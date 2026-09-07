@@ -172,7 +172,9 @@ describe("G3 Antigravity full-workspace contract", () => {
       }
       expect(result).toMatchObject({ status: "completed", provider: "gemini" });
       expect(execute).toHaveBeenCalledOnce();
-      expect(execute.mock.calls[0][0]).toMatchObject({ workspaceRoot: workspace.root, writableRoots: [workspace.root], fullAccess: true, networkEffective: false });
+      // Absolute write scopes retain the submitted spelling; Workspace may expand
+      // a Windows short path (for example RUNNER~1) when canonicalizing its root.
+      expect(execute.mock.calls[0][0]).toMatchObject({ workspaceRoot: workspace.root, writableRoots: [path.resolve(root)], fullAccess: true, networkEffective: false });
       expect(codexFactory).not.toHaveBeenCalled();
       expect(childExits).toEqual([0]);
     } finally {
