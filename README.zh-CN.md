@@ -173,7 +173,7 @@ c2c sandbox-allow   # 把本地设置目录加入 Codex 沙箱白名单（macOS 
 c2c status / doctor / pair / unpair / logs / stop
 ```
 
-环境要求：Node.js >= 20、git；公网连接需要 `cloudflared`
+环境要求：Node.js >= 22、git；公网连接需要 `cloudflared`
 （自动检测，Skill 会替你安装）。
 
 文档：[架构](docs/architecture.md) · [协议](docs/protocol.md) ·

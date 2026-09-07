@@ -212,7 +212,7 @@ async function ensureBridgeAndTunnel(
   if (opts.tunnel) {
     if (info.publicUrl) publicProbe = await probePublicMcp(info.publicUrl);
     if (!info.publicUrl || !publicProbe?.ok) {
-      const ownerWorkspaceId = observation?.shared ? runtime.workspaceId : workspace.id;
+      const ownerWorkspaceId = observation?.state === "healthy" && observation.shared ? runtime.workspaceId : workspace.id;
       const ownerTunnelState = readTunnelState(ownerWorkspaceId, stateDir);
       const namedReady = isNamedTunnelReady(ownerTunnelState);
       const requestedEndpoint = readLastEndpoint(workspace.id, stateDir);

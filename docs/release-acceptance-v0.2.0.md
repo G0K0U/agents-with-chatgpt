@@ -55,5 +55,5 @@ acceptance JSON) is kept out of the public repository by design.
 - Release commit and tag are pinned; the installer supports
   `-ExpectedCommit` verification and records the checked-out SHA.
 - No binaries are signed; provenance is the git history on the public
-  repository. CI (typecheck + build + tests on Windows/Linux, Node 20/22)
+  repository. CI (typecheck + build + tests on Windows/Linux, Node 22)
   runs on every push and pull request.

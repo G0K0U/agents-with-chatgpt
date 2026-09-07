@@ -83,7 +83,7 @@ install prompt below is unchanged and battle-tested:
 请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
 所有事情你自己做：
 
-1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
+1. 环境自检：需要 git 和 Node.js ≥ 22，缺什么就自动安装
   （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
 2. 下载：把 https://github.com/G0K0U/agents-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
@@ -108,7 +108,7 @@ paragraph below, paste it to your coding agent (Codex), and go grab a coffee:
 Please install and configure "Codex with ChatGPT" for me, fully automatically.
 I am a non-technical user — do everything yourself:
 
-1. Check the environment: git and Node.js >= 20 must be available. Install
+1. Check the environment: git and Node.js >= 22 must be available. Install
    anything missing yourself (macOS: Homebrew, Windows: winget). Also install
    cloudflared.
 2. Download: clone https://github.com/G0K0U/agents-with-chatgpt into
@@ -264,7 +264,7 @@ c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
 c2c status / doctor / pair / unpair / logs / stop
 ```
 
-Requirements: Node.js >= 20, git. `cloudflared` for the public connection
+Requirements: Node.js >= 22, git. `cloudflared` for the public connection
 (auto-detected; the Skill installs it for you).
 
 Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·

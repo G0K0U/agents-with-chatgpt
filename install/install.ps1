@@ -101,10 +101,10 @@ try {
       winget install --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements | Out-Null
       $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User') + ';' + $env:Path
     }
-    Step 'node available' (Test-Cmd 'node') 'install Node.js >= 20 from https://nodejs.org and re-run'
+    Step 'node available' (Test-Cmd 'node') 'install Node.js >= 22 from https://nodejs.org and re-run'
   }
   $nodeMajor = [int]((node -v) -replace '^v(\d+)\..*','$1')
-  Step 'node >= 20' ($nodeMajor -ge 20) ("found node " + (node -v))
+  Step 'node >= 22' ($nodeMajor -ge 22) ("found node " + (node -v))
 
   # ── fetch source at the pinned ref ─────────────────────────────────────────
   if (Test-Path (Join-Path $InstallRoot '.git')) {
