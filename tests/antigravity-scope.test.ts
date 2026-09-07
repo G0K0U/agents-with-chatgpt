@@ -23,6 +23,8 @@ import {
   evaluateAntigravityToolScope,
   verifyWriteScopePreflight,
   realTargetWithinRoots,
+  realPathIfExists,
+  extractCandidatePathsFromCommand,
   parseGitStatusEntries,
   fileContentSignature,
   computeChangedFilesFromSignatures,
@@ -90,11 +92,15 @@ function scopeInput(overrides: {
   allowedRoots?: string[];
   writesAllowed?: boolean;
 }) {
+  const canonicalRoot = realPathIfExists(overrides.workspaceRoot) ?? overrides.workspaceRoot;
+  const canonicalAllowed = overrides.allowedRoots
+    ? overrides.allowedRoots.map((r) => realPathIfExists(r) ?? r)
+    : [canonicalRoot];
   return {
     toolName: overrides.toolName ?? "write_to_file",
     parameters: overrides.parameters ?? {},
-    workspaceRoot: overrides.workspaceRoot,
-    allowedRoots: overrides.allowedRoots ?? [overrides.workspaceRoot],
+    workspaceRoot: canonicalRoot,
+    allowedRoots: canonicalAllowed,
     writesAllowed: overrides.writesAllowed ?? true,
   };
 }
@@ -160,6 +166,35 @@ describe("R3 P0-a: out-of-bounds denials never delete files", () => {
     expect(verdict.category).toBe("command");
     expect(fs.existsSync(sentinel)).toBe(true);
     expect(sha256(sentinel)).toBe(beforeHash);
+  });
+
+  it("category 1 — write-shaped run_command against a POSIX outside path is denied (quoted and unquoted)", () => {
+    const workspace = makeTempDir("ws");
+    const verdictQuoted = evaluateAntigravityToolScope(scopeInput({
+      toolName: "run_command",
+      workspaceRoot: workspace,
+      parameters: { CommandLine: 'Set-Content -Path "/outside/notes.txt" -Value "clobber"' },
+    }));
+    expect(verdictQuoted.violation).toBeTruthy();
+    expect(verdictQuoted.category).toBe("command");
+
+    const verdictUnquoted = evaluateAntigravityToolScope(scopeInput({
+      toolName: "run_command",
+      workspaceRoot: workspace,
+      parameters: { CommandLine: 'echo "clobber" > /outside/notes.txt' },
+    }));
+    expect(verdictUnquoted.violation).toBeTruthy();
+    expect(verdictUnquoted.category).toBe("command");
+  });
+
+  it("extracts candidate POSIX absolute paths from write commands safely", () => {
+    const extracted = extractCandidatePathsFromCommand(
+      'Set-Content -Path "/var/log/audit.log" -Value "test"; echo "hi" > /tmp/out.txt; cmd /c "echo foo"',
+      "/home/user/ws"
+    );
+    expect(extracted).toContain("/var/log/audit.log");
+    expect(extracted).toContain("/tmp/out.txt");
+    expect(extracted).not.toContain("/c");
   });
 
   it("category 2 — write inside the workspace but outside the declared scope leaves the file intact", () => {
@@ -230,7 +265,8 @@ describe("R3 P0-a: out-of-bounds denials never delete files", () => {
   });
 
   it("in-scope write is allowed (no false positives)", () => {
-    const workspace = makeTempDir("ws");
+    const rawWorkspace = makeTempDir("ws");
+    const workspace = realPathIfExists(rawWorkspace) ?? rawWorkspace;
     const target = path.join(workspace, "ok.txt");
     const verdict = evaluateAntigravityToolScope(scopeInput({
       workspaceRoot: workspace,

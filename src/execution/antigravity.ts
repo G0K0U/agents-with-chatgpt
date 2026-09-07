@@ -262,36 +262,69 @@ export function verifyWriteScopePreflight(request: {
 
 export function extractCandidatePathsFromCommand(cmd: string, workspaceRoot?: string): string[] {
   const candidates: string[] = [];
+  const add = (candidate: string | null | undefined) => {
+    if (!candidate) return;
+    const trimmed = candidate.trim().replace(/^["']|["']$/g, "");
+    if (trimmed && !candidates.includes(trimmed)) {
+      candidates.push(trimmed);
+    }
+  };
+
   // 1. Quoted paths with Windows drive letters: "C:\path\..." or 'C:\path\...'
   const quotedWin = cmd.match(/(["'])([A-Za-z]:\\[^"']+)\1/g);
   if (quotedWin) {
     for (const m of quotedWin) {
-      candidates.push(m.slice(1, -1));
+      add(m.slice(1, -1));
     }
   }
+
   // 2. Unquoted paths with Windows drive letters: C:\path\with_no_spaces
   const unquotedWin = cmd.match(/(?:^|[\s=,;()<>|])([A-Za-z]:\\[^\s"'<>|]+)/g);
   if (unquotedWin) {
     for (const m of unquotedWin) {
-      const cleaned = m.trim().replace(/^[=,;()<>|\s]+/, "");
-      if (cleaned && !candidates.includes(cleaned)) {
-        candidates.push(cleaned);
+      const cleaned = m.trim().replace(/^[=,;()<>|\s]+/, "").replace(/[=,;()<>|\s]+$/, "");
+      add(cleaned);
+    }
+  }
+
+  // 3. Quoted POSIX absolute paths: "/path/..." or '/path/...'
+  const quotedPosix = cmd.match(/(["'])(\/(?!\/)[^"'\r\n]+)\1/g);
+  if (quotedPosix) {
+    for (const m of quotedPosix) {
+      add(m.slice(1, -1));
+    }
+  }
+
+  // 4. Unquoted POSIX absolute paths: /path/with_no_spaces
+  // Exclude switches like /c, /s, /y by requiring an internal slash or dot-extension unless preceded by redirection
+  const unquotedPosix = cmd.match(/(?:^|[\s=,;()<>|])(\/(?!\/)[^\s"'<>|]+)/g);
+  if (unquotedPosix) {
+    for (const m of unquotedPosix) {
+      const cleaned = m.trim().replace(/^[=,;()<>|\s]+/, "").replace(/[=,;()<>|\s]+$/, "");
+      if (cleaned && (cleaned.includes("/", 1) || cleaned.includes(".") || /^[>|]/.test(m.trim()))) {
+        add(cleaned);
       }
     }
   }
-  // 3. Command parameters for file creation (e.g. -Path "...", Out-File "...")
+
+  // 5. Command parameters for file creation (e.g. -Path "...", Out-File "...")
   if (workspaceRoot) {
-    const paramMatches = cmd.match(/(?:-Path|-LiteralPath|>|>>|Out-File|New-Item|Set-Content|Add-Content)\s+["']?([^"'\s<>|]+)["']?/gi);
+    const paramMatches = cmd.match(/(?:-Path|-LiteralPath|-FilePath|>|>>)\s+["']?([^"'\s<>|]+)["']?|(?:Out-File|New-Item|Set-Content|Add-Content)(?:\s+-(?:Path|LiteralPath|FilePath))?\s+["']?([^"'\s<>|]+)["']?/gi);
     if (paramMatches) {
       for (const m of paramMatches) {
         const parts = m.split(/\s+/);
         const target = parts[parts.length - 1]?.replace(/["']/g, "");
-        if (target && !/^[A-Za-z]:\\/.test(target) && !target.startsWith("-") && target.includes(".")) {
-          candidates.push(path.resolve(workspaceRoot, target));
+        if (target && !target.startsWith("-") && target.includes(".")) {
+          if (/^[A-Za-z]:\\/.test(target) || target.startsWith("/")) {
+            add(target);
+          } else {
+            add(path.resolve(workspaceRoot, target));
+          }
         }
       }
     }
   }
+
   return candidates;
 }
 
