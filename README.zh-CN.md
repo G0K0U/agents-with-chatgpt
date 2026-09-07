@@ -49,7 +49,7 @@ Agent（Codex），然后去倒杯咖啡：
 请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
 所有事情你自己做：
 
-1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
+1. 环境自检：需要 git 和 Node.js ≥ 22，缺什么就自动安装
   （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
 2. 下载：把 https://github.com/G0K0U/agents-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
