@@ -410,29 +410,60 @@ describe("detached restart handoff (offline)", () => {
     });
   });
 
-  it("real detached child survives immediate parent termination and starts exactly once", async () => {
+  it("real detached child survives parent termination immediately after claiming and starts exactly once", async () => {
     // Both processes use test-only dependencies. No bridge, service, network, or real runtime is touched.
     const moduleUrl = pathToFileURL(path.resolve("dist/process/restart.js")).href;
     const childFile = path.join(base, "fixture-child.mjs");
     const parentFile = path.join(base, "fixture-parent.mjs");
     const countFile = path.join(base, "starts");
+    const readyFile = path.join(base, "child-ready");
+    const releaseFile = path.join(base, "parent-exited");
+    const doneFile = path.join(base, "child-done");
+    const waitForFile = `async function waitForFile(file) {
+      const deadline = Date.now() + 10000;
+      while (!fs.existsSync(file)) {
+        if (Date.now() >= deadline) throw new Error('fixture handshake timeout');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }`;
     fs.writeFileSync(childFile, `import fs from 'node:fs'; import { runRestartHelper } from ${JSON.stringify(moduleUrl)};
       const state = ${JSON.stringify(state)}, old = ${JSON.stringify(old)}, replacement = ${JSON.stringify(replacement)};
+      ${waitForFile}
       let started = false;
-      await new Promise(r => setTimeout(r, 250));
-      await runRestartHelper(process.argv[2], state, { processStart: () => 'fixture-child-start',
-        observe: async () => started ? replacement : old, stop: async () => true,
+      const result = await runRestartHelper(process.argv[2], state, { processStart: () => 'fixture-child-start',
+        observe: async () => started ? replacement : old, stop: async () => {
+          fs.writeFileSync(${JSON.stringify(readyFile)}, process.argv[2]);
+          await waitForFile(${JSON.stringify(releaseFile)}); return true;
+        },
         ensure: async () => { started = true; fs.appendFileSync(${JSON.stringify(countFile)}, 'start\\n'); return { runtime: replacement, spawned: true }; },
-        tunnel: async () => true, launch: async () => { throw new Error('recursive'); } });`);
-    fs.writeFileSync(parentFile, `import { spawn } from 'node:child_process'; import { requestRestart } from ${JSON.stringify(moduleUrl)};
+        tunnel: async () => true, launch: async () => { throw new Error('recursive'); } });
+      fs.writeFileSync(${JSON.stringify(doneFile)}, JSON.stringify(result));`);
+    fs.writeFileSync(parentFile, `import fs from 'node:fs'; import { spawn } from 'node:child_process'; import { requestRestart } from ${JSON.stringify(moduleUrl)};
+      ${waitForFile}
       await requestRestart(${JSON.stringify(root)}, { stateDir: ${JSON.stringify(state)}, tunnel: false }, {
         observe: async () => (${JSON.stringify(old)}), processStart: () => 'fixture-parent-start',
         launch: async id => { const child = spawn(process.execPath, [${JSON.stringify(childFile)}, id], { detached: true, windowsHide: true, stdio: 'ignore' }); child.unref();
-          await new Promise((r,j) => { child.once('spawn',r); child.once('error',j); }); process.kill(process.pid, 'SIGTERM'); }
+          await new Promise((r,j) => { child.once('spawn',r); child.once('error',j); });
+          await waitForFile(${JSON.stringify(readyFile)});
+          if (fs.readFileSync(${JSON.stringify(readyFile)}, 'utf8') !== id) throw new Error('wrong fixture generation');
+          process.kill(process.pid, 'SIGTERM'); }
       });`);
     const parent = spawn(process.execPath, [parentFile], { windowsHide: true, stdio: "ignore" });
     await new Promise<void>((resolve, reject) => { parent.once("exit", () => resolve()); parent.once("error", reject); });
-    await vi.waitFor(() => expect(readRestartHandoff(state).state).toBe("complete"), { timeout: 10_000 });
+    // stop() is reached only after the helper has claimed, published its identity,
+    // and validated the old runtime. Hold it there until the parent really exits.
+    // Poll separate markers, not the durable record while Windows replaces it.
+    const claimed = readRestartHandoff(state);
+    expect(fs.readFileSync(readyFile, "utf8")).toBe(claimed.id);
+    expect(claimed.state).toBe("stopping");
+    expect(claimed.helper?.start).toBe("fixture-child-start");
+    expect(fs.existsSync(countFile)).toBe(false);
+    fs.writeFileSync(releaseFile, claimed.id);
+    await vi.waitFor(() => expect(fs.existsSync(doneFile)).toBe(true), { timeout: 10_000 });
+    const done = readRestartHandoff(state);
+    expect(done.state, JSON.stringify(done)).toBe("complete");
+    expect(done.id).toBe(claimed.id);
+    expect(done.helper).toEqual(claimed.helper);
     expect(fs.readFileSync(countFile, "utf8")).toBe("start\n");
   }, 15_000);
 });
