@@ -269,7 +269,8 @@ Requirements: Node.js >= 22, git. `cloudflared` for the public connection
 
 Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 [security](docs/security.md) · [troubleshooting](docs/troubleshooting.md) ·
-[agent prompts](docs/agent-prompts.md) · [support matrix](docs/support-matrix.md)
+[agent prompts](docs/agent-prompts.md) · [support matrix](docs/support-matrix.md) ·
+[ZCode](docs/zcode.md)
 
 ## Project layout
 
@@ -286,7 +287,7 @@ src/
   cli/        the c2c CLI
 skill/        the Codex Skill (the real UX layer)
 tests/        unit + integration tests
-docs/         architecture / protocol / security / troubleshooting
+docs/         architecture / protocol / security / troubleshooting / zcode
 ```
 
 ## Public infrastructure boundary
@@ -304,6 +305,12 @@ registered engineering workspace and the bridge workspace, persist sessions,
 resume task metadata after restart, and run the CLI executor in full-access mode.
 The full-access choice is intentional: anyone holding the connector's execution
 scopes can direct local Codex actions within the OS permissions of the bridge.
+
+Native ZCode companion integration is VERIFIED on Windows 11 x64: status and
+self-test passed, exact session binding is `builtin:zai-start-plan / GLM-5.3-Flash`,
+a real native model turn completed, same-session resume returned the new turn
+response, and the Engineering AI workspace probe completed. The companion Z2C
+Desktop bridge is external to this repository and Desktop owns authentication.
 
 **Unofficial community project. Not affiliated with or endorsed by OpenAI.**
 

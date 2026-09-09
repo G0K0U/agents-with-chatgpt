@@ -1,6 +1,26 @@
-# ZCode Free-Window Queue — Governed C2C Control Plane
+# ZCode Integration: Free-Window Queue vs. Native Control Plane
 
-The `zcode_*` MCP tools give ChatGPT/C2C governed access to a ZCode
+The C2C bridge provides two distinct, non-overlapping ZCode integration surfaces:
+1. **Free-Window Queue (`zcode_*`, 4 tools)**: An asynchronous, file-based batch queue driven by append-only JSONL files (`queue.jsonl`, `receipts.jsonl`) at an operator-configured root (`C2C_ZCODE_QUEUE_ROOT`).
+2. **Native Start Plan Control Plane (`zcode_native_*`, 8 tools)**: A real-time, synchronous control plane that dispatches tasks directly to the native ZCode Desktop environment via an external companion bridge (`Z2C`).
+
+These two surfaces serve different workflows and fail closed independently; there is no fallback between them in either direction.
+
+| Attribute | Free-Window Queue (`zcode_*`) | Native Control Plane (`zcode_native_*`) |
+|---|---|---|
+| **Tools (count)** | 4 tools (`zcode_enqueue_task`, `zcode_get_task`, `zcode_list_tasks`, `zcode_cancel_task`) | 8 tools (`zcode_native_read_session`, `zcode_native_self_test`, `zcode_native_status`, `zcode_native_submit_task`, `zcode_native_get_task`, `zcode_native_cancel_task`, `zcode_native_execution_output`, `zcode_native_resume_session`) |
+| **Execution mode** | Asynchronous batch queue | Real-time synchronous dispatch and multi-turn session resume |
+| **Backend** | File-based append-only logs (`queue.jsonl`, `receipts.jsonl`) | Companion Z2C Desktop bridge (external, Desktop-owned auth) |
+| **Identity / Binding** | Generic worker queue roles | Exact session pin: `builtin:zai-start-plan / GLM-5.3-Flash` |
+| **Gating environment** | `C2C_ZCODE_QUEUE_ROOT` | `ZCODE_NATIVE_ALLOWED_WORKSPACES` |
+| **Multi-turn resume** | Not supported (single-task batch queue) | Supported via `zcode_native_resume_session` |
+| **Status truth** | `receipts.jsonl` (written exclusively by coordinator) | Native Z2C protocol state, writer slot serialization |
+
+---
+
+# Part 1: ZCode Free-Window Queue (`zcode_*`)
+
+The four `zcode_*` MCP tools give ChatGPT/C2C governed access to a ZCode
 free-window worker queue. The queue root is **operator-configured** via the
 `C2C_ZCODE_QUEUE_ROOT` environment variable (for example, a directory inside
 a deployment you own, such as `<your-workspace>/var/c2c-zcode`). It is unset
@@ -110,3 +130,40 @@ sanitization, cancel-request truth, terminal receipt precedence,
 symlink/junction escape rejection and the 8 MiB read cap — all against
 isolated temporary queue roots. The configured production root is never
 touched by tests.
+
+# Part 2: Native ZCode Start Plan Control Plane (`zcode_native_*`)
+
+The eight `zcode_native_*` tools provide a governed real-time control plane forwarding tasks directly to the native ZCode Desktop environment.
+
+## Architecture & Boundaries
+
+- **External companion Z2C**: Forwarding relies on an independent companion bridge (`Z2C`) that interfaces with the desktop agent. The companion Z2C bridge is **external** to this repository and is not bundled here.
+- **Desktop-owned authentication**: All model authentication is managed and minted by the native ZCode Desktop runtime through a runtime auth handoff. The C2C bridge requires no upstream API keys, manages no secrets, and never falls back to API keys.
+- **Exact identity pin & fail-closed**: Z2C admits tasks only after asserting exact session binding to `builtin:zai-start-plan / GLM-5.3-Flash`. The binding is verified on session read and re-verified on task submission. Any divergence from this exact identity fails closed immediately. No fallback to the free-window queue or other providers exists in either direction.
+- **Workspace allowlist**: Native forwarding is gated by the `ZCODE_NATIVE_ALLOWED_WORKSPACES` environment variable. Unless a workspace is explicitly included in this comma-delimited allowlist, all native operations fail closed.
+- **Queue & writer serialization**: Native submissions honor the shared workspace queue pause/freeze state and serialize through the workspace writer slot.
+
+## Native Tools (8 tools)
+
+| Tool | Scope | Purpose |
+|---|---|---|
+| `zcode_native_read_session` | `execution.read` | Read and attest the exact native session workspace, Desktop Start Plan provider (`builtin:zai-start-plan`), and model (`GLM-5.3-Flash`); fails closed on mismatch |
+| `zcode_native_self_test` | `execution.submit` | Read-only protocol self-test verifying durable idempotency, exact binding, replay, conflict detection, and unchanged queue/writer state |
+| `zcode_native_status` | `execution.read` | Check health and Start Plan identity of the independent Z2C desktop control plane for an authorized workspace |
+| `zcode_native_submit_task` | `execution.submit` | Dispatch a realtime native ZCode Start Plan task via Z2C in an allowlisted workspace |
+| `zcode_native_get_task` | `execution.read` | Retrieve bounded native task metadata (`z2c_*` task ID, `sess_*` session ID, status, timestamps) |
+| `zcode_native_cancel_task` | `execution.cancel` | Cancel an active or queued native task (interrupts the underlying real ZCode session) |
+| `zcode_native_execution_output` | `execution.read` | Retrieve bounded, sanitized final assistant output from a completed native task for independent audit of the GLM result |
+| `zcode_native_resume_session` | `execution.submit` | Continue an existing native `sess_*` ZCode session with a new instruction, maintaining session context |
+
+## Verification Status (Windows 11 x64)
+
+The native ZCode companion integration is **VERIFIED** on Windows 11 x64 using only sanitized facts:
+- **Status & self-test**: Status/self-test passed (`zcode_native_status` and `zcode_native_self_test`).
+- **Exact session binding**: Bound strictly to `builtin:zai-start-plan / GLM-5.3-Flash`.
+- **Real native model turn**: A real native model turn completed and returned output.
+- **Same-session resume**: Same-session resume returned the new turn response while maintaining session continuity.
+- **Workspace probe**: Engineering AI workspace probe completed.
+- **Desktop authentication**: The companion Z2C Desktop bridge is external to this repository and Desktop owns authentication.
+- **Hygiene**: Local paths, PIDs, task/session IDs, credentials, headers, account details, and private endpoints are strictly excluded.
+

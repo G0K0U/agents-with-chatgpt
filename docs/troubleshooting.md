@@ -105,6 +105,21 @@ Do not pick another project by name automatically. Open the collection that
 matches this workspace and tell Codex「已找到」, or say you want the old
 long-chat instead. Each workspace has its own Project and its own connector.
 
+### Native ZCode: `provider_not_configured / Provider authentication failed` (FIXED)
+In earlier builds, native model turns dispatched via Z2C could report `provider_not_configured` or `Provider authentication failed`.
+
+**Status: FIXED.**
+
+The issue was resolved via corrected Desktop runtime auth handoff and stale child-process reload:
+- The companion Z2C Desktop bridge interfaces with the native ZCode Desktop environment, where Desktop owns authentication. The runtime auth handoff was corrected so fresh session tokens and provider credentials minted by Desktop are handed off reliably to execution workers.
+- Stale child processes holding expired or uninitialized auth states are reloaded, ensuring native dispatches pick up active credentials immediately.
+- Authentication is strictly Desktop-owned: no upstream API keys are used, and no API-key fallback is recommended or supported. Do not configure or inject external API keys.
+
+If this error occurs on older setups:
+1. Ensure the external companion Z2C Desktop bridge is running.
+2. Verify that the workspace is allowed in `ZCODE_NATIVE_ALLOWED_WORKSPACES`.
+3. Restart or reload stale desktop processes so the updated Desktop runtime auth handoff is applied.
+
 ### Completely stuck
 ```
 c2c stop

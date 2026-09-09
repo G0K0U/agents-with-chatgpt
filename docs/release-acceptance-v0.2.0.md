@@ -35,6 +35,14 @@ acceptance JSON) is kept out of the public repository by design.
   evidence-grounded session ID, model identity separation, network deny policy,
   safe cancellation without Codex AppServer disruption, and fail-closed
   workspace write scoping).
+- **Native ZCode companion integration / Start Plan (Windows 11 x64)**: status/self-test
+  passed; exact session binding is `builtin:zai-start-plan / GLM-5.3-Flash`;
+  real native model turn completed; same-session resume returned the new turn
+  response; Engineering AI workspace probe completed. The companion Z2C
+  Desktop bridge is external to this repository and not bundled here; Desktop
+  owns authentication. This sanitized acceptance record omits local paths,
+  PIDs, task/session IDs, credentials, headers, account details, or private
+  endpoints. See [ZCode](zcode.md).
 - **Honest support claims**: see docs/support-matrix.md — Windows 11 x64 is
   the only verified platform first release; everything else is NOT_TESTED
   and labeled as such.
@@ -47,8 +55,7 @@ acceptance JSON) is kept out of the public repository by design.
   release is prepared; publishing requires repository write access.
 - Clean-machine (Windows Sandbox/VM) installer rerun.
 - macOS/Linux/arm64 platforms; Gemini models beyond live-verified
-  gemini-3.8-flash-high; native ZCode desktop (Start-Plan) dispatch —
-  all fail closed or NOT_TESTED, never claimed.
+  gemini-3.8-flash-high — all fail closed or NOT_TESTED, never claimed.
 
 ## Distribution integrity
 
