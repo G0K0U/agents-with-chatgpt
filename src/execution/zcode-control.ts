@@ -12,7 +12,11 @@
  *   read (never skip-and-continue).
  * - Appends are serialized per file (in-process mutex) so concurrent enqueues
  *   can never interleave partial JSON lines.
- * - Single-file reads are capped at 8 MiB.
+ * - Single-file reads are capped at 8 MiB for queue.jsonl / control.jsonl.
+ *   receipts.jsonl scales with executed history: it is read with bounded
+ *   streaming (per-record cap, total size never rejects the file) and the
+ *   coordinator rotates it into deterministic receipts.NNNNNN.jsonl segments
+ *   inside the same canonical root. History is never deleted or rewritten.
  * - Credential-shaped instructions are rejected at enqueue time.
  * - Cancellation only ever appends CANCEL_REQUESTED to control.jsonl. Terminal
  *   receipts (COMPLETED/FAILED/CANCELLED) are written exclusively by the ZCode
@@ -21,6 +25,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { sanitizeExecutionOutput } from "./sanitize.js";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
@@ -38,6 +43,13 @@ const CONTROL_FILE = "control.jsonl";
 const STATE_FILE = "worker-state.json";
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
+// Lifecycle receipts scale with real executed history, so the receipts file is
+// NOT subject to the whole-file read cap: it is read with bounded streaming
+// and rotated into deterministic segments. Every single record is still
+// strictly bounded and every malformed record fails closed.
+const RECEIPTS_ROTATE_BYTES = 8 * 1024 * 1024;
+const MAX_RECEIPT_LINE_BYTES = 1024 * 1024;
+const RECEIPTS_SEGMENT_PATTERN = /^receipts\.(\d{6})\.jsonl$/;
 const MAX_INSTRUCTION_CHARS = 100_000;
 const MAX_LISTED_TASKS = 100;
 const MAX_INSTRUCTION_EXCERPT = 600;
@@ -400,10 +412,14 @@ function realQueueRoot(rawRoot: string | undefined): string {
 
 /**
  * Validate one truth file: must live inside the real root, must be a plain
- * regular file (no symlink/junction/reparse point), and must be within the
- * read cap. Returns its absolute path.
+ * regular file (no symlink/junction/reparse point), and — unless opted out —
+ * must be within the whole-file read cap. Returns its absolute path.
  */
-function safeTruthFile(root: string, name: string, options: { mustExist: boolean }): string {
+function safeTruthFile(
+  root: string,
+  name: string,
+  options: { mustExist: boolean; enforceSizeCap?: boolean }
+): string {
   const file = path.join(root, name);
   const relative = path.relative(root, file);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
@@ -437,10 +453,73 @@ function safeTruthFile(root: string, name: string, options: { mustExist: boolean
   if (realRelative.startsWith("..") || path.isAbsolute(realRelative)) {
     throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} resolves outside the fixed queue root (reparse-point escape)`);
   }
-  if (stats.size > MAX_FILE_BYTES) {
+  if ((options.enforceSizeCap ?? true) && stats.size > MAX_FILE_BYTES) {
     throw new ZcodeControlError("ZCODE_FILE_TOO_LARGE", `${name} exceeds the ${MAX_FILE_BYTES} byte read cap`);
   }
   return file;
+}
+
+/**
+ * Bounded streaming scan of one JSONL truth file. The file is read in fixed
+ * chunks and decoded incrementally, so total file size never bounds memory;
+ * only one line is materialized at a time and a single line larger than
+ * `maxLineBytes` fails closed instead of being silently truncated or skipped.
+ */
+function scanJsonlLines(
+  file: string,
+  name: string,
+  options: { maxLineBytes: number },
+  visit: (line: string, lineNumber: number) => void
+): void {
+  const fd = fs.openSync(file, "r");
+  try {
+    const chunk = Buffer.alloc(64 * 1024);
+    const decoder = new StringDecoder("utf8");
+    let partial = "";
+    let partialBytes = 0;
+    let lineNumber = 0;
+    for (;;) {
+      const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      const text = decoder.write(read === chunk.length ? chunk : chunk.subarray(0, read));
+      let start = 0;
+      for (;;) {
+        const nl = text.indexOf("\n", start);
+        if (nl === -1) break;
+        const segmentBytes = Buffer.byteLength(text.slice(start, nl), "utf8");
+        if (partialBytes + segmentBytes > options.maxLineBytes) {
+          throw new ZcodeControlError(
+            "ZCODE_RECORD_TOO_LARGE",
+            `${name} line ${lineNumber + 1} exceeds the ${options.maxLineBytes} byte record cap (fail closed)`
+          );
+        }
+        const line = partial + text.slice(start, nl);
+        lineNumber += 1;
+        partial = "";
+        partialBytes = 0;
+        visit(line, lineNumber);
+        start = nl + 1;
+      }
+      const rest = text.slice(start);
+      if (rest.length > 0) {
+        partial += rest;
+        partialBytes += Buffer.byteLength(rest, "utf8");
+      }
+      if (partialBytes > options.maxLineBytes) {
+        throw new ZcodeControlError(
+          "ZCODE_RECORD_TOO_LARGE",
+          `${name} line ${lineNumber + 1} exceeds the ${options.maxLineBytes} byte record cap (fail closed)`
+        );
+      }
+    }
+    const tail = partial + decoder.end();
+    if (tail.length > 0) {
+      lineNumber += 1;
+      visit(tail, lineNumber);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 export class ZcodeControl {
@@ -461,7 +540,7 @@ export class ZcodeControl {
     return realQueueRoot(rawRoot);
   }
 
-  private safeFile(name: string, options: { mustExist: boolean }): string {
+  private safeFile(name: string, options: { mustExist: boolean; enforceSizeCap?: boolean }): string {
     return safeTruthFile(this.realRoot(), name, options);
   }
 
@@ -540,27 +619,95 @@ export class ZcodeControl {
     return record as unknown as ZcodeTaskRecord;
   }
 
-  private receiptRecords(): ReceiptRecord[] {
-    return this.readJsonl(RECEIPTS_FILE) as ReceiptRecord[];
+  /**
+   * Ordered lifecycle receipts history: rotated segments oldest → newest,
+   * then the active receipts.jsonl segment. Every file is validated with the
+   * same fail-closed guarantees as any truth file (regular file, inside the
+   * real root, no reparse points) and scanned with bounded memory; only the
+   * per-record cap bounds a single record, never cumulative history size.
+   */
+  private receiptsHistoryFiles(): string[] {
+    const root = this.realRoot();
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const segments: Array<{ seq: number; name: string }> = [];
+    for (const entry of entries) {
+      const match = RECEIPTS_SEGMENT_PATTERN.exec(entry.name);
+      if (!match) continue;
+      segments.push({ seq: Number(match[1]), name: entry.name });
+    }
+    segments.sort((a, b) => a.seq - b.seq);
+    const files: string[] = [];
+    for (const segment of segments) {
+      files.push(this.safeFile(segment.name, { mustExist: true, enforceSizeCap: false }));
+    }
+    const active = this.safeFile(RECEIPTS_FILE, { mustExist: false, enforceSizeCap: false });
+    if (fs.existsSync(active)) files.push(active);
+    return files;
+  }
+
+  private forEachReceiptRecord(visit: (record: Record<string, unknown>, source: string, line: number) => void): void {
+    for (const file of this.receiptsHistoryFiles()) {
+      const name = path.basename(file);
+      scanJsonlLines(file, name, { maxLineBytes: MAX_RECEIPT_LINE_BYTES }, (line, lineNumber) => {
+        if (line.trim() === "") {
+          throw new ZcodeControlError(
+            "ZCODE_MALFORMED_FILE",
+            `${name} line ${lineNumber} is empty; the JSONL truth file is malformed (fail closed)`
+          );
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          throw new ZcodeControlError(
+            "ZCODE_MALFORMED_FILE",
+            `${name} line ${lineNumber} is not valid JSON; the JSONL truth file is malformed (fail closed)`
+          );
+        }
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new ZcodeControlError(
+            "ZCODE_MALFORMED_FILE",
+            `${name} line ${lineNumber} is not a JSON object (fail closed)`
+          );
+        }
+        visit(parsed as Record<string, unknown>, name, lineNumber);
+      });
+    }
   }
 
   private controlRecords(): ControlRecord[] {
     return this.readJsonl(CONTROL_FILE) as ControlRecord[];
   }
 
+  /** Bounded-memory fold over the full receipts history: each task keeps its
+   * latest MAX_RECEIPTS_PER_TASK records; older records are dropped as the
+   * stream advances so a giant history never materializes in memory. */
   private receiptsByTask(): Map<string, ReceiptRecord[]> {
     const map = new Map<string, ReceiptRecord[]>();
-    for (const record of this.receiptRecords()) {
+    this.forEachReceiptRecord((record) => {
       const task_id = typeof record.task_id === "string" ? record.task_id : null;
-      if (!task_id) continue;
+      if (!task_id) return;
       const list = map.get(task_id) ?? [];
       list.push(record);
-      map.set(task_id, list);
-    }
-    for (const list of map.values()) {
       if (list.length > MAX_RECEIPTS_PER_TASK) list.splice(0, list.length - MAX_RECEIPTS_PER_TASK);
-    }
+      map.set(task_id, list);
+    });
     return map;
+  }
+
+  /** Streaming existence check across the entire receipts history. */
+  private receiptsContainTask(taskId: string): boolean {
+    let found = false;
+    this.forEachReceiptRecord((record) => {
+      if (found) return;
+      if (record.task_id === taskId) found = true;
+    });
+    return found;
   }
 
   private statusFor(taskId: string, receipts: ReceiptRecord[] | undefined, cancelRequested: boolean): ZcodeTaskStatus {
@@ -715,7 +862,7 @@ export class ZcodeControl {
     if (existingQueue.some((task) => task.task_id === task_id)) {
       throw new ZcodeControlError("ZCODE_DUPLICATE_TASK_ID", `task_id ${task_id} already exists in queue.jsonl`);
     }
-    if (this.receiptRecords().some((record) => record.task_id === task_id)) {
+    if (this.receiptsContainTask(task_id)) {
       throw new ZcodeControlError("ZCODE_DUPLICATE_TASK_ID", `task_id ${task_id} already exists in receipts.jsonl`);
     }
 
@@ -895,12 +1042,52 @@ export class ZcodeCoordinatorStore {
 
 /** Serialized single-line append after full truth-file validation. */
 function appendCoordinatorJsonl(root: string, name: string, payload: Record<string, unknown>): void {
-  const file = safeTruthFile(root, name, { mustExist: false });
   const serialized = JSON.stringify(payload);
   if (serialized.includes("\n")) {
     throw new ZcodeControlError("ZCODE_INVALID_TASK", "refusing to append a multi-line JSON record");
   }
+  if (name === RECEIPTS_FILE) {
+    rotateReceiptsIfNeeded(root, serialized.length + 1);
+  }
+  const file = safeTruthFile(root, name, { mustExist: false, enforceSizeCap: false });
   fs.appendFileSync(file, serialized + "\n", "utf8");
+}
+
+/**
+ * Rotate the active receipts segment deterministically BEFORE it crosses the
+ * rotation threshold: receipts.jsonl is renamed to the next unused
+ * receipts.NNNNNN.jsonl sequence (atomic rename on the same volume, so no
+ * record is lost or duplicated even across a crash mid-rotation) and the
+ * active file starts empty. Rotation runs under the receipts file lock.
+ * Only the exact segment filename pattern inside the canonical root is ever
+ * considered; callers cannot influence archive names.
+ */
+function rotateReceiptsIfNeeded(root: string, incomingBytes: number): void {
+  const active = safeTruthFile(root, RECEIPTS_FILE, { mustExist: false, enforceSizeCap: false });
+  let stats: fs.Stats | null = null;
+  try {
+    stats = fs.statSync(active);
+  } catch {
+    stats = null; // no active segment yet — nothing to rotate
+  }
+  if (!stats || !stats.isFile() || stats.size + incomingBytes <= RECEIPTS_ROTATE_BYTES) return;
+  let entries: fs.Dirent[] = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    // treated as no segments; the rename below still targets a fresh name
+  }
+  let maxSeq = 0;
+  for (const entry of entries) {
+    const match = RECEIPTS_SEGMENT_PATTERN.exec(entry.name);
+    if (match) maxSeq = Math.max(maxSeq, Number(match[1]));
+  }
+  const segmentName = `receipts.${String(maxSeq + 1).padStart(6, "0")}.jsonl`;
+  const segmentPath = safeTruthFile(root, segmentName, { mustExist: false, enforceSizeCap: false });
+  if (fs.existsSync(segmentPath)) {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `receipts segment ${segmentName} already exists (fail closed)`);
+  }
+  fs.renameSync(active, segmentPath);
 }
 
 // ── Control-plane status layers ─────────────────────────────────────────────

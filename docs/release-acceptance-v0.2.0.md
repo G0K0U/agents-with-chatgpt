@@ -39,16 +39,32 @@ acceptance JSON) is kept out of the public repository by design.
   the only verified platform first release; everything else is NOT_TESTED
   and labeled as such.
 
+## Verified post-release hotfix (2026-09-12)
+
+- **Native ZCode Desktop route (Windows 11 x64)**: the live chain
+  desktop-agent proxy → Z2C → ZCode Desktop GLM session was accepted with
+  real (non-mocked) evidence — a harmless write task executed for real with
+  its output retrieved and verified on disk; the exact observed session
+  binding was `builtin:zai-start-plan / GLM-5.3-Flash` (source:
+  `desktop-session-read`, Desktop-managed authentication); same-session
+  resume completed in the identical session; cancellation reached a terminal
+  `cancelled` state; durable idempotency replay returned the same task while
+  a tampered request under the same key was refused
+  (`IDEMPOTENCY_CONFLICT`); wrong-workspace and unattested-session access
+  failed closed (`ZCODE_NATIVE_WORKSPACE_FORBIDDEN`).
+- **Public repository published**: this repository is live at
+  [G0K0U/agents-with-chatgpt](https://github.com/G0K0U/agents-with-chatgpt);
+  the release lineage includes commit `40d1a5a` (release + coordinator
+  idempotency contract) and the hotfix commit that supersedes it as HEAD.
+
 ## Explicitly NOT verified (do not assume)
 
 - ChatGPT client end-to-end with an authenticated connector — requires a
   human ChatGPT session (PENDING_MANUAL_ACCEPTANCE).
-- GitHub-hosted artifact re-verification (download-back + reinstall) — the
-  release is prepared; publishing requires repository write access.
+- GitHub-hosted artifact re-verification (download-back + reinstall).
 - Clean-machine (Windows Sandbox/VM) installer rerun.
-- macOS/Linux/arm64 platforms; Gemini models beyond live-verified
-  gemini-3.8-flash-high; native ZCode desktop (Desktop-managed route, exact binding `builtin:zai-start-plan / GLM-5.3-Flash`) dispatch —
-  all fail closed or NOT_TESTED, never claimed.
+- macOS/Linux/arm64 platforms and Gemini models beyond live-verified
+  gemini-3.8-flash-high — all fail closed or NOT_TESTED, never claimed.
 
 ## Distribution integrity
 

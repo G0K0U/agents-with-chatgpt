@@ -112,7 +112,7 @@ mere HTTP connectivity.
 | File | Role | Writers |
 |---|---|---|
 | `queue.jsonl` | append-only task queue (lifecycle input) | `zcode_enqueue_task` |
-| `receipts.jsonl` | append-only lifecycle truth (START, COMPLETED, FAILED, CANCELLED) | **only the C2C-owned coordinator** |
+| `receipts.jsonl` | append-only lifecycle truth (START, COMPLETED, FAILED, CANCELLED); the ACTIVE segment — read with bounded streaming, and rotated by the coordinator into deterministic `receipts.NNNNNN.jsonl` sibling segments inside the same queue root before it crosses the 8 MiB rotation threshold. History is never deleted or rewritten; duplicate pre-hotfix CANCELLED records remain as historical evidence | **only the C2C-owned coordinator** |
 | `control.jsonl` | append-only cancellation requests (`CANCEL_REQUESTED`) | `zcode_cancel_task` |
 | `worker-state.json` | bounded worker status cache (never lifecycle truth) | the C2C-owned coordinator |
 | `bootstrap-receipt.json` | bootstrap metadata (worker version/model/schedule) | bootstrap only |
