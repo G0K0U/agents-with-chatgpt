@@ -55,8 +55,8 @@ function makeFakeNative(workspaceId: string, options: { available?: boolean; pro
         provider: { name: provider },
         start_plan: {
           attested,
-          provider_id: attested ? "builtin:zai-coding-plan" : "UNKNOWN",
-          model_id: attested ? "GLM-5.3" : "UNKNOWN",
+          provider_id: attested ? "builtin:zai-start-plan" : "UNKNOWN",
+          model_id: attested ? "GLM-5.3-Flash" : "UNKNOWN",
           mismatches: attested ? [] : ["model_binding unobserved"],
         },
         ...(id ? {} : {}),
@@ -73,7 +73,7 @@ function makeFakeNative(workspaceId: string, options: { available?: boolean; pro
         session_id: `sess_00000000-0000-0000-0000-${String(counter).padStart(12, "0")}`,
         status: "running",
         exit_status: null,
-        model_binding: { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" },
+        model_binding: { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3-Flash" },
         instruction: input.instruction,
         idempotency_key: input.idempotency_key,
       };
@@ -176,7 +176,7 @@ describe("zcode coordinator lifecycle", () => {
     const done = new ZcodeControl(root).getTask(task.task_id);
     expect(done?.status).toBe("completed");
     expect(done?.receipts.map((r) => r.event)).toEqual(["START", "COMPLETED"]);
-    expect(done?.receipts[1].model).toBe("GLM-5.3");
+    expect(done?.receipts[1].model).toBe("GLM-5.3-Flash");
   });
 
   it("never claims when the native lane is unavailable and records the degraded layer", async () => {
@@ -255,6 +255,61 @@ describe("zcode coordinator lifecycle", () => {
     const view = new ZcodeControl(root).getTask(task.task_id);
     expect(view?.status).toBe("cancelled");
     expect(view?.receipts.map((r) => r.event)).toEqual(["START", "CANCELLED"]);
+  });
+
+  it("writes exactly one CANCELLED receipt for a queued cancel, then stays idempotent over 10 further ticks", async () => {
+    const native = makeFakeNative("wskyc039abcd");
+    const task = (await enqueue()) as { task_id: string };
+    await requestCancel(task.task_id);
+    const coordinator = makeCoordinator(native, { pollMs: 1000 });
+
+    await coordinator.runTick(); // writes the single CANCELLED terminal receipt
+    expect(new ZcodeControl(root).getTask(task.task_id)?.receipts.map((r) => r.event)).toEqual(["CANCELLED"]);
+
+    for (let i = 0; i < 10; i += 1) await coordinator.runTick();
+    const view = new ZcodeControl(root).getTask(task.task_id);
+    expect(view?.status).toBe("cancelled");
+    expect(view?.receipts.map((r) => r.event)).toEqual(["CANCELLED"]);
+    expect(native.submitKeys).toEqual([]);
+  });
+
+  it("never appends CANCELLED to a COMPLETED task carrying a stale CANCEL_REQUESTED", async () => {
+    const native = makeFakeNative("wskyc039abcd");
+    const task = (await enqueue()) as { task_id: string };
+    const coordinator = makeCoordinator(native, { pollMs: 1000 });
+    await coordinator.runTick(); // dispatch
+    for (const entry of native.tasks.values()) entry.status = "completed";
+    await coordinator.runTick(); // observes COMPLETED
+    // A CANCEL_REQUESTED record that predates the terminal receipt is the
+    // realistic "stale request" shape; write it directly (requestCancel
+    // refuses terminal tasks).
+    fs.appendFileSync(
+      path.join(root, "control.jsonl"),
+      JSON.stringify({ event: "CANCEL_REQUESTED", task_id: task.task_id, timestamp: new Date().toISOString() }) + "\n"
+    );
+
+    for (let i = 0; i < 10; i += 1) await coordinator.runTick();
+    const view = new ZcodeControl(root).getTask(task.task_id);
+    expect(view?.status).toBe("completed");
+    expect(view?.receipts.map((r) => r.event)).toEqual(["START", "COMPLETED"]);
+  });
+
+  it("never appends CANCELLED to a FAILED task carrying a stale CANCEL_REQUESTED", async () => {
+    const native = makeFakeNative("wskyc039abcd");
+    const task = (await enqueue()) as { task_id: string };
+    const coordinator = makeCoordinator(native, { pollMs: 1000 });
+    await coordinator.runTick(); // dispatch
+    for (const entry of native.tasks.values()) entry.status = "failed";
+    await coordinator.runTick(); // observes FAILED
+    fs.appendFileSync(
+      path.join(root, "control.jsonl"),
+      JSON.stringify({ event: "CANCEL_REQUESTED", task_id: task.task_id, timestamp: new Date().toISOString() }) + "\n"
+    );
+
+    for (let i = 0; i < 10; i += 1) await coordinator.runTick();
+    const view = new ZcodeControl(root).getTask(task.task_id);
+    expect(view?.status).toBe("failed");
+    expect(view?.receipts.map((r) => r.event)).toEqual(["START", "FAILED"]);
   });
 
   it("respects depends_on: only claims when every dependency reached COMPLETED", async () => {

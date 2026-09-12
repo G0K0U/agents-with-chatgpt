@@ -393,7 +393,16 @@ export class ZcodeCoordinator {
     const views = this.taskViews();
     for (const view of views) {
       if (!view.cancel_requested) continue;
-      if (view.status === "completed" || view.status === "failed" || view.status === "cancelled") continue;
+      // Terminal guard: a task that already has a terminal merged status
+      // (completed/failed/cancelled) must never receive another terminal
+      // receipt from a later tick — cancellation is idempotent.
+      if (
+        view.status === "completed" ||
+        view.status === "failed" ||
+        view.status === "cancelled"
+      ) {
+        continue;
+      }
       // Dispatched = a START receipt exists (or the merged status says
       // running). Anything not yet dispatched is terminal-cancelled locally;
       // a dispatched task gets its cancellation forwarded to the native lane
