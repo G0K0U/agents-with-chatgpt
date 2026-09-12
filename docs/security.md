@@ -101,7 +101,7 @@ operating-system account has access. Network remains disabled by default and is
 an explicit per-task opt-in in this deployment. This is an intentional
 permission trade-off, not a security pass under the former sandbox criteria.
 
-The fixed 14-tool MCP contract, OAuth scope checks, stable workspace registry,
+The fixed 28-tool MCP contract, OAuth scope checks, stable workspace registry,
 workspace/owner/session/task ownership, loopback-only admin API, and output
 redaction remain active. The verification profile below is still bridge-owned
 and bounded, but it is an observability/reproducibility guard rather than a

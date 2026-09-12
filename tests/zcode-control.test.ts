@@ -6,13 +6,15 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   FIXED_ZCODE_QUEUE_ROOT,
   ZcodeControl,
   ZcodeControlError,
+  resolveFixedZcodeQueueRoot,
 } from "../src/execution/zcode-control.js";
+import { WorkspaceRegistry } from "../src/workspace/registry.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
 function expectZcodeError(fn: () => unknown, code: string): void {
@@ -279,5 +281,346 @@ describe("reads", () => {
     );
     const listed = await control.listTasks();
     expect(listed.worker_state).toMatchObject({ status: "running", max_parallel: 3 });
+  });
+});
+
+describe("foreign cwd / system32 queue root resolution regression", () => {
+  it("resolves to configured fixed Engineering AI root without traversal when process cwd is system32 or foreign directory", async () => {
+    const engAiWs = makeTmpDir("engai-regression-ws");
+    createdDirs.push(engAiWs);
+    const zcodeRoot = path.join(engAiWs, "var", "c2c-zcode");
+    fs.mkdirSync(zcodeRoot, { recursive: true });
+
+    const foreignCwd = process.platform === "win32" && fs.existsSync("C:\\WINDOWS\\system32")
+      ? "C:\\WINDOWS\\system32"
+      : makeTmpDir("foreign-cwd");
+    if (foreignCwd !== "C:\\WINDOWS\\system32") createdDirs.push(foreignCwd);
+
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(foreignCwd);
+    const origEnv = process.env.C2C_ZCODE_QUEUE_ROOT;
+    try {
+      expect(process.cwd().toLowerCase()).toBe(foreignCwd.toLowerCase());
+
+      process.env.C2C_ZCODE_QUEUE_ROOT = zcodeRoot;
+      const ctrl = new ZcodeControl();
+
+      const enqueued = await ctrl.enqueue({
+        role: "worker",
+        priority: 10,
+        instruction: "Governed task executed while cwd is foreign/system32",
+      });
+
+      expect(enqueued.task_id).toMatch(/^zcode_[0-9a-f]{24}$/);
+      expect(fs.existsSync(path.join(zcodeRoot, "queue.jsonl"))).toBe(true);
+      expect(fs.existsSync(path.join(foreignCwd, "queue.jsonl"))).toBe(false);
+
+      const retrieved = ctrl.getTask(enqueued.task_id);
+      expect(retrieved?.task_id).toBe(enqueued.task_id);
+      expect(retrieved?.status).toBe("queued");
+    } finally {
+      cwdSpy.mockRestore();
+      if (origEnv === undefined) delete process.env.C2C_ZCODE_QUEUE_ROOT;
+      else process.env.C2C_ZCODE_QUEUE_ROOT = origEnv;
+    }
+  });
+
+  it("resolves to Engineering AI var/c2c-zcode from in-memory WorkspaceRegistry when C2C_ZCODE_QUEUE_ROOT is unset and cwd is foreign", async () => {
+    const engAiWs = makeTmpDir("engai-synth-reg-ws");
+    createdDirs.push(engAiWs);
+    const zcodeRoot = path.join(engAiWs, "var", "c2c-zcode");
+    fs.mkdirSync(zcodeRoot, { recursive: true });
+
+    const foreignCwd = process.platform === "win32" && fs.existsSync("C:\\WINDOWS\\system32")
+      ? "C:\\WINDOWS\\system32"
+      : makeTmpDir("foreign-cwd");
+    if (foreignCwd !== "C:\\WINDOWS\\system32") createdDirs.push(foreignCwd);
+
+    const syntheticRegistry = new WorkspaceRegistry({
+      initial: [
+        {
+          id: "0123456789ab",
+          name: "engineering-ai",
+          canonicalPath: engAiWs,
+          enabled: true,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    });
+
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(foreignCwd);
+    try {
+      const resolved = resolveFixedZcodeQueueRoot({
+        registry: syntheticRegistry,
+        env: {},
+      });
+      expect(resolved.toLowerCase()).toBe(zcodeRoot.toLowerCase());
+
+      const ctrl = new ZcodeControl({
+        registry: syntheticRegistry,
+        env: {},
+      });
+      const enqueued = await ctrl.enqueue({
+        role: "worker",
+        priority: 5,
+        instruction: "Task resolved via in-memory synthetic registry without cwd dependency",
+      });
+
+      expect(enqueued.task_id).toBeTruthy();
+      expect(fs.existsSync(path.join(zcodeRoot, "queue.jsonl"))).toBe(true);
+      expect(fs.existsSync(path.join(foreignCwd, "queue.jsonl"))).toBe(false);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it("resolves from synthetic persisted workspaces.json in stateDir when cwd is foreign", async () => {
+    const engAiWs = makeTmpDir("engai-synth-state-ws");
+    createdDirs.push(engAiWs);
+    const zcodeRoot = path.join(engAiWs, "var", "c2c-zcode");
+    fs.mkdirSync(zcodeRoot, { recursive: true });
+
+    const synthStateDir = makeTmpDir("synth-state-dir");
+    createdDirs.push(synthStateDir);
+    const workspacesJson = path.join(synthStateDir, "workspaces.json");
+    fs.writeFileSync(
+      workspacesJson,
+      JSON.stringify({
+        version: 1,
+        workspaces: [
+          {
+            id: "0123456789ab",
+            name: "engineering-ai",
+            canonicalPath: engAiWs,
+            enabled: true,
+            createdAt: new Date().toISOString(),
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const foreignCwd = process.platform === "win32" && fs.existsSync("C:\\WINDOWS\\system32")
+      ? "C:\\WINDOWS\\system32"
+      : makeTmpDir("foreign-cwd");
+    if (foreignCwd !== "C:\\WINDOWS\\system32") createdDirs.push(foreignCwd);
+
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(foreignCwd);
+    try {
+      const resolved = resolveFixedZcodeQueueRoot({
+        stateDir: synthStateDir,
+        env: {},
+      });
+      expect(resolved.toLowerCase()).toBe(zcodeRoot.toLowerCase());
+
+      const ctrl = new ZcodeControl({
+        stateDir: synthStateDir,
+        env: {},
+      });
+      const enqueued = await ctrl.enqueue({
+        role: "reviewer",
+        priority: 3,
+        instruction: "Task resolved via synthetic stateDir workspaces.json without cwd dependency",
+      });
+
+      expect(enqueued.task_id).toBeTruthy();
+      expect(fs.existsSync(path.join(zcodeRoot, "queue.jsonl"))).toBe(true);
+      expect(fs.existsSync(path.join(foreignCwd, "queue.jsonl"))).toBe(false);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it("resolves from synthetic runtime state in stateDir/runtime/<id>.json when cwd is foreign", async () => {
+    const engAiWs = makeTmpDir("engai-synth-runtime-ws");
+    createdDirs.push(engAiWs);
+    const zcodeRoot = path.join(engAiWs, "var", "c2c-zcode");
+    fs.mkdirSync(zcodeRoot, { recursive: true });
+
+    const synthStateDir = makeTmpDir("synth-runtime-dir");
+    createdDirs.push(synthStateDir);
+    const runtimeDir = path.join(synthStateDir, "runtime");
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(runtimeDir, "0123456789ab.json"),
+      JSON.stringify({ workspaceRoot: engAiWs }),
+      "utf8",
+    );
+    const runtimeEnv = { C2C_ENGINEERING_AI_WORKSPACE_ID: "0123456789ab" };
+
+    const foreignCwd = process.platform === "win32" && fs.existsSync("C:\\WINDOWS\\system32")
+      ? "C:\\WINDOWS\\system32"
+      : makeTmpDir("foreign-cwd");
+    if (foreignCwd !== "C:\\WINDOWS\\system32") createdDirs.push(foreignCwd);
+
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(foreignCwd);
+    try {
+      const resolved = resolveFixedZcodeQueueRoot({
+        stateDir: synthStateDir,
+        env: runtimeEnv,
+      });
+      expect(resolved.toLowerCase()).toBe(zcodeRoot.toLowerCase());
+
+      const ctrl = new ZcodeControl({
+        stateDir: synthStateDir,
+        env: runtimeEnv,
+      });
+      const enqueued = await ctrl.enqueue({
+        role: "admin",
+        priority: 1,
+        instruction: "Task resolved via synthetic runtime descriptor",
+      });
+
+      expect(enqueued.task_id).toBeTruthy();
+      expect(fs.existsSync(path.join(zcodeRoot, "queue.jsonl"))).toBe(true);
+      expect(fs.existsSync(path.join(foreignCwd, "queue.jsonl"))).toBe(false);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it("explicit absolute C2C_ZCODE_QUEUE_ROOT wins over registry and stateDir", () => {
+    const otherWs = makeTmpDir("other-ws");
+    createdDirs.push(otherWs);
+    const syntheticQueueDir = makeTmpDir("synth-explicit-queue");
+    createdDirs.push(syntheticQueueDir);
+
+    const syntheticRegistry = new WorkspaceRegistry({
+      initial: [
+        {
+          id: "0123456789ab",
+          name: "engineering-ai",
+          canonicalPath: otherWs,
+          enabled: true,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    });
+
+    const resolved = resolveFixedZcodeQueueRoot({
+      root: syntheticQueueDir,
+      registry: syntheticRegistry,
+      env: { C2C_ZCODE_QUEUE_ROOT: syntheticQueueDir },
+    });
+    expect(resolved.toLowerCase()).toBe(syntheticQueueDir.toLowerCase());
+  });
+
+  it("resolves relative configured root under authorized workspace root without process.cwd reliance", () => {
+    const engAiWs = makeTmpDir("engineering-ai-relative-ws");
+    createdDirs.push(engAiWs);
+
+    const resolved = resolveFixedZcodeQueueRoot({
+      root: "custom-var/zcode",
+      workspaceRoot: engAiWs,
+      env: {},
+    });
+    expect(resolved.toLowerCase()).toBe(path.resolve(engAiWs, "custom-var", "zcode").toLowerCase());
+  });
+
+  it("never anchors the queue under a foreign workspace root; the authorized registry wins", () => {
+    const foreignWs = makeTmpDir("bridge-repo-workspace");
+    createdDirs.push(foreignWs);
+    const engAiWs = makeTmpDir("engineering-ai-registry-ws");
+    createdDirs.push(engAiWs);
+    const registry = new WorkspaceRegistry({ initial: [
+      { id: "aabbccdde001", name: "some-product", canonicalPath: foreignWs, enabled: true },
+      { id: "aabbccdde002", name: "engineering-ai", canonicalPath: engAiWs, enabled: true },
+    ]});
+
+    // Default derivation: the foreign default workspace must not host the queue.
+    const resolved = resolveFixedZcodeQueueRoot({
+      workspaceRoot: foreignWs,
+      registry,
+      env: {},
+    });
+    expect(resolved.toLowerCase()).toBe(path.join(engAiWs, "var", "c2c-zcode").toLowerCase());
+  });
+
+  it("fails closed on empty root and never resolves to process cwd or system32", async () => {
+    const foreignCwd = process.platform === "win32" && fs.existsSync("C:\\WINDOWS\\system32")
+      ? "C:\\WINDOWS\\system32"
+      : makeTmpDir("foreign-cwd");
+    if (foreignCwd !== "C:\\WINDOWS\\system32") createdDirs.push(foreignCwd);
+
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(foreignCwd);
+    try {
+      expect(() => resolveFixedZcodeQueueRoot({ root: "" })).toThrowError(
+        expect.objectContaining({ code: "ZCODE_ROOT_MISSING" }),
+      );
+
+      const emptyCtrl = new ZcodeControl("");
+      await expect(
+        emptyCtrl.enqueue({ role: "worker", priority: 0, instruction: "fail closed test" }),
+      ).rejects.toMatchObject({ code: "ZCODE_ROOT_MISSING" });
+      expect(fs.existsSync(path.join(foreignCwd, "queue.jsonl"))).toBe(false);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it("rejects path traversal attempts independent of process cwd", async () => {
+    const foreignCwd = process.platform === "win32" && fs.existsSync("C:\\WINDOWS\\system32")
+      ? "C:\\WINDOWS\\system32"
+      : makeTmpDir("foreign-cwd");
+    if (foreignCwd !== "C:\\WINDOWS\\system32") createdDirs.push(foreignCwd);
+
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(foreignCwd);
+    try {
+      // Traversal in absolute path
+      const traversalRoot = `${root}${path.sep}..${path.sep}escape`;
+      const ctrl = new ZcodeControl(traversalRoot);
+      await expect(
+        ctrl.enqueue({ role: "worker", priority: 0, instruction: "traversal test" }),
+      ).rejects.toMatchObject({ code: "ZCODE_PATH_UNSAFE" });
+
+      // Relative path without anchor
+      const relativeCtrl = new ZcodeControl("var/c2c-zcode");
+      await expect(
+        relativeCtrl.enqueue({ role: "worker", priority: 0, instruction: "relative test" }),
+      ).rejects.toMatchObject({ code: "ZCODE_PATH_UNSAFE" });
+
+      // Traversal escaping authorized workspace
+      expect(() =>
+        resolveFixedZcodeQueueRoot({
+          root: `..${path.sep}escape`,
+          workspaceRoot: root,
+        }),
+      ).toThrowError(expect.objectContaining({ code: "ZCODE_PATH_UNSAFE" }));
+
+      expect(fs.existsSync(path.join(foreignCwd, "queue.jsonl"))).toBe(false);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it("fails closed with ZCODE_ROOT_MISSING when neither explicit root nor authorized workspace can be established", async () => {
+    const emptyStateDir = makeTmpDir("empty-state-dir");
+    createdDirs.push(emptyStateDir);
+
+    const foreignCwd = process.platform === "win32" && fs.existsSync("C:\\WINDOWS\\system32")
+      ? "C:\\WINDOWS\\system32"
+      : makeTmpDir("foreign-cwd");
+    if (foreignCwd !== "C:\\WINDOWS\\system32") createdDirs.push(foreignCwd);
+
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(foreignCwd);
+    try {
+      expect(() =>
+        resolveFixedZcodeQueueRoot({
+          stateDir: emptyStateDir,
+          env: {},
+        }),
+      ).toThrowError(expect.objectContaining({ code: "ZCODE_ROOT_MISSING" }));
+
+      const ctrl = new ZcodeControl({
+        stateDir: emptyStateDir,
+        env: {},
+      });
+      await expect(
+        ctrl.enqueue({ role: "worker", priority: 0, instruction: "should fail closed" }),
+      ).rejects.toMatchObject({ code: "ZCODE_ROOT_MISSING" });
+
+      expect(fs.existsSync(path.join(foreignCwd, "queue.jsonl"))).toBe(false);
+    } finally {
+      cwdSpy.mockRestore();
+    }
   });
 });

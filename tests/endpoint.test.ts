@@ -91,4 +91,3 @@ describe("endpoint stateDir handling", () => {
     }
   });
 });
-

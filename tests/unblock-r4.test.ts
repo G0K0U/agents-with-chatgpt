@@ -54,7 +54,10 @@ describe('R4 offline safety fixtures', () => {
   it('rejects narrow scope before spawn', async () => {
     const root=temp(), sub=path.join(root,'sub'); fs.mkdirSync(sub);
     const spy=vi.spyOn(cp,'spawn').mockImplementation(() => {throw new Error('must not spawn');});
-    const result=await new AntigravityBackend({stateDir:root,executablePath:'inert'}).execute({taskId:'fixture',workspaceId:'fixture',workspaceRoot:root,instruction:'fixture',writeScope:['sub'],writableRoots:[sub],networkRequested:false,networkEffective:false,fullAccess:true,runTests:false,timeoutMs:1000});
+    // Network is permitted so this test proves the WRITE gate independently
+    // of the network gate; full-access offline rejection is proven separately
+    // below via NETWORK_POLICY_UNSUPPORTED.
+    const result=await new AntigravityBackend({stateDir:root,executablePath:'inert'}).execute({taskId:'fixture',workspaceId:'fixture',workspaceRoot:root,instruction:'fixture',writeScope:['sub'],writableRoots:[sub],networkRequested:true,networkEffective:true,fullAccess:false,runTests:false,timeoutMs:1000});
     expect(result.error?.code).toBe('WRITE_SCOPE_UNSUPPORTED'); expect(spy).not.toHaveBeenCalled();
   });
   it.each(['example.com','localhost','127.0.0.2','127.0.0.1.evil','user@127.0.0.1'])('rejects non-allowlisted host %s before request',async host => {

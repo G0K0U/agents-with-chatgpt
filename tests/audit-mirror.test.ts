@@ -14,6 +14,10 @@ import {
   ENGINEERING_AI_ONEDRIVE_FOLDER,
   ENGINEERING_AI_WORKSPACE_ID,
   MAX_AUDIT_MIRROR_BYTES,
+  MAX_AUDIT_STATUS_MIRROR_BYTES,
+  MAX_AUDIT_STATUS_MIRROR_LINES,
+  MAX_AUDIT_TIMELINE_MIRROR_BYTES,
+  MAX_AUDIT_TIMELINE_MIRROR_LINES,
   resolveEngineeringAiAuditMirrorTarget,
   writeEngineeringAiAuditMirror,
 } from "../src/execution/audit-mirror.js";
@@ -346,5 +350,188 @@ describe("Engineering AI OneDrive audit mirror", () => {
       success: false,
       code: "ENGINEERING_AI_WORKSPACE_NOT_AUTHORIZED",
     });
+  });
+
+  it("status target still rejects content or ledger exceeding 2000 lines even below byte cap", async () => {
+    const root = makeOneDriveRoot("audit-mirror-status-lines");
+    const statusTarget = path.join(root, "Desktop", "Startup", ENGINEERING_AI_AUDIT_MIRROR_FILENAME);
+    const lineCount = MAX_AUDIT_STATUS_MIRROR_LINES + 1;
+    const overLinesContent = "status-entry\n".repeat(lineCount);
+    expect(Buffer.byteLength(overLinesContent, "utf8")).toBeLessThan(MAX_AUDIT_STATUS_MIRROR_BYTES);
+
+    const contentEvidence = await writeEngineeringAiAuditMirror({
+      oneDriveRoot: root,
+      content: overLinesContent,
+    });
+    expect(contentEvidence).toMatchObject({
+      success: false,
+      code: "SOURCE_TOO_LARGE",
+      targetFilename: ENGINEERING_AI_AUDIT_MIRROR_FILENAME,
+    });
+    expect(fs.existsSync(statusTarget)).toBe(false);
+
+    const sourceRoot = makeTmpDir("audit-mirror-status-ledger-lines");
+    temporaryDirectories.push(sourceRoot);
+    const statusLedgerPath = path.join(sourceRoot, ENGINEERING_AI_AUDIT_STATUS_LEDGER_RELATIVE_PATH);
+    fs.mkdirSync(path.dirname(statusLedgerPath), { recursive: true });
+    fs.writeFileSync(statusLedgerPath, overLinesContent, "utf8");
+
+    const ledgerWorkspace = {
+      id: ENGINEERING_AI_WORKSPACE_ID,
+      resolve: (requested: string) => ({
+        abs: path.join(sourceRoot, requested),
+        rel: requested,
+      }),
+    } as unknown as Workspace;
+
+    const ledgerEvidence = await writeEngineeringAiAuditMirror({
+      oneDriveRoot: root,
+      source: "engineering_ai_ledger",
+      ledgerWorkspace,
+    });
+    expect(ledgerEvidence).toMatchObject({
+      success: false,
+      code: "SOURCE_TOO_LARGE",
+      targetFilename: ENGINEERING_AI_AUDIT_MIRROR_FILENAME,
+    });
+    expect(fs.existsSync(statusTarget)).toBe(false);
+  });
+
+  it("timeline target accepts a canonical ledger exceeding 2000 lines when below 8MiB and 100000 lines", async () => {
+    const root = makeOneDriveRoot("audit-mirror-timeline-longevity");
+    const sourceRoot = makeTmpDir("audit-mirror-timeline-longevity-source");
+    temporaryDirectories.push(sourceRoot);
+    const timelinePath = path.join(sourceRoot, ENGINEERING_AI_AUDIT_TIMELINE_LEDGER_RELATIVE_PATH);
+    fs.mkdirSync(path.dirname(timelinePath), { recursive: true });
+
+    const lineCount = 2501;
+    const lines: string[] = ["# Engineering AI audit execution timeline", ""];
+    for (let i = 1; i <= lineCount - 2; i++) {
+      lines.push(`- iteration ${i}: step completed`);
+    }
+    const timelineContent = lines.join("\n") + "\n";
+    const timelineBytes = Buffer.from(timelineContent, "utf8");
+
+    expect(timelineBytes.length).toBeLessThan(MAX_AUDIT_TIMELINE_MIRROR_BYTES);
+    expect(lineCount).toBeGreaterThan(MAX_AUDIT_STATUS_MIRROR_LINES);
+    expect(lineCount).toBeLessThan(MAX_AUDIT_TIMELINE_MIRROR_LINES);
+
+    fs.writeFileSync(timelinePath, timelineBytes);
+    const ledgerWorkspace = {
+      id: ENGINEERING_AI_WORKSPACE_ID,
+      resolve: (requested: string) => ({
+        abs: path.join(sourceRoot, requested),
+        rel: requested,
+      }),
+    } as unknown as Workspace;
+
+    const evidence = await writeEngineeringAiAuditMirror({
+      oneDriveRoot: root,
+      requestedPath: ENGINEERING_AI_AUDIT_TIMELINE_RELATIVE_PATH,
+      source: "engineering_ai_ledger",
+      ledgerWorkspace,
+    });
+
+    const target = path.join(root, "Desktop", "Startup", ENGINEERING_AI_AUDIT_TIMELINE_FILENAME);
+    const expectedSha256 = createHash("sha256").update(timelineBytes).digest("hex");
+
+    expect(evidence).toMatchObject({
+      success: true,
+      code: "OK",
+      logicalTarget: ENGINEERING_AI_AUDIT_TIMELINE_LOGICAL_PATH,
+      resolvedTarget: target,
+      targetFilename: ENGINEERING_AI_AUDIT_TIMELINE_FILENAME,
+      source: "engineering_ai_ledger",
+      byteCount: timelineBytes.length,
+      sha256: expectedSha256,
+      targetSha256: expectedSha256,
+      freshness: "fresh",
+    });
+    expect(fs.readFileSync(target)).toEqual(timelineBytes);
+  });
+
+  it("timeline target rejects >100000 lines or >8MiB fail-closed without replacing a prior valid target", async () => {
+    const root = makeOneDriveRoot("audit-mirror-timeline-fail-closed");
+    const target = path.join(root, "Desktop", "Startup", ENGINEERING_AI_AUDIT_TIMELINE_FILENAME);
+    const priorContent = "# Initial valid timeline\n\n- entry 1: ok\n";
+    const priorBytes = Buffer.from(priorContent, "utf8");
+    const priorSha256 = createHash("sha256").update(priorBytes).digest("hex");
+
+    const initial = await writeEngineeringAiAuditMirror({
+      oneDriveRoot: root,
+      requestedPath: ENGINEERING_AI_AUDIT_TIMELINE_RELATIVE_PATH,
+      content: priorContent,
+    });
+    expect(initial).toMatchObject({
+      success: true,
+      code: "OK",
+      sha256: priorSha256,
+      targetFilename: ENGINEERING_AI_AUDIT_TIMELINE_FILENAME,
+      freshness: "fresh",
+    });
+    expect(fs.readFileSync(target, "utf8")).toBe(priorContent);
+
+    const overLinesCount = MAX_AUDIT_TIMELINE_MIRROR_LINES + 1;
+    const overLinesContent = "e\n".repeat(overLinesCount);
+    expect(Buffer.byteLength(overLinesContent, "utf8")).toBeLessThan(MAX_AUDIT_TIMELINE_MIRROR_BYTES);
+
+    const lineExceededEvidence = await writeEngineeringAiAuditMirror({
+      oneDriveRoot: root,
+      requestedPath: ENGINEERING_AI_AUDIT_TIMELINE_RELATIVE_PATH,
+      content: overLinesContent,
+    });
+    expect(lineExceededEvidence).toMatchObject({
+      success: false,
+      code: "SOURCE_TOO_LARGE",
+      targetFilename: ENGINEERING_AI_AUDIT_TIMELINE_FILENAME,
+      targetSha256: priorSha256,
+      freshness: "fresh",
+    });
+    expect(fs.readFileSync(target, "utf8")).toBe(priorContent);
+
+    const overBytesContent = "x".repeat(MAX_AUDIT_TIMELINE_MIRROR_BYTES + 1);
+
+    const byteExceededEvidence = await writeEngineeringAiAuditMirror({
+      oneDriveRoot: root,
+      requestedPath: ENGINEERING_AI_AUDIT_TIMELINE_RELATIVE_PATH,
+      content: overBytesContent,
+    });
+    expect(byteExceededEvidence).toMatchObject({
+      success: false,
+      code: "SOURCE_TOO_LARGE",
+      targetFilename: ENGINEERING_AI_AUDIT_TIMELINE_FILENAME,
+      targetSha256: priorSha256,
+      freshness: "fresh",
+    });
+    expect(fs.readFileSync(target, "utf8")).toBe(priorContent);
+
+    const sourceRoot = makeTmpDir("audit-mirror-timeline-oversized-source");
+    temporaryDirectories.push(sourceRoot);
+    const ledgerPath = path.join(sourceRoot, ENGINEERING_AI_AUDIT_TIMELINE_LEDGER_RELATIVE_PATH);
+    fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+    fs.writeFileSync(ledgerPath, overLinesContent, "utf8");
+
+    const ledgerWorkspace = {
+      id: ENGINEERING_AI_WORKSPACE_ID,
+      resolve: (requested: string) => ({
+        abs: path.join(sourceRoot, requested),
+        rel: requested,
+      }),
+    } as unknown as Workspace;
+
+    const ledgerLineExceededEvidence = await writeEngineeringAiAuditMirror({
+      oneDriveRoot: root,
+      requestedPath: ENGINEERING_AI_AUDIT_TIMELINE_RELATIVE_PATH,
+      source: "engineering_ai_ledger",
+      ledgerWorkspace,
+    });
+    expect(ledgerLineExceededEvidence).toMatchObject({
+      success: false,
+      code: "SOURCE_TOO_LARGE",
+      targetFilename: ENGINEERING_AI_AUDIT_TIMELINE_FILENAME,
+      targetSha256: priorSha256,
+      freshness: "fresh",
+    });
+    expect(fs.readFileSync(target, "utf8")).toBe(priorContent);
   });
 });

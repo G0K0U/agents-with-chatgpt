@@ -1,3 +1,4 @@
+import { fullAccessDevelopmentEnabled } from "../config/development.js";
 import { Command } from "commander";
 import fs from "node:fs";
 import path from "node:path";
@@ -316,7 +317,7 @@ program
       stateDir,
       port: opts.port ? parseInt(opts.port, 10) : undefined,
       logger,
-      fullAccess: true,
+      fullAccess: fullAccessDevelopmentEnabled(),
     });
     const shutdown = (): void => {
       void bridge.close().then(() => process.exit(0));

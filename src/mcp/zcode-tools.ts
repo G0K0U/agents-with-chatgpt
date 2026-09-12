@@ -1,5 +1,5 @@
 /**
- * ChatGPT-facing ZCode free-window queue tools.
+ * ChatGPT-facing governed ZCode scheduled-queue tools.
  *
  * These tools give C2C governed access to the configured ZCode worker queue
  * (C2C_ZCODE_QUEUE_ROOT): enqueue governed tasks,
@@ -7,7 +7,7 @@
  * root is fixed in zcode-control.ts and can never be chosen by a caller.
  *
  * Governance: terminal receipts (COMPLETED/FAILED/CANCELLED) are written
- * exclusively by the ZCode free-window worker coordinator. This surface can
+ * exclusively by the governed ZCode queue coordinator. This surface can
  * only append CANCEL_REQUESTED to control.jsonl.
  */
 import { z } from "zod";
@@ -17,6 +17,8 @@ import {
   FIXED_ZCODE_QUEUE_ROOT,
   ZcodeControl,
   ZcodeControlError,
+  describeControlPlane,
+  resolveFixedZcodeQueueRoot,
 } from "../execution/zcode-control.js";
 import { sanitizeExecutionOutput } from "../execution/sanitize.js";
 import type { McpContext } from "./server.js";
@@ -75,7 +77,24 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
   const { ctx, resolveWorkspace, requireScope, fail, mapError, untrustedNote } = deps;
   const ok = (data: unknown): ToolResult => deps.ok(safeOutput(data));
 
-  const control = (): ZcodeControl => new ZcodeControl();
+  let declaredRoot = FIXED_ZCODE_QUEUE_ROOT;
+  if (!declaredRoot) {
+    try {
+      declaredRoot = resolveFixedZcodeQueueRoot({
+        workspaceRoot: ctx.workspace?.root,
+        stateDir: ctx.stateDir,
+        registry: ctx.registry,
+      });
+    } catch {
+      declaredRoot = "";
+    }
+  }
+
+  const control = (workspaceRoot?: string): ZcodeControl => new ZcodeControl({
+    workspaceRoot: workspaceRoot ?? ctx.workspace?.root,
+    stateDir: ctx.stateDir,
+    registry: ctx.registry,
+  });
 
   const mapErr = (error: unknown): ToolResult => {
     if (error instanceof ZcodeControlError) {
@@ -89,11 +108,11 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
     {
       title: "Enqueue ZCode worker task",
       description:
-        `Append one governed task to the fixed ZCode free-window queue ` +
-        `(${redact(FIXED_ZCODE_QUEUE_ROOT)}). network must remain false. The task_id must be ` +
+        `Append one governed task to the fixed governed ZCode scheduled queue ` +
+        `(${redact(declaredRoot || "[fixed engineering-ai var/c2c-zcode root]")}). network must remain false. The task_id must be ` +
         `unique across the queue and its receipts. Credential-like instructions ` +
         `(token/password/cookie/api_key/client_secret/private key) are rejected. The ZCode ` +
-        `free-window coordinator claims tasks during the discounted window; terminal ` +
+        `governed coordinator claims tasks while its claim window is open; terminal ` +
         `receipts are written only by that coordinator. ${untrustedNote}`,
       inputSchema: {
         role: z.enum(["worker", "reviewer", "admin", "task"]).describe("Worker role requested for this task"),
@@ -116,9 +135,9 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
       if (denied) return denied;
       // Workspace authorization stays in C2C: the caller must hold access to
       // the default workspace even though the queue root itself is fixed.
-      resolveWorkspace(undefined, extra.authInfo);
+      const ws = resolveWorkspace(undefined, extra.authInfo);
       try {
-        const stored = await control().enqueue({
+        const stored = await control(ws?.root).enqueue({
           task_id: args.task_id,
           role: args.role,
           priority: args.priority,
@@ -137,7 +156,7 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
           network: false,
           status: "queued",
           queueRoot: "[fixed engineering-ai var/c2c-zcode root]",
-          note: "Claimed only by the ZCode free-window coordinator; track with zcode_get_task.",
+          note: "Claimed only by the governed ZCode queue coordinator; track with zcode_get_task.",
         });
       } catch (error) {
         return mapErr(error);
@@ -150,7 +169,7 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
     {
       title: "Get ZCode worker task",
       description:
-        `Read one ZCode free-window task: merged status (queued → cancel_requested → running ` +
+        `Read one governed ZCode scheduled-queue task: merged status (queued → cancel_requested → running ` +
         `→ completed/failed/cancelled), its receipts and any recorded error. receipts.jsonl ` +
         `is the lifecycle truth. ${untrustedNote}`,
       inputSchema: {
@@ -162,7 +181,13 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
       try {
-        const view = control().getTask(args.task_id);
+        let wsRoot: string | undefined;
+        try {
+          wsRoot = resolveWorkspace(undefined, extra.authInfo)?.root;
+        } catch {
+          // Keep default resolution
+        }
+        const view = control(wsRoot).getTask(args.task_id);
         if (!view) {
           return fail("ZCODE_TASK_UNKNOWN", `task_id ${args.task_id} is not a known queued task`);
         }
@@ -178,8 +203,10 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
     {
       title: "List ZCode worker tasks",
       description:
-        `List ZCode free-window tasks in queue order with merged lifecycle status and the ` +
-        `bounded worker state cache. Use zcode_get_task for one task's receipts. ${untrustedNote}`,
+        `List governed ZCode scheduled-queue tasks in queue order with merged lifecycle status, the ` +
+        `bounded worker state cache, and a control_plane health layer (QUEUE_ROOT_MISSING, ` +
+        `COORDINATOR_NOT_RUNNING, OUTSIDE_CLAIM_WINDOW, ZCODE_DESKTOP_UNAVAILABLE, ` +
+        `AUTH_NOT_ATTESTED, WRONG_PROVIDER, READY). Use zcode_get_task for one task's receipts. ${untrustedNote}`,
       inputSchema: {
         limit: z.number().int().min(1).max(100).default(50),
       },
@@ -189,7 +216,18 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
       try {
-        return ok(control().listTasks(args.limit));
+        let wsRoot: string | undefined;
+        try {
+          wsRoot = resolveWorkspace(undefined, extra.authInfo)?.root;
+        } catch {
+          // Keep default resolution
+        }
+        const resolution = { workspaceRoot: wsRoot ?? ctx.workspace?.root, stateDir: ctx.stateDir, registry: ctx.registry };
+        const listing = control(wsRoot).listTasks(args.limit);
+        // Bounded layered health: which control-plane layer is broken, derived
+        // from local truth files only (never a synchronous upstream probe).
+        const controlPlane = describeControlPlane(resolution);
+        return ok({ ...listing, control_plane: controlPlane });
       } catch (error) {
         return mapErr(error);
       }
@@ -201,7 +239,7 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
     {
       title: "Cancel ZCode worker task",
       description:
-        `Request cancellation of a known non-terminal ZCode free-window task. This only ` +
+        `Request cancellation of a known non-terminal governed ZCode scheduled-queue task. This only ` +
         `appends CANCEL_REQUESTED to control.jsonl — it never writes terminal receipts; ` +
         `the ZCode coordinator owns COMPLETED/FAILED/CANCELLED. Repeated requests are ` +
         `idempotent. ${untrustedNote}`,
@@ -214,7 +252,13 @@ export function registerZcodeTools(server: McpServer, deps: ZcodeToolDeps): void
       const denied = requireScope(extra.authInfo, "execution.cancel");
       if (denied) return denied;
       try {
-        return ok(await control().requestCancel(args.task_id));
+        let wsRoot: string | undefined;
+        try {
+          wsRoot = resolveWorkspace(undefined, extra.authInfo)?.root;
+        } catch {
+          // Keep default resolution
+        }
+        return ok(await control(wsRoot).requestCancel(args.task_id));
       } catch (error) {
         return mapErr(error);
       }

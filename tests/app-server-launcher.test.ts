@@ -209,3 +209,16 @@ describe("Codex task launcher failure mapping", () => {
     throw new Error("Task did not reach the expected launcher failure");
   });
 });
+
+
+describe("native offline full-access limitation", () => {
+  it.each([false, undefined])("rejects network=%s before executable resolution or spawn", async networkAccess => {
+    const resolveExecutable = vi.fn(() => windowsExecutable);
+    const spawnChild = vi.fn();
+    const client = new CodexAppServerClient({ workspaceRoot: process.cwd(), logger: nullLogger, fullAccess: true, networkAccess },
+      { resolveExecutable, spawn: spawnChild as unknown as typeof spawn });
+    await expect(client.initialize()).rejects.toThrow("NETWORK_POLICY_UNSUPPORTED");
+    expect(resolveExecutable).not.toHaveBeenCalled();
+    expect(spawnChild).not.toHaveBeenCalled();
+  });
+});

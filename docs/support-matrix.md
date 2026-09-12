@@ -23,8 +23,8 @@ but are unclaimed until verified.
 |---|---|---|
 | Codex App Server (official) | VERIFIED in hermetic tests + live use | primary executor; full-access mode is an explicit local choice |
 | Antigravity / Gemini | VERIFIED (adapter + live gemini-3.8-flash-high) | offline workspace contract, identity separation, and live G7C activation verified; other models unverified; workspace granularity |
-| ZCode native (Z2C desktop, Start Plan) | VERIFIED on Windows 11 x64 | Status/self-test passed; exact session binding is `builtin:zai-start-plan / GLM-5.3-Flash`; real native model turn completed; same-session resume returned the new turn response; Engineering AI workspace probe completed. Companion Z2C Desktop bridge is external to this repository and Desktop owns authentication; requires `ZCODE_NATIVE_ALLOWED_WORKSPACES`. See [acceptance notes](release-acceptance-v0.2.0.md). |
-| ZCode free-window queue (`zcode_*` tools) | VERIFIED in hermetic tests | disabled until `C2C_ZCODE_QUEUE_ROOT` is configured |
+| ZCode native (Z2C Desktop, Desktop-managed plan route) | PENDING: fails closed unless the operator runs the Z2C desktop-agent proxy and enables the workspace via `ZCODE_NATIVE_ALLOWED_WORKSPACES` | binding gate requires observed `builtin:zai-start-plan / GLM-5.3-Flash` |
+| ZCode scheduled queue (`zcode_*` tools) | VERIFIED in hermetic tests | disabled until `C2C_ZCODE_QUEUE_ROOT` is configured |
 | Omnigent | DEPRECATED | legacy orchestrator, not recommended; see docs/omnigent.md |
 
 ## Public surface

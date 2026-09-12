@@ -271,13 +271,13 @@ describe("named tunnel runtime reconciliation", () => {
   it("renders the current origin port atomically and never uses the quick-tunnel --url shortcut", () => {
     const first = renderNamedTunnelConfig({
       tunnelId: "33333333-3333-3333-3333-333333333333",
-      credentialsFile: "C:\\Users\\tester\\.cloudflared\\33333333-3333-3333-3333-333333333333.json",
+      credentialsFile: "C:\\Users\\Peter\\.cloudflared\\33333333-3333-3333-3333-333333333333.json",
       hostname: "c2c.example.com",
       localPort: 51092,
     });
     const second = renderNamedTunnelConfig({
       tunnelId: "33333333-3333-3333-3333-333333333333",
-      credentialsFile: "C:\\Users\\tester\\.cloudflared\\33333333-3333-3333-3333-333333333333.json",
+      credentialsFile: "C:\\Users\\Peter\\.cloudflared\\33333333-3333-3333-3333-333333333333.json",
       hostname: "c2c.example.com",
       localPort: 51093,
     });

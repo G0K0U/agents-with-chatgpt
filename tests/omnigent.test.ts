@@ -543,8 +543,9 @@ describe("Omnigent G1", () => {
     const taskManager = manager();
     const server = createMcpServer({ workspace, logger: nullLogger, stateDir: state, sessions, taskManager, authorizedWorkspaceIds: [workspace.id] });
     const tools = (server as any)._registeredTools;
-    expect(Object.keys(tools)).toHaveLength(33);
-    expect(Object.keys(tools).filter((name) => name.startsWith("omnigent_"))).toHaveLength(6);
+    // Omnigent MCP tools are deprecated; the current surface is 28 tools with none.
+    expect(Object.keys(tools)).toHaveLength(28);
+    expect(Object.keys(tools).filter((name) => name.startsWith("omnigent_"))).toHaveLength(0);
     const denied = await tools.submit_codex_task.handler(input(), { authInfo: { clientId: "bob", scopes: ["execution.submit"], extra: { authorizedWorkspaceIds: [] } } });
     expect(denied.isError).toBe(true);
     expect(fake.calls).toHaveLength(0);

@@ -19,7 +19,6 @@ import {
   writeEngineeringAiAuditMirror,
 } from "../execution/audit-mirror.js";
 import { C2CSessionRegistry, SessionRegistryError, type C2CSession } from "../session/registry.js";
-import { registerOmnigentTools } from "./omnigent-tools.js";
 import { registerZcodeTools } from "./zcode-tools.js";
 import { registerZcodeNativeTools } from "./zcode-native-tools.js";
 import { registerQuantaTools } from "./quanta-tools.js";
@@ -1178,18 +1177,9 @@ export function createMcpServer(ctx: McpContext): McpServer {
     }
   );
 
-  // Full-access Omnigent control surface (operator-elected; see omnigent-control.ts).
-  registerOmnigentTools(server, {
-    ctx,
-    resolveWorkspace,
-    requireScope,
-    ok,
-    fail,
-    mapError,
-    untrustedNote: UNTRUSTED_NOTE,
-  });
+  // Omnigent is deprecated; native provider tools are the only execution lanes.
 
-  // Governed C2C → ZCode free-window queue surface (fixed root; see zcode-control.ts).
+  // Governed C2C → ZCode scheduled-queue surface (fixed root; see zcode-control.ts).
   registerZcodeTools(server, {
     ctx,
     resolveWorkspace,
@@ -1200,8 +1190,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
     untrustedNote: UNTRUSTED_NOTE,
   });
 
-  // Governed C2C → independent Z2C desktop control plane (native Start Plan realtime;
-  // separate path from the free-window queue; see execution/zcode-native.ts).
+  // Governed C2C → independent Z2C desktop control plane (native Desktop-managed realtime;
+  // separate path from the scheduled queue; see execution/zcode-native.ts).
   // Principal workspace authorization uses the same resolveWorkspace semantics as
   // every other tool; the shared per-workspace queue pause/freeze and writer slot
   // gate new dispatches, while cancellation of an authorized task stays available.

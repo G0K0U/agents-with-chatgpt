@@ -17,8 +17,8 @@ ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的
 执行器掌握。你的仓库永远不会被上传——ChatGPT 通过 OAuth MCP 连接按需读取代码，
 并可通过本地 Codex App Server 提交任务。当前 CLI 按已选择的 full-access 模式运行执行器：
 Codex 可以使用 bridge 进程拥有的文件系统和进程权限；网络默认关闭，只有任务明确设置
-`network: true` 且本地 full-access 部署允许时才开启。公开 MCP 接口仍保持固定的 14 个
-工具，其中外部写入仅限单独授权的精确审计镜像工具，不新增通用 Shell 工具。
+`network: true` 且本地 full-access 部署允许时才开启。公开 MCP 接口仍保持固定、显式枚举的 28 个 MCP 工具，
+其中外部写入仅限单独授权的精确审计镜像工具，不新增通用 Shell 工具。
 
 ## 一行命令安装（Windows 11 x64）
 
@@ -49,7 +49,7 @@ Agent（Codex），然后去倒杯咖啡：
 请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
 所有事情你自己做：
 
-1. 环境自检：需要 git 和 Node.js ≥ 22，缺什么就自动安装
+1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
   （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
 2. 下载：把 https://github.com/G0K0U/agents-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
@@ -173,7 +173,7 @@ c2c sandbox-allow   # 把本地设置目录加入 Codex 沙箱白名单（macOS 
 c2c status / doctor / pair / unpair / logs / stop
 ```
 
-环境要求：Node.js >= 22、git；公网连接需要 `cloudflared`
+环境要求：Node.js >= 20、git；公网连接需要 `cloudflared`
 （自动检测，Skill 会替你安装）。
 
 文档：[架构](docs/architecture.md) · [协议](docs/protocol.md) ·

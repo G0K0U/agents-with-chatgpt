@@ -34,7 +34,7 @@ import { makeTmpDir, cleanup } from "./helpers.js";
 const TEST_TOKEN = "test-token-0123456789abcdef";
 const ENGINEERING_AI_WS = "1a2b3c4d5e6f";
 const C2C_WS = "9f8e7d6c5b4a";
-const START_PLAN_BINDING = {
+const SANCTIONED_BINDING = {
   provider_id: ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id,
   model_id: ZCODE_NATIVE_REQUIRED_IDENTITY.model_id,
 };
@@ -201,6 +201,11 @@ async function startFakeZ2c(): Promise<void> {
           return { content: [{ type: "text", text: JSON.stringify(fake.outputBody) }] };
         },
       );
+      mcp.registerTool("read_zcode_session", { inputSchema: { workspace_id: z.string(), session_id: z.string() } }, async args => {
+        const view = [...fake.tasks.values()].map(t => t.view).find(v => v.workspace_id === args.workspace_id && v.session_id === args.session_id);
+        if (!view) return upstreamError("Z2C_BINDING_UNVERIFIED: session binding unverified for this workspace");
+        return { content: [{ type: "text", text: JSON.stringify({ ...args, canonical_path: process.cwd(), model_binding: { ...(view.model_binding as object), source: "desktop-session-read" }, immediate_resume: "native-session-v1" }) }] };
+      });
       mcp.registerTool(
         "resume_zcode_session",
         { inputSchema: { workspace_id: z.string(), session_id: z.string(), instruction: z.string() } },
@@ -249,9 +254,9 @@ function healthyFake(): void {
     providerName: ZCODE_NATIVE_REQUIRED_IDENTITY.provider,
     providerStatus: "healthy",
     capsOk: true,
-    modelBinding: { ...START_PLAN_BINDING },
+    modelBinding: { ...SANCTIONED_BINDING },
     bindingWorkspace: C2C_WS,
-    submitBinding: { ...START_PLAN_BINDING },
+    submitBinding: { ...SANCTIONED_BINDING },
     echoAuth: false,
     ignoreWorkspaceScope: false,
     spoofSubmitWorkspace: null,
@@ -337,15 +342,15 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     await expect(c.submitTask(input)).rejects.toBeInstanceOf(ZcodeNativeError);
     expect(fake.submitCalls).toBe(1);
   });
-  it("1. attests Start Plan only from a real reported binding", async () => {
+  it("1. attests the sanctioned Desktop GLM binding only from a real reported binding", async () => {
     const status = await client().status(C2C_WS);
     expect(status.available).toBe(true);
     expect(status.desktop_managed_auth).toBe(true);
     expect(status.provider?.name).toBe("zcode-desktop");
     expect(status.capabilities_ok).toBe(true);
     expect(status.start_plan?.attested).toBe(true);
-    expect(status.start_plan?.provider_id).toBe("builtin:zai-start-plan");
-    expect(status.start_plan?.model_id).toBe("GLM-5.3-Flash");
+    expect(status.start_plan?.provider_id).toBe(ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id);
+    expect(status.start_plan?.model_id).toBe(ZCODE_NATIVE_REQUIRED_IDENTITY.model_id);
     expect(status.start_plan?.identity_source).toBe("control-plane-reported");
     expect(status.allowed_workspaces).toEqual([...nativeAllowedWorkspaces()]);
   });
@@ -361,20 +366,19 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     });
   });
 
-  it("3. rejects a wrong reported provider binding", async () => {
-    fake.modelBinding = { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3-Flash" };
+  it("3. attests the CURRENT Desktop plan binding builtin:zai-start-plan (live-observed 2026-09-12)", async () => {
+    fake.modelBinding = { provider_id: "builtin:zai-start-plan", model_id: ZCODE_NATIVE_REQUIRED_IDENTITY.model_id };
     fake.submitBinding = { ...fake.modelBinding };
     const status = await client().status(C2C_WS);
-    expect(status.start_plan?.attested).toBe(false);
-    expect(status.start_plan?.provider_id).toBe("builtin:zai-coding-plan");
-    expect(status.start_plan?.mismatches.join(";")).toContain("provider_id=builtin:zai-coding-plan");
-    await expect(client().submitTask({ workspace_id: C2C_WS, instruction: "x" })).rejects.toMatchObject({
-      code: "ZCODE_NATIVE_NOT_ATTESTED",
-    });
+    expect(status.start_plan?.attested).toBe(true);
+    expect(status.start_plan?.provider_id).toBe("builtin:zai-start-plan");
+    expect(status.start_plan?.mismatches).toEqual([]);
+    const view = await client().submitTask({ workspace_id: C2C_WS, instruction: "x" });
+    expect(view.model_binding).toMatchObject({ provider_id: "builtin:zai-start-plan" });
   });
 
-  it("4. rejects a wrong reported model binding", async () => {
-    fake.modelBinding = { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3" };
+  it("4. rejects a wrong reported model binding (obsolete GLM-5.3 stays rejected)", async () => {
+    fake.modelBinding = { provider_id: ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id, model_id: "GLM-5.3" };
     fake.submitBinding = { ...fake.modelBinding };
     fake.bindingWorkspace = ENGINEERING_AI_WS; // admission passes; the returned binding is wrong
     const status = await client().status(ENGINEERING_AI_WS);
@@ -382,6 +386,18 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     expect(status.start_plan?.model_id).toBe("GLM-5.3");
     expect(status.start_plan?.mismatches.join(";")).toContain("model_id=GLM-5.3");
     await expect(client().submitTask({ workspace_id: ENGINEERING_AI_WS, instruction: "x" })).rejects.toMatchObject({
+      code: "ZCODE_NATIVE_NOT_ATTESTED",
+    });
+  });
+
+  it("4b. rejects the RETIRED identity builtin:zai-coding-plan/GLM-5.3", async () => {
+    fake.modelBinding = { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" };
+    fake.submitBinding = { ...fake.modelBinding };
+    const status = await client().status(C2C_WS);
+    expect(status.start_plan?.attested).toBe(false);
+    expect(status.start_plan?.mismatches.join(";")).toContain("provider_id=builtin:zai-coding-plan");
+    expect(status.start_plan?.mismatches.join(";")).toContain("model_id=GLM-5.3");
+    await expect(client().submitTask({ workspace_id: C2C_WS, instruction: "x" })).rejects.toMatchObject({
       code: "ZCODE_NATIVE_NOT_ATTESTED",
     });
   });
@@ -395,8 +411,8 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     // Status never gates creation: identity is proven per task by the binding
     // Z2C observed for the exact session at admission.
     const submitted = await client().submitTask({ workspace_id: C2C_WS, instruction: "x" });
-    expect(submitted.model_binding?.provider_id).toBe("builtin:zai-start-plan");
-    expect(submitted.model_binding?.model_id).toBe("GLM-5.3-Flash");
+    expect(submitted.model_binding?.provider_id).toBe(ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id);
+    expect(submitted.model_binding?.model_id).toBe(ZCODE_NATIVE_REQUIRED_IDENTITY.model_id);
   });
 
   it("6. idle status stays UNKNOWN and does not block; admission proves identity per task", async () => {
@@ -413,8 +429,8 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     expect(submitted.task_id).toMatch(/^z2c_/);
     expect(submitted.session_id).toMatch(/^sess_[0-9a-f-]{36}$/i);
     expect(submitted.model_binding).toEqual({
-      provider_id: "builtin:zai-start-plan",
-      model_id: "GLM-5.3-Flash",
+      provider_id: ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id,
+      model_id: ZCODE_NATIVE_REQUIRED_IDENTITY.model_id,
       source: "z2c-session-read",
     });
     const resumed = await client().resumeSession({
@@ -480,8 +496,8 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     expect(submitted.workspace_id).toBe(C2C_WS);
     expect(submitted.status).toBe("queued");
     expect(submitted.model_binding).toEqual({
-      provider_id: "builtin:zai-start-plan",
-      model_id: "GLM-5.3-Flash",
+      provider_id: ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id,
+      model_id: ZCODE_NATIVE_REQUIRED_IDENTITY.model_id,
       source: "z2c-session-read",
     });
     const fetched = await client().getTask({ workspace_id: C2C_WS, task_id: submitted.task_id });
@@ -496,6 +512,18 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     expect(cancelled.status).toBe("cancelled");
     expect(cancelled.task_id).toBe(submitted.task_id);
     expect(cancelled.workspace_id).toBe(ENGINEERING_AI_WS);
+  });
+
+  it("exact-session read rejects workspace/model mismatch before any send", async () => {
+    const first = await client().submitTask({ workspace_id: C2C_WS, instruction: "x" });
+    const input = { workspace_id: C2C_WS, session_id: first.session_id!, instruction: "bounded canary" };
+    const observed = await client().readSession(input);
+    expect(observed.model_binding.model_id).toBe(ZCODE_NATIVE_REQUIRED_IDENTITY.model_id);
+    await expect(client().resumeSession({ ...input, expected_workspace_path: tmpdir() })).rejects.toMatchObject({ code: "ZCODE_NATIVE_NAMESPACE_MISMATCH" });
+    const view = fake.tasks.get(taskKey(C2C_WS, first.task_id))!.view;
+    view.model_binding = { provider_id: "other", model_id: "other" };
+    await expect(client().resumeSession(input)).rejects.toMatchObject({ code: "ZCODE_NATIVE_NOT_ATTESTED" });
+    expect(fake.resumeCalls).toBe(0);
   });
 
   it("10. resumes an existing native session bound to the same sess_* id", async () => {
@@ -788,7 +816,7 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
       text:
         "result line\n" +
         'api_key = sk-verysecretvalue123\n' +
-        "see F:\\Users\\tester\\secret\\plan.md for details\n" +
+        "see F:\\Users\\peter\\secret\\plan.md for details\n" +
         "G".repeat(20000),
     };
     const out = await invoke("zcode_native_execution_output", {
@@ -799,7 +827,7 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
     expect(out.isError).toBe(false);
     expect(out.text).not.toContain("sk-verysecretvalue123");
     expect(out.text).toContain("[REDACTED]");
-    expect(out.text).not.toContain("F:\\Users\\tester\\secret\\plan.md");
+    expect(out.text).not.toContain("F:\\Users\\peter\\secret\\plan.md");
     expect(out.text.length).toBeLessThanOrEqual(16000 + "…[truncated]".length);
     expect(out.task_id).toBe(submitted.task_id);
     expect(out.workspace_id).toBe(C2C_WS);

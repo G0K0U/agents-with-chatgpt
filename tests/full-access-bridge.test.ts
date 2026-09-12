@@ -106,7 +106,7 @@ describe("full-access bridge MCP lifecycle", () => {
   }
 
   beforeAll(async () => {
-    externalTmpRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "c2c-full-access-")));
+    externalTmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-full-access-"));
     delete process.env.C2C_TEST_TMP_ROOT;
     process.env.C2C_STATE_DIR = externalTmpRoot;
     root = makeTmpDir("full-access-ws");

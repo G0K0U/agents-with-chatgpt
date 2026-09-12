@@ -13,6 +13,8 @@ import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { CodexTaskManagerPool } from "../execution/pool.js";
+import { EngineeringAiAuditMaintainer } from "../execution/audit-maintenance.js";
+import { startZcodeCoordinatorFromEnvironment, type ZcodeCoordinator } from "../execution/zcode-coordinator.js";
 import { installApprovedManifest, manifestSchema } from "../execution/continuation.js";
 import { executionOrchestrator, type ExecutionOrchestrator } from "../execution/orchestrator.js";
 import type { OmnigentBackendOptions } from "../execution/omnigent.js";
@@ -86,6 +88,10 @@ export interface BridgeOptions {
   enforceStateOwnership?: boolean;
   /** Test seam for process-identity fencing. */
   stateDomainProcessInspector?: BridgeProcessInspector;
+  /** Test seam for injecting or mocking the Engineering AI audit maintainer. */
+  auditMaintainer?: EngineeringAiAuditMaintainer;
+  /** Start the C2C-owned ZCode scheduled-queue coordinator (default: enabled). */
+  zcodeCoordinator?: boolean;
 }
 
 export interface Bridge {
@@ -93,6 +99,8 @@ export interface Bridge {
   registry: WorkspaceRegistry;
   sessions: C2CSessionRegistry;
   taskManagers: CodexTaskManagerPool;
+  auditMaintainer?: EngineeringAiAuditMaintainer;
+  zcodeCoordinator?: ZcodeCoordinator;
   port: number;
   host: string;
   adminToken: string;
@@ -195,6 +203,26 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger, stateDir);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
   const sessions = new C2CSessionRegistry({ file: opts.sessionRegistryFile, stateDir });
+
+  let auditMaintainer: EngineeringAiAuditMaintainer | undefined = opts.auditMaintainer;
+  if (!auditMaintainer) {
+    try {
+      auditMaintainer = new EngineeringAiAuditMaintainer({
+        stateDir,
+        logger,
+        registry,
+        oneDriveRoot: opts.oneDriveRoot,
+        fullAccess: opts.fullAccess === true,
+      });
+    } catch (error) {
+      logger.warn(
+        `Failed to initialize Engineering AI audit maintainer; failing closed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
   const taskManagers = new CodexTaskManagerPool(registry, sessions, {
     logger,
     stateDir,
@@ -204,6 +232,9 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     bridgeWorkspaceId: bridgeRoot.id,
     fullAccess: opts.fullAccess,
     maxQueueSize: opts.maxQueueSize,
+    onTaskLifecycleEvent: (event) => {
+      auditMaintainer?.notifyEvent(event);
+    },
     continuationAuthorize: (owner, workspaceId, scope) => {
       stateOwner?.assertCurrent();
       return registry.enabledIds().includes(workspaceId) && authStore.hasOwnerAuthorization(owner, workspaceId, scope);
@@ -214,6 +245,52 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   // deterministic even when the first post-restart request is only a session
   // or execution summary and does not select a task manager explicitly.
   for (const workspaceId of authorizedWorkspaceIds) taskManagers.get(workspaceId);
+
+  // After all authorized task managers are constructed/recovered, enqueue one
+  // restart runtime event and start startup catchUp asynchronously; DO NOT
+  // block bridge startup on Gemini generation. Catch-up errors log safely.
+  if (auditMaintainer?.isEnabled) {
+    const restartTimestamp = new Date().toISOString();
+    auditMaintainer.notifyEvent({
+      type: "restart",
+      workspaceId: workspace.id,
+      timestamp: restartTimestamp,
+    });
+    void auditMaintainer
+      .catchUp()
+      .catch((error) => {
+        logger.warn(
+          `Engineering AI audit maintenance startup catch-up failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      });
+  }
+
+  // The C2C-owned ZCode scheduled-queue coordinator starts with the bridge and
+  // stops with it: it owns claims, dispatch through the native Desktop lane,
+  // and the only terminal receipts the queue ever receives. It disables
+  // itself (fail closed, logged) when no authorized queue root resolves.
+  // Test-style bridges (persistRuntime: false) never auto-start it so tests
+  // can never write worker-state into a real configured queue root.
+  let zcodeCoordinator: ZcodeCoordinator | undefined;
+  const wantCoordinator = opts.zcodeCoordinator ?? opts.persistRuntime !== false;
+  if (wantCoordinator) {
+    try {
+      zcodeCoordinator = startZcodeCoordinatorFromEnvironment({
+        registry,
+        workspaceRoot: workspace.root,
+        stateDir,
+        logger,
+      }) ?? undefined;
+    } catch (error) {
+      logger.warn(
+        `ZCode coordinator failed to start; the scheduled queue stays ownerless: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
 
   let publicBaseUrl: string | null = null;
   let publicProbe: PublicProbeResult | null = null;
@@ -436,10 +513,26 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     if (closed) return;
     closed = true;
     try {
+      // Stop claiming new scheduled-queue work before anything else rejects
+      // submissions; the coordinator finalizes its own heartbeat state.
+      await zcodeCoordinator?.stop().catch((error) => {
+        logger.warn(
+          `ZCode coordinator stop failed: ${error instanceof Error ? error.message : String(error)}`
+        );
+      });
       // Close task managers first. This rejects new submissions immediately,
-      // interrupts only the live writer, and leaves durable queued records for
-      // the next bridge process to replay.
+      // interrupts only the live writer, emits final terminal events, and
+      // leaves durable queued records for the next bridge process to replay.
       await taskManagers.close();
+      if (auditMaintainer) {
+        await auditMaintainer.close().catch((error) => {
+          logger.warn(
+            `Engineering AI audit maintainer close failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        });
+      }
       await tunnel.stop().catch(() => undefined);
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (opts.persistRuntime !== false) clearRuntimeState(workspace.id, {
@@ -459,6 +552,8 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     registry,
     sessions,
     taskManagers,
+    auditMaintainer,
+    zcodeCoordinator,
     port,
     host,
     adminToken,

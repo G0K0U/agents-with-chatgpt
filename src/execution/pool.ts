@@ -53,6 +53,7 @@ export class CodexTaskManagerPool {
       queueLimit: this.opts.queueLimit,
       sessionRegistry: this.sessionRegistry,
       continuationAuthorize: this.opts.continuationAuthorize,
+      onTaskLifecycleEvent: this.opts.onTaskLifecycleEvent,
       restartRequiredResolver:
         this.opts.taskManagerOptions?.restartRequiredResolver ??
         (bridgeWorkspace

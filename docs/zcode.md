@@ -1,31 +1,23 @@
-# ZCode Integration: Free-Window Queue vs. Native Control Plane
+# ZCode Scheduled Queue — Governed C2C Control Plane
 
-The C2C bridge provides two distinct, non-overlapping ZCode integration surfaces:
-1. **Free-Window Queue (`zcode_*`, 4 tools)**: An asynchronous, file-based batch queue driven by append-only JSONL files (`queue.jsonl`, `receipts.jsonl`) at an operator-configured root (`C2C_ZCODE_QUEUE_ROOT`).
-2. **Native Start Plan Control Plane (`zcode_native_*`, 8 tools)**: A real-time, synchronous control plane that dispatches tasks directly to the native ZCode Desktop environment via an external companion bridge (`Z2C`).
-
-These two surfaces serve different workflows and fail closed independently; there is no fallback between them in either direction.
-
-| Attribute | Free-Window Queue (`zcode_*`) | Native Control Plane (`zcode_native_*`) |
-|---|---|---|
-| **Tools (count)** | 4 tools (`zcode_enqueue_task`, `zcode_get_task`, `zcode_list_tasks`, `zcode_cancel_task`) | 8 tools (`zcode_native_read_session`, `zcode_native_self_test`, `zcode_native_status`, `zcode_native_submit_task`, `zcode_native_get_task`, `zcode_native_cancel_task`, `zcode_native_execution_output`, `zcode_native_resume_session`) |
-| **Execution mode** | Asynchronous batch queue | Real-time synchronous dispatch and multi-turn session resume |
-| **Backend** | File-based append-only logs (`queue.jsonl`, `receipts.jsonl`) | Companion Z2C Desktop bridge (external, Desktop-owned auth) |
-| **Identity / Binding** | Generic worker queue roles | Exact session pin: `builtin:zai-start-plan / GLM-5.3-Flash` |
-| **Gating environment** | `C2C_ZCODE_QUEUE_ROOT` | `ZCODE_NATIVE_ALLOWED_WORKSPACES` |
-| **Multi-turn resume** | Not supported (single-task batch queue) | Supported via `zcode_native_resume_session` |
-| **Status truth** | `receipts.jsonl` (written exclusively by coordinator) | Native Z2C protocol state, writer slot serialization |
-
----
-
-# Part 1: ZCode Free-Window Queue (`zcode_*`)
-
-The four `zcode_*` MCP tools give ChatGPT/C2C governed access to a ZCode
-free-window worker queue. The queue root is **operator-configured** via the
+The `zcode_*` MCP tools give ChatGPT/C2C governed access to a
+governed scheduled worker queue. The queue root is **operator-configured** via the
 `C2C_ZCODE_QUEUE_ROOT` environment variable (for example, a directory inside
 a deployment you own, such as `<your-workspace>/var/c2c-zcode`). It is unset
 by default: without configuration the tools fail closed and report
 `ZCODE_ROOT_MISSING`.
+
+When `C2C_ZCODE_QUEUE_ROOT` is a **relative** path, it resolves only
+underneath an authorized workspace root — never against the process working
+directory. The authorized workspace is resolved, in authority order, from:
+an explicit workspace root, `C2C_ENGINEERING_AI_WORKSPACE_ROOT`, the
+in-memory workspace registry, the persisted workspace registry
+(`workspaces.json`), and the persisted runtime pointer — failing closed when
+none resolves. An absolute `C2C_ZCODE_QUEUE_ROOT` is honored as-is after
+traversal checks. The queue root is also identified by the logical workspace
+name (default `engineering-ai`, override with
+`C2C_ENGINEERING_AI_WORKSPACE_NAME`/`_ID`); no machine-specific absolute
+path is ever baked into the product.
 
 No caller can ever pass a filesystem
 path — every tool operates on the configured root, and the control plane fails
@@ -33,14 +25,96 @@ closed on anything that is not a plain regular file inside it (symlinks,
 junctions and reparse-point escapes are rejected, and reads are capped at
 8 MiB per file).
 
+## Coordinator ownership and lifecycle
+
+The C2C bridge owns the queue coordinator. On bridge start it
+starts exactly once per queue root (duplicate starts are no-ops); on bridge
+shutdown it stops gracefully. It is the ONLY writer of lifecycle receipts
+(`START`, `COMPLETED`, `FAILED`, `CANCELLED` in `receipts.jsonl`) and of
+`worker-state.json` — the ChatGPT-facing control plane cannot forge terminal
+receipts.
+
+Lifecycle per task:
+
+```
+queued → (claim window) → dispatched through the native Desktop lane
+        → START receipt → observed terminal → COMPLETED | FAILED | CANCELLED
+CANCEL_REQUESTED while queued → CANCELLED (never dispatched)
+CANCEL_REQUESTED while running → forwarded to the native lane → CANCELLED
+```
+
+Ownership is fenced through `worker-state.json` heartbeats: a second
+coordinator observing a fresh foreign heartbeat goes STANDBY and never
+dual-claims; when a heartbeat goes stale (or the previous owner wrote a
+graceful `stopped` state) ownership is taken over. After a crash, tasks with
+a `START` receipt but no terminal outcome are re-adopted by re-dispatching
+the **same durable idempotency key**, so an already-accepted native task
+replays instead of executing twice.
+
+Dispatch happens only through the governed native Desktop lane
+(`zcode_native_*` transport) and only while its identity attestation holds —
+observed Desktop-managed GLM binding (sanctioned: builtin:zai-start-plan/GLM-5.3-Flash,
+the Z.AI Individual Plan route). When the native lane is down the
+coordinator degrades explicitly and claims nothing; there is no fallback and
+no silent provider substitution.
+
+### Desktop-agent prerequisite
+
+The native lane executes tasks through the Desktop-managed ZCode agent. That
+agent is reachable only when **ZCode Desktop runs with the Z2C desktop-agent
+proxy**, i.e. it is launched with:
+
+```
+ZCODE_AGENT_SERVER_COMMAND = <node.exe>
+ZCODE_AGENT_SERVER_ARGS_JSON = ["<z2c-install>/scripts/desktop-agent-proxy.mjs", "--stdio"]
+```
+
+The proxy publishes the per-workspace registration under
+`%LOCALAPPDATA%\z2c\desktop-agents\` that the Z2C desktop provider requires
+(run Z2C with `Z2C_PROVIDER=desktop` or the default `auto`). Without a live
+Desktop-driven agent, admission fails explicitly (`provider not healthy`)
+and tasks remain safely queued — they are claimed and dispatched
+automatically once the lane recovers.
+
+New tasks are claimed only inside the configured claim window
+(`C2C_ZCODE_COORDINATOR_WINDOW`, local `HH:mm-HH:mm` ranges, comma-separated,
+optional — default is always); already-running tasks always finish.
+Dependency (`depends_on`) and write-conflict rules are enforced at claim
+time: read tasks never conflict, declared writes conflict on any resource or
+exclusive-path intersection, and an undeclared write is globally exclusive.
+
+Environment (all optional):
+
+- `C2C_ZCODE_COORDINATOR_DISABLE` — set `1` to disable the coordinator.
+- `C2C_ZCODE_COORDINATOR_WINDOW` — claim window(s), e.g. `01:00-09:30,22:00-23:59`.
+- `C2C_ZCODE_COORDINATOR_MAX_PARALLEL` — 1..3 (default 1).
+- `C2C_ZCODE_COORDINATOR_POLL_MS` — loop interval, 1000..60000 (default 15000).
+
+## Control-plane status layers
+
+`zcode_list_tasks` returns a bounded `control_plane` view that names the
+broken layer without exposing secrets or raw process output:
+
+`QUEUE_ROOT_MISSING` → `QUEUE_ROOT_UNSAFE` → `WORKSPACE_BINDING_FAILED` →
+`COORDINATOR_NOT_RUNNING` → `OUTSIDE_CLAIM_WINDOW` →
+`ZCODE_DESKTOP_UNAVAILABLE` → `AUTH_NOT_ATTESTED` → `WRONG_PROVIDER` →
+`READY`.
+
+`zcode_native_self_test` reports a structured PASS/FAIL layer per check:
+transport, service protocol, workspace binding, Desktop-managed auth,
+provider identity, model identity, submit admission, idempotent replay,
+idempotency conflict, task read-back, session attestation, queue/writer
+invariants and cancel cleanup. A global PASS requires the full chain, not
+mere HTTP connectivity.
+
 ## Files
 
 | File | Role | Writers |
 |---|---|---|
-| `queue.jsonl` | append-only task queue (lifecycle input) | `zcode_enqueue_task` and the ZCode coordinator |
-| `receipts.jsonl` | append-only lifecycle truth (START, COMPLETED, FAILED, CANCELLED) | **only the ZCode coordinator** |
+| `queue.jsonl` | append-only task queue (lifecycle input) | `zcode_enqueue_task` |
+| `receipts.jsonl` | append-only lifecycle truth (START, COMPLETED, FAILED, CANCELLED) | **only the C2C-owned coordinator** |
 | `control.jsonl` | append-only cancellation requests (`CANCEL_REQUESTED`) | `zcode_cancel_task` |
-| `worker-state.json` | bounded worker status cache (never lifecycle truth) | the ZCode coordinator |
+| `worker-state.json` | bounded worker status cache (never lifecycle truth) | the C2C-owned coordinator |
 | `bootstrap-receipt.json` | bootstrap metadata (worker version/model/schedule) | bootstrap only |
 
 ## Tools
@@ -112,7 +186,7 @@ If any truth file contains a malformed line, the whole read fails closed
 `control.jsonl`. It refuses unknown tasks (`ZCODE_TASK_UNKNOWN`) and tasks
 that already have a terminal receipt (`ZCODE_ALREADY_TERMINAL`). Repeated
 requests are idempotent. It can never write `COMPLETED`, `FAILED` or
-`CANCELLED` — terminal receipts belong to the ZCode free-window worker
+`CANCELLED` — terminal receipts belong to the ZCode queue coordinator
 coordinator alone.
 
 ## Output hygiene
@@ -130,40 +204,3 @@ sanitization, cancel-request truth, terminal receipt precedence,
 symlink/junction escape rejection and the 8 MiB read cap — all against
 isolated temporary queue roots. The configured production root is never
 touched by tests.
-
-# Part 2: Native ZCode Start Plan Control Plane (`zcode_native_*`)
-
-The eight `zcode_native_*` tools provide a governed real-time control plane forwarding tasks directly to the native ZCode Desktop environment.
-
-## Architecture & Boundaries
-
-- **External companion Z2C**: Forwarding relies on an independent companion bridge (`Z2C`) that interfaces with the desktop agent. The companion Z2C bridge is **external** to this repository and is not bundled here.
-- **Desktop-owned authentication**: All model authentication is managed and minted by the native ZCode Desktop runtime through a runtime auth handoff. The C2C bridge requires no upstream API keys, manages no secrets, and never falls back to API keys.
-- **Exact identity pin & fail-closed**: Z2C admits tasks only after asserting exact session binding to `builtin:zai-start-plan / GLM-5.3-Flash`. The binding is verified on session read and re-verified on task submission. Any divergence from this exact identity fails closed immediately. No fallback to the free-window queue or other providers exists in either direction.
-- **Workspace allowlist**: Native forwarding is gated by the `ZCODE_NATIVE_ALLOWED_WORKSPACES` environment variable. Unless a workspace is explicitly included in this comma-delimited allowlist, all native operations fail closed.
-- **Queue & writer serialization**: Native submissions honor the shared workspace queue pause/freeze state and serialize through the workspace writer slot.
-
-## Native Tools (8 tools)
-
-| Tool | Scope | Purpose |
-|---|---|---|
-| `zcode_native_read_session` | `execution.read` | Read and attest the exact native session workspace, Desktop Start Plan provider (`builtin:zai-start-plan`), and model (`GLM-5.3-Flash`); fails closed on mismatch |
-| `zcode_native_self_test` | `execution.submit` | Read-only protocol self-test verifying durable idempotency, exact binding, replay, conflict detection, and unchanged queue/writer state |
-| `zcode_native_status` | `execution.read` | Check health and Start Plan identity of the independent Z2C desktop control plane for an authorized workspace |
-| `zcode_native_submit_task` | `execution.submit` | Dispatch a realtime native ZCode Start Plan task via Z2C in an allowlisted workspace |
-| `zcode_native_get_task` | `execution.read` | Retrieve bounded native task metadata (`z2c_*` task ID, `sess_*` session ID, status, timestamps) |
-| `zcode_native_cancel_task` | `execution.cancel` | Cancel an active or queued native task (interrupts the underlying real ZCode session) |
-| `zcode_native_execution_output` | `execution.read` | Retrieve bounded, sanitized final assistant output from a completed native task for independent audit of the GLM result |
-| `zcode_native_resume_session` | `execution.submit` | Continue an existing native `sess_*` ZCode session with a new instruction, maintaining session context |
-
-## Verification Status (Windows 11 x64)
-
-The native ZCode companion integration is **VERIFIED** on Windows 11 x64 using only sanitized facts:
-- **Status & self-test**: Status/self-test passed (`zcode_native_status` and `zcode_native_self_test`).
-- **Exact session binding**: Bound strictly to `builtin:zai-start-plan / GLM-5.3-Flash`.
-- **Real native model turn**: A real native model turn completed and returned output.
-- **Same-session resume**: Same-session resume returned the new turn response while maintaining session continuity.
-- **Workspace probe**: Engineering AI workspace probe completed.
-- **Desktop authentication**: The companion Z2C Desktop bridge is external to this repository and Desktop owns authentication.
-- **Hygiene**: Local paths, PIDs, task/session IDs, credentials, headers, account details, and private endpoints are strictly excluded.
-

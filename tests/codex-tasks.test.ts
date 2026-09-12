@@ -822,7 +822,7 @@ describe("controlled Codex task execution", () => {
       sandbox: "danger-full-access",
     });
     expect(fake.requests.find((request) => request.method === "turn/start")?.params).toMatchObject({
-      sandboxPolicy: { type: "dangerFullAccess", networkAccess: true },
+      sandboxPolicy: { type: "dangerFullAccess" },
     });
   });
 
@@ -869,7 +869,7 @@ describe("controlled Codex task execution", () => {
     expect(result.restartRequired).toBe(true);
   });
 
-  it("keeps a full-access task offline when network is omitted", async () => {
+  it("preserves omitted network metadata with a fake transport (native launcher rejects this combination)", async () => {
     await manager.close();
     fake = new FakeAppServer(undefined, true);
     manager = new CodexTaskManager(workspace, {
@@ -887,7 +887,7 @@ describe("controlled Codex task execution", () => {
     expect(result.status).toBe("completed");
     expect(result.network).toBe(false);
     expect(fake.requests.find((request) => request.method === "turn/start")?.params).toMatchObject({
-      sandboxPolicy: { type: "dangerFullAccess", networkAccess: false },
+      sandboxPolicy: { type: "dangerFullAccess" },
     });
   });
 

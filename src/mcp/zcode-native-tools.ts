@@ -1,14 +1,14 @@
 /**
- * ChatGPT-facing NATIVE ZCode (Z2C desktop Start Plan) tools.
+ * ChatGPT-facing NATIVE ZCode (Z2C desktop-managed) tools.
  *
- * Distinct from the zcode_* free-window queue tools: this surface forwards
+ * Distinct from the zcode_* scheduled-queue tools: this surface forwards
  * governed operations to the independent, already-working Z2C control plane
- * (desktop-spawned agent, Desktop-minted Start Plan auth, realtime FIFO).
+ * (desktop-spawned agent, Desktop-managed auth, realtime FIFO).
  * It is a thin proxy — C2C adds only principal workspace authorization
  * (resolveWorkspace — the C2C registry is authoritative), the shared product
  * queue pause/freeze and writer-slot gate, credential gating, returned-task
  * binding verification, namespace validation, and token scrubbing. No
- * fallback to the free-window queue exists in either direction.
+ * fallback to the scheduled queue exists in either direction.
  *
  * Mutation ordering: submit/resume run resolveWorkspace → shared queue/writer
  * gate BEFORE any upstream side effect; execution identity is then proven by
@@ -70,7 +70,7 @@ const instructionField = z
   .string()
   .min(1)
   .max(20000)
-  .describe("Bounded instruction for the native ZCode Start Plan agent (max 20000 chars, no credentials)");
+  .describe("Bounded instruction for the native ZCode Desktop agent (max 20000 chars, no credentials)");
 const taskIdField = z.string().regex(/^z2c_[A-Za-z0-9_-]{1,100}$/);
 
 export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToolDeps): void {
@@ -92,22 +92,37 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
     workspaceId: string,
     authInfo: AuthInfo | undefined,
     sessionId?: string,
-  ): void => {
+  ): unknown => {
     // C2C's workspace registry + principal authorization are authoritative;
     // this must succeed before any upstream interaction.
-    resolveWorkspace(workspaceId, authInfo, sessionId);
+    return resolveWorkspace(workspaceId, authInfo, sessionId);
   };
+
+  server.registerTool("zcode_native_read_session", {
+    title: "Read native ZCode session",
+    description: "Read and attest the exact native session workspace, Desktop-managed provider and GLM model binding. Fails closed on any mismatch. No scheduled-queue scheduling.",
+    inputSchema: { workspace_id: workspaceIdField, session_id: z.string().regex(/^sess_[0-9a-f-]{36}$/i) },
+    annotations: { readOnlyHint: true },
+  }, async (args, extra) => {
+    const denied = requireScope(extra.authInfo, "execution.read");
+    if (denied) return denied;
+    try {
+      const workspace = resolveWorkspace(args.workspace_id, extra.authInfo, extra.sessionId) as { root?: string };
+      if (!workspace?.root) throw new ZcodeNativeError("ZCODE_NATIVE_NAMESPACE_MISMATCH", "Authorized workspace path unavailable");
+      return ok(await zcodeNativeClient().readSession({ ...args, expected_workspace_path: workspace.root }));
+    } catch (err) { return mapErr(err); }
+  });
 
   server.registerTool("zcode_native_self_test", {
     title: "Native ZCode protocol self-test",
-    description: "Run a fixed server-owned readonly plan probe to verify native durable idempotency, exact Start Plan binding, replay, conflict, and unchanged C2C queue/writer state. Creates one native task and cancels it only when execution.cancel is authorized. Returns bounded evidence only.",
+    description: "Run a fixed server-owned readonly plan probe to verify native durable idempotency, exact Desktop GLM binding, replay, conflict, and unchanged C2C queue/writer state. Creates one native task and cancels it only when execution.cancel is authorized. Returns bounded evidence only.",
     inputSchema: { workspace_id: workspaceIdField },
     annotations: { readOnlyHint: false },
   }, async (args, extra) => {
     // This surface never sends authorization errors or upstream messages back as evidence.
     try {
       if (!extra.authInfo || requireScope(extra.authInfo, "execution.submit")) throw new Error("unauthorized");
-      resolveAuthorized(args.workspace_id, extra.authInfo, extra.sessionId);
+      const workspace = resolveAuthorized(args.workspace_id, extra.authInfo, extra.sessionId) as { root?: string } | undefined;
       deps.taskGate(args.workspace_id, extra.authInfo, false);
       if (!deps.nativeAdmissionSnapshot) throw new Error("snapshot unavailable");
       const manager = deps.writerManagerFor(args.workspace_id, extra.authInfo);
@@ -117,6 +132,11 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
         submitNative: input => manager.submitNative(input, () => deps.taskGate(args.workspace_id, extra.authInfo, false)),
         snapshot: () => deps.nativeAdmissionSnapshot!(args.workspace_id, extra.authInfo),
         ...(canCancel ? { cancel: (input: { workspace_id: string; task_id: string }) => manager.cancelNative(input, true) } : {}),
+        // Layered proofs: read the admitted task back and attest the exact
+        // native session in its authorized workspace.
+        getTask: input => manager.getNative(input),
+        ...(workspace?.root ? { readSession: (input: { workspace_id: string; session_id: string }) =>
+          zcodeNativeClient().readSession({ ...input, expected_workspace_path: workspace.root }) } : {}),
       });
       return { ...ok(evidence), ...(evidence.overall === "FAIL" ? { isError: true } : {}) };
     } catch {
@@ -129,7 +149,7 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
     {
       title: "Native ZCode status",
       description:
-        "Health and Start Plan identity of the independent Z2C desktop control plane, scoped to the " +
+        "Health and Desktop GLM binding identity of the independent Z2C control plane, scoped to the " +
         "authorized workspace_id. Reports the binding observed via Z2C's native exact-session read " +
         "for the workspace's current session; UNKNOWN when no observable session exists. Status is " +
         "informational and never blocks task creation — admission identity is proven per task. " +
@@ -154,11 +174,12 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
     {
       title: "Submit native ZCode task",
       description:
-        "Dispatch a realtime native ZCode Start Plan task through Z2C in an authorized governed " +
+        "Dispatch a realtime native ZCode task through Z2C in an authorized governed " +
         "workspace enabled via ZCODE_NATIVE_ALLOWED_WORKSPACES. Honors the shared workspace " +
         "queue pause/freeze and writer slot. Z2C admits the task only after observing " +
-        "builtin:zai-start-plan/GLM-5.3-Flash on the exact created session, and the returned task " +
-        "binding is re-verified here — fails closed, never falls back to the free-window queue. " +
+        "the sanctioned Desktop-managed binding (builtin:zai-start-plan/GLM-5.3-Flash) on the " +
+        "exact created session, and the returned task " +
+        "binding is re-verified here — fails closed, never falls back to the scheduled queue. " +
         deps.untrustedNote,
       inputSchema: {
         workspace_id: workspaceIdField,
@@ -266,7 +287,7 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
       title: "Resume native ZCode session",
       description:
         "Continue an existing native sess_* ZCode session with a fresh instruction, preserving its " +
-        "context. Same principal authorization, shared queue/writer gate, and Start Plan identity " +
+        "context immediately when idle; rejects paused/busy work without scheduled-queue scheduling. Exact session read precedes send. Same principal authorization, shared queue/writer gate, and Desktop GLM identity " +
         "rules as submit. " +
         deps.untrustedNote,
       inputSchema: {

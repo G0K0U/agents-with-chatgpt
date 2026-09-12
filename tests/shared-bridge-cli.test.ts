@@ -382,5 +382,3 @@ it("direct owner start --tunnel succeeds and reuses persisted endpoint when info
   expect(seam.admin).not.toHaveBeenCalled();
   expect(seam.stop).not.toHaveBeenCalled();
 });
-
-

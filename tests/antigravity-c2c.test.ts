@@ -27,7 +27,7 @@ function fixture(name = "codex-with-chatgpt") {
   const request: BackendExecutionRequest = {
     taskId: "c2c_g3_fixture", workspaceId: "fixture", workspaceRoot: root,
     instruction: 'Review "src/execution/tasks.ts" without edits', writeScope: [root], writableRoots: [root],
-    networkRequested: false, networkEffective: false, fullAccess: true, runTests: false,
+    networkRequested: true, networkEffective: true, fullAccess: true, runTests: false,
     model: "gemini-3.8-flash-high", timeoutMs: 5000,
   };
   return { root, parent, backend, request };
@@ -164,7 +164,7 @@ describe("G3 Antigravity full-workspace contract", () => {
     });
     try {
       const submitted = manager.submit({ workspace_id: workspace.id, provider: "gemini", model: "gemini-3.8-flash-high",
-        instruction: "Review the workspace without edits", write_scope: [root], network: false, run_tests: false });
+        instruction: "Review the workspace without edits", write_scope: [root], network: true, run_tests: false });
       let result = manager.get(submitted.taskId);
       for (let i = 0; i < 200 && ["queued", "running"].includes(result.status); i++) {
         await new Promise(resolve => setTimeout(resolve, 20));
@@ -172,9 +172,7 @@ describe("G3 Antigravity full-workspace contract", () => {
       }
       expect(result).toMatchObject({ status: "completed", provider: "gemini" });
       expect(execute).toHaveBeenCalledOnce();
-      // Absolute write scopes retain the submitted spelling; Workspace may expand
-      // a Windows short path (for example RUNNER~1) when canonicalizing its root.
-      expect(execute.mock.calls[0][0]).toMatchObject({ workspaceRoot: workspace.root, writableRoots: [path.resolve(root)], fullAccess: true, networkEffective: false });
+      expect(execute.mock.calls[0][0]).toMatchObject({ workspaceRoot: root, writableRoots: [root], fullAccess: true, networkEffective: true });
       expect(codexFactory).not.toHaveBeenCalled();
       expect(childExits).toEqual([0]);
     } finally {
@@ -199,12 +197,23 @@ describe("G3 Antigravity full-workspace contract", () => {
     expect(childExits).toEqual([0]);
   });
 
-  it("does not bypass narrow-scope preflight even in full-access mode", async () => {
+  it("does not bypass narrow-scope preflight in restricted mode", async () => {
     const { backend, request, root } = fixture();
     const sub = path.join(root, "src");
     fs.mkdirSync(sub);
-    expect(await backend.execute({ ...request, writeScope: ["src"], writableRoots: [sub] })).toMatchObject({ error: { code: "WRITE_SCOPE_UNSUPPORTED" } });
+    expect(await backend.execute({ ...request, fullAccess: false, writeScope: ["src"], writableRoots: [sub] })).toMatchObject({ error: { code: "WRITE_SCOPE_UNSUPPORTED" } });
     expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("accepts external absolute scopes only in full-access development mode", async () => {
+    await installContractChild("native-file");
+    const { backend, request, parent } = fixture();
+    const outside = path.join(parent, "external");
+    fs.mkdirSync(outside);
+    const scoped = { ...request, writeScope: [outside], writableRoots: [outside] };
+    expect(await backend.execute({ ...scoped, fullAccess: false })).toMatchObject({ error: { code: "WRITE_SCOPE_UNSUPPORTED" } });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(await backend.execute(scoped)).toMatchObject({ status: "completed", provider: "gemini" });
   });
 
   it("drains diagnostics after exit and never serializes synthetic credentials", async () => {
@@ -322,7 +331,7 @@ describe("G3 Antigravity full-workspace contract", () => {
     fs.writeFileSync(secretFile, "original confidential content", "utf-8");
 
     // Sub-directory scope is rejected upfront by preflight
-    const result = await backend.execute({ ...request, writeScope: ["src"], writableRoots: [sub] });
+    const result = await backend.execute({ ...request, fullAccess: false, writeScope: ["src"], writableRoots: [sub] });
     expect(result.status).toBe("failed");
     expect(result.error?.code).toBe("WRITE_SCOPE_UNSUPPORTED");
     expect(result.actualProvider).toBeNull();
@@ -333,6 +342,30 @@ describe("G3 Antigravity full-workspace contract", () => {
     // Verify secretFile is completely untouched
     expect(fs.existsSync(secretFile)).toBe(true);
     expect(fs.readFileSync(secretFile, "utf-8")).toBe("original confidential content");
+  });
+
+  it("uses the spawned isolated home for scratch scope without adding scratch to changedFiles", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const pending = backend.execute(request);
+    const options = vi.mocked(spawn).mock.calls[0][2];
+    const home = options?.env?.USERPROFILE;
+    expect(home).toBe(backend.getIsolatedHomeDir());
+    const target = path.join(home!, ".gemini", "antigravity-cli", "brain", "session", "scratch", "result.txt");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, "provider scratch");
+    for (const [tool_name, parameters] of [
+      ["read_file", { AbsolutePath: target }],
+      ["write_to_file", { TargetFile: target }],
+      ["run_command", { CommandLine: `Set-Content -Path "${target}" -Value fixture` }],
+    ]) {
+      child.stdout.write(JSON.stringify({ type: "step_update", step_update: { tool_name, tool_info: { parameters } } }) + "\n");
+    }
+    child.stdout.write(JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "fixture completed" } }) + "\n");
+    child.emit("close", 0);
+    const result = await pending;
+    expect(result.status).toBe("completed");
+    expect(result.changedFiles).toEqual([]);
   });
 
   it("aborts execution when Antigravity attempts Northbound C2C MCP tool call during step_update", async () => {
@@ -351,5 +384,51 @@ describe("G3 Antigravity full-workspace contract", () => {
     expect(result.status).toBe("failed");
     expect(result.error?.code).toBe("C2C_RECURSION_DETECTED");
     expect(result.error?.message).toContain("Aborting execution to prevent recursive loop");
+  });
+});
+
+
+describe("owner full-access permission contract", () => {
+  it("blocks offline full access before launching or modifying native configuration", async () => {
+    const { backend, request, parent } = fixture();
+    const result = await backend.execute({ ...request, networkRequested: false, networkEffective: false });
+    expect(result.error?.code).toBe("NETWORK_POLICY_UNSUPPORTED");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(parent, "state", "providers"))).toBe(false);
+  });
+
+  it.each([true, false])("native permission settings follow owner selection (%s)", fullAccess => {
+    const { backend } = fixture();
+    const { isolatedHome } = backend.setupIsolatedConfig(false, fullAccess);
+    const settings = JSON.parse(fs.readFileSync(path.join(isolatedHome, ".gemini", "antigravity-cli", "settings.json"), "utf8"));
+    expect(settings.allowNonWorkspaceAccess).toBe(fullAccess);
+    expect(settings.permissions.deny).toContain("search_web(*)");
+  });
+
+  it.each([true, false])("external fixture read/write preserves evidence (fullAccess=%s)", async fullAccess => {
+    const { backend, request, parent } = fixture();
+    const target = path.join(parent, "external-fixture.txt");
+    fs.writeFileSync(target, "before");
+    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    vi.mocked(spawn).mockImplementation(((exe, args, options) => {
+      const argv = args as string[];
+      expect(argv.includes("--dangerously-skip-permissions")).toBe(fullAccess);
+      expect(argv.includes("--sandbox")).toBe(!fullAccess);
+      // Real local child filesystem IO; simulated provider stream, no model call.
+      const script = `
+        const fs = require('node:fs'); const target = process.argv[1];
+        fs.writeFileSync(target, fs.readFileSync(target, 'utf8') + '-after');
+        process.stdout.write(JSON.stringify({type:'step_update',step_update:{tool_name:'read_file',tool_info:{parameters:{AbsolutePath:target}}}})+'\\n');
+        process.stdout.write(JSON.stringify({type:'step_update',step_update:{tool_name:'write_to_file',tool_info:{parameters:{TargetFile:target}}}})+'\\n');
+        process.stdout.write(JSON.stringify({type:'result',result:{status:'SUCCESS',response:'fixture'}})+'\\n');
+      `;
+      return actual.spawn(process.execPath, ["-e", script, target], options);
+    }) as typeof spawn);
+    // Avoid signalling an OS process in a detective-error test; the fixture exits itself.
+    vi.spyOn(backend as any, "terminateProcess").mockImplementation(() => {});
+    const result = await backend.execute({ ...request, fullAccess, networkRequested: fullAccess, networkEffective: fullAccess });
+    expect(result.status).toBe(fullAccess ? "completed" : "failed");
+    if (!fullAccess) expect(result.error?.code).toBe("WRITE_SCOPE_VIOLATION");
+    expect(fs.readFileSync(target, "utf8")).toBe("before-after");
   });
 });

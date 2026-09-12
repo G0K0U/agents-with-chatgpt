@@ -1,4 +1,11 @@
-# Omnigent G1 (Codex only)
+# Omnigent G1 (Codex only) — DEPRECATED
+
+> **Status: deprecated.** Omnigent is no longer registered as a public MCP
+> surface. The current product architecture dispatches through direct governed
+> providers (Antigravity / Gemini and ZCode Desktop / GLM). The Omnigent
+> library code is retained as legacy internal orchestration only; no
+> `omnigent_*` tool appears in the 28-tool MCP contract. The notes below are
+> preserved for historical operators of the legacy local-bridge selector.
 
 Legacy Codex remains the default. Select Omnigent in the **local bridge process
 environment**, then restart that bridge using its existing state directory:

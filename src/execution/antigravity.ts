@@ -189,7 +189,7 @@ export interface WriteScopePreflight {
   /** Real-path-resolved scope roots. Empty when writes are not allowed. */
   writableRoots: string[];
   writesAllowed: boolean;
-  enforcement: "provider-workspace" | "none";
+  enforcement: "provider-workspace" | "none" | "full-access-development";
 }
 
 export type WriteScopePreflightResult =
@@ -220,6 +220,7 @@ export type WriteScopePreflightResult =
 export function verifyWriteScopePreflight(request: {
   workspaceRoot: string;
   writableRoots: string[];
+  fullAccess?: boolean;
 }): WriteScopePreflightResult {
   const workspaceReal = realPathIfExists(request.workspaceRoot);
   if (!workspaceReal || !fs.statSync(workspaceReal).isDirectory()) {
@@ -238,13 +239,13 @@ export function verifyWriteScopePreflight(request: {
     if (!rootReal || !fs.statSync(rootReal).isDirectory()) {
       return { ok: false, code: "WRITE_SCOPE_UNSUPPORTED", message: "A declared write scope does not exist at execution time" };
     }
-    if (!isWithinRoots(rootReal, [workspaceReal])) {
+    if (!request.fullAccess && !isWithinRoots(rootReal, [workspaceReal])) {
       return { ok: false, code: "WRITE_SCOPE_UNSUPPORTED", message: "A declared write scope resolves outside the workspace through a real path, junction or symlink" };
     }
     if (!resolvedRoots.includes(rootReal)) resolvedRoots.push(rootReal);
   }
   const coversWorkspace = resolvedRoots.length === 1 && isWithinRoots(workspaceReal, [resolvedRoots[0]]);
-  if (!coversWorkspace) {
+  if (!request.fullAccess && !coversWorkspace) {
     return {
       ok: false,
       code: "WRITE_SCOPE_UNSUPPORTED",
@@ -256,75 +257,42 @@ export function verifyWriteScopePreflight(request: {
   }
   return {
     ok: true,
-    preflight: { workspaceRoot: workspaceReal, writableRoots: resolvedRoots, writesAllowed: true, enforcement: "provider-workspace" },
+    preflight: { workspaceRoot: workspaceReal, writableRoots: resolvedRoots, writesAllowed: true, enforcement: request.fullAccess ? "full-access-development" : "provider-workspace" },
   };
 }
 
 export function extractCandidatePathsFromCommand(cmd: string, workspaceRoot?: string): string[] {
   const candidates: string[] = [];
-  const add = (candidate: string | null | undefined) => {
-    if (!candidate) return;
-    const trimmed = candidate.trim().replace(/^["']|["']$/g, "");
-    if (trimmed && !candidates.includes(trimmed)) {
-      candidates.push(trimmed);
-    }
-  };
-
   // 1. Quoted paths with Windows drive letters: "C:\path\..." or 'C:\path\...'
   const quotedWin = cmd.match(/(["'])([A-Za-z]:\\[^"']+)\1/g);
   if (quotedWin) {
     for (const m of quotedWin) {
-      add(m.slice(1, -1));
+      candidates.push(m.slice(1, -1));
     }
   }
-
   // 2. Unquoted paths with Windows drive letters: C:\path\with_no_spaces
   const unquotedWin = cmd.match(/(?:^|[\s=,;()<>|])([A-Za-z]:\\[^\s"'<>|]+)/g);
   if (unquotedWin) {
     for (const m of unquotedWin) {
-      const cleaned = m.trim().replace(/^[=,;()<>|\s]+/, "").replace(/[=,;()<>|\s]+$/, "");
-      add(cleaned);
-    }
-  }
-
-  // 3. Quoted POSIX absolute paths: "/path/..." or '/path/...'
-  const quotedPosix = cmd.match(/(["'])(\/(?!\/)[^"'\r\n]+)\1/g);
-  if (quotedPosix) {
-    for (const m of quotedPosix) {
-      add(m.slice(1, -1));
-    }
-  }
-
-  // 4. Unquoted POSIX absolute paths: /path/with_no_spaces
-  // Exclude switches like /c, /s, /y by requiring an internal slash or dot-extension unless preceded by redirection
-  const unquotedPosix = cmd.match(/(?:^|[\s=,;()<>|])(\/(?!\/)[^\s"'<>|]+)/g);
-  if (unquotedPosix) {
-    for (const m of unquotedPosix) {
-      const cleaned = m.trim().replace(/^[=,;()<>|\s]+/, "").replace(/[=,;()<>|\s]+$/, "");
-      if (cleaned && (cleaned.includes("/", 1) || cleaned.includes(".") || /^[>|]/.test(m.trim()))) {
-        add(cleaned);
+      const cleaned = m.trim().replace(/^[=,;()<>|\s]+/, "");
+      if (cleaned && !candidates.includes(cleaned)) {
+        candidates.push(cleaned);
       }
     }
   }
-
-  // 5. Command parameters for file creation (e.g. -Path "...", Out-File "...")
+  // 3. Command parameters for file creation (e.g. -Path "...", Out-File "...")
   if (workspaceRoot) {
-    const paramMatches = cmd.match(/(?:-Path|-LiteralPath|-FilePath|>|>>)\s+["']?([^"'\s<>|]+)["']?|(?:Out-File|New-Item|Set-Content|Add-Content)(?:\s+-(?:Path|LiteralPath|FilePath))?\s+["']?([^"'\s<>|]+)["']?/gi);
+    const paramMatches = cmd.match(/(?:-Path|-LiteralPath|>|>>|Out-File|New-Item|Set-Content|Add-Content)\s+["']?([^"'\s<>|]+)["']?/gi);
     if (paramMatches) {
       for (const m of paramMatches) {
         const parts = m.split(/\s+/);
         const target = parts[parts.length - 1]?.replace(/["']/g, "");
-        if (target && !target.startsWith("-") && target.includes(".")) {
-          if (/^[A-Za-z]:\\/.test(target) || target.startsWith("/")) {
-            add(target);
-          } else {
-            add(path.resolve(workspaceRoot, target));
-          }
+        if (target && !/^[A-Za-z]:\\/.test(target) && !target.startsWith("-") && target.includes(".")) {
+          candidates.push(path.resolve(workspaceRoot, target));
         }
       }
     }
   }
-
   return candidates;
 }
 
@@ -345,6 +313,8 @@ export interface AntigravityToolScopeInput {
   workspaceRoot: string;
   /** Verified scope roots from the preflight. Empty = writes disabled. */
   allowedRoots: string[];
+  /** C2C-selected ephemeral directories under the spawned provider's isolated home. */
+  providerOwnedRoots?: string[];
   writesAllowed: boolean;
 }
 
@@ -364,6 +334,27 @@ export interface AntigravityToolScopeVerdict {
  */
 export function evaluateAntigravityToolScope(input: AntigravityToolScopeInput): AntigravityToolScopeVerdict {
   const { toolName, parameters: params, workspaceRoot, allowedRoots, writesAllowed } = input;
+  const providerOwnedRoots = input.providerOwnedRoots ?? [];
+  const isProviderOwned = (candidate: string): boolean => {
+    if (!isWithinRoots(candidate, providerOwnedRoots)) return false;
+    // Unlike existsSync, lstat detects dangling links. Never skip an unreadable
+    // entry or dangling link while resolving a future scratch target.
+    let ancestor = path.resolve(candidate);
+    for (;;) {
+      try {
+        fs.lstatSync(ancestor);
+        const real = realPathIfExists(ancestor);
+        return real !== null && isWithinRoots(
+          path.resolve(real, path.relative(ancestor, candidate)), providerOwnedRoots,
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        const parent = path.dirname(ancestor);
+        if (parent === ancestor) return false;
+        ancestor = parent;
+      }
+    }
+  };
 
   const candidateWritePath = typeof params.TargetFile === "string" ? params.TargetFile
     : typeof params.target_file === "string" ? params.target_file
@@ -380,7 +371,7 @@ export function evaluateAntigravityToolScope(input: AntigravityToolScopeInput): 
       const resolvedTarget = path.isAbsolute(targetCandidate)
         ? path.resolve(targetCandidate)
         : path.resolve(workspaceRoot, targetCandidate);
-      if (!isWithinRoots(resolvedTarget, allowedRoots) || !realTargetWithinRoots(resolvedTarget, allowedRoots)) {
+      if (!isProviderOwned(resolvedTarget) && (!isWithinRoots(resolvedTarget, allowedRoots) || !realTargetWithinRoots(resolvedTarget, allowedRoots))) {
         return { violation: resolvedTarget, category: "write-tool" };
       }
     }
@@ -392,7 +383,7 @@ export function evaluateAntigravityToolScope(input: AntigravityToolScopeInput): 
     const outsideWorkspace =
       !isWithinRoot(resolvedAbsolute, workspaceRoot) ||
       (fs.existsSync(resolvedAbsolute) && !realTargetWithinRoots(resolvedAbsolute, [workspaceRoot]));
-    if (outsideWorkspace) {
+    if (outsideWorkspace && !isProviderOwned(resolvedAbsolute)) {
       return { violation: params.AbsolutePath, category: "read-path" };
     }
   }
@@ -406,7 +397,7 @@ export function evaluateAntigravityToolScope(input: AntigravityToolScopeInput): 
         return { violation: "(write-shaped command under a no-write task)", category: "command" };
       }
       for (const candidate of extractCandidatePathsFromCommand(cmd, workspaceRoot)) {
-        if (!isWithinRoots(candidate, allowedRoots) || !realTargetWithinRoots(candidate, allowedRoots)) {
+        if (!isProviderOwned(candidate) && (!isWithinRoots(candidate, allowedRoots) || !realTargetWithinRoots(candidate, allowedRoots))) {
           return { violation: candidate, category: "command" };
         }
       }
@@ -559,7 +550,7 @@ export class AntigravityBackend implements ExecutionBackend {
     return ensureDir(path.join(providerDir, "isolated_home"));
   }
 
-  setupIsolatedConfig(networkEffective: boolean): { isolatedHome: string; env: NodeJS.ProcessEnv } {
+  setupIsolatedConfig(networkEffective: boolean, fullAccess = false): { isolatedHome: string; env: NodeJS.ProcessEnv } {
     const isolatedHome = this.getIsolatedHomeDir();
     const geminiDir = ensureDir(path.join(isolatedHome, ".gemini"));
     const configDir = ensureDir(path.join(geminiDir, "config"));
@@ -586,7 +577,7 @@ export class AntigravityBackend implements ExecutionBackend {
     const cliSettingsFile = path.join(cliDir, "settings.json");
     const cliSettings = {
       toolPermission: "always-proceed",
-      allowNonWorkspaceAccess: false,
+      allowNonWorkspaceAccess: fullAccess,
       permissions: {
         allow: [],
         deny: networkDenyTools,
@@ -678,6 +669,7 @@ export class AntigravityBackend implements ExecutionBackend {
     const preflightResult = verifyWriteScopePreflight({
       workspaceRoot: request.workspaceRoot,
       writableRoots: request.writableRoots,
+      fullAccess: request.fullAccess,
     });
     if (!preflightResult.ok) {
       request.onLifecyclePhase?.("TERMINAL");
@@ -693,6 +685,17 @@ export class AntigravityBackend implements ExecutionBackend {
         output: "",
         changedFiles: [],
         error: { code: preflightResult.code, message: preflightResult.message },
+      };
+    }
+    // Native unsandboxed shell access cannot enforce an offline network policy.
+    // Tool-name denies are not a network sandbox; never silently launch online.
+    if (request.fullAccess && !request.networkEffective) {
+      request.onLifecyclePhase?.("TERMINAL");
+      return {
+        status: "failed", provider: "gemini", providerRuntime: "antigravity-cli",
+        providerModel: model, requestedProvider: "gemini", requestedModel: model,
+        actualProvider: null, actualModel: "UNKNOWN", output: "", changedFiles: [],
+        error: { code: "NETWORK_POLICY_UNSUPPORTED", message: "Antigravity full-access execution cannot enforce network=false; no provider was launched. Use a restricted deployment for offline tasks." },
       };
     }
     const preflight = preflightResult.preflight;
@@ -718,7 +721,12 @@ export class AntigravityBackend implements ExecutionBackend {
         },
       };
     }
-    const { env } = this.setupIsolatedConfig(request.networkEffective);
+    const { env, isolatedHome } = this.setupIsolatedConfig(request.networkEffective, request.fullAccess);
+    // Only provider ephemeral storage, never the home/config/auth or state root.
+    const providerOwnedRoots = [
+      path.join(isolatedHome, ".gemini", "antigravity-cli", "brain"),
+      path.join(isolatedHome, ".gemini", "antigravity-cli", ".system_generated"),
+    ];
     // Detective layers use exactly the verified roots. Never widen an empty
     // scope back to the workspace root.
     const allowedRoots = preflight.writableRoots;
@@ -733,7 +741,7 @@ export class AntigravityBackend implements ExecutionBackend {
       "accept-edits",
       // Full-access mode is already explicitly authorized by the caller. Forcing
       // AppContainer here can stop headless run_command at an admin setup prompt.
-      ...(request.fullAccess ? [] : ["--sandbox"]),
+      ...(request.fullAccess ? ["--dangerously-skip-permissions"] : ["--sandbox"]),
       "--disable-slash-commands",
       "--output-format",
       "stream-json",
@@ -921,11 +929,12 @@ export class AntigravityBackend implements ExecutionBackend {
                 // the task and terminates the agent, but never deletes or
                 // rolls back files — the scene is preserved for the owner.
                 const params = (su.tool_info.parameters ?? {}) as Record<string, unknown>;
-                const verdict = evaluateAntigravityToolScope({
+                const verdict = request.fullAccess ? { violation: null, category: "allowed" as const } : evaluateAntigravityToolScope({
                   toolName: String(su.tool_name),
                   parameters: params,
                   workspaceRoot: request.workspaceRoot,
                   allowedRoots,
+                  providerOwnedRoots,
                   writesAllowed: preflight.writesAllowed,
                 });
                 if (verdict.violation) {
@@ -1062,7 +1071,7 @@ export class AntigravityBackend implements ExecutionBackend {
           const outsideScope = !preflight.writesAllowed
             ? true
             : !isWithinRoots(absFile, allowedRoots) || !realTargetWithinRoots(absFile, allowedRoots);
-          if (outsideScope) {
+          if (!request.fullAccess && outsideScope) {
             finalStatus = "failed";
             failureError = {
               code: "WRITE_SCOPE_VIOLATION",

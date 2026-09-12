@@ -342,8 +342,9 @@ export function evaluateRoute(
     "[Note: Generic Quanta GLM route: " + glmVerdict + ". Observed window telemetry: " +
     "5h=" + fmtWindow(glm5h) + ", weekly=" + fmtWindow(glmRaw?.weekly_window) +
     "; connection_mode and quota_pool: UNATTRIBUTED. Outside that window, native ZCode " +
-    "Connection mode = Start Plan with GLM-5.3-Flash — currently unverified without fresh " +
-    "native plan binding and quota evidence. This observation covers only this route and " +
+    "Connection mode = Desktop-managed builtin:zai-start-plan with GLM-5.3-Flash " +
+    "(observed 2026-09-12 through the live desktop-agent chain; quota evidence for this route " +
+    "remains separate). This observation covers only this route and " +
     "does not establish exhaustion of all GLM pipelines.]";
 
   const reasoning =

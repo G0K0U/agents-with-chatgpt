@@ -1,7 +1,7 @@
 /**
  * Governed C2C → ZCode queue control plane.
  *
- * The MCP layer exposes exactly four tools over the fixed ZCode free-window
+ * The MCP layer exposes exactly four tools over the fixed governed ZCode scheduled
  * queue (enqueue / get / list / cancel-request). This module owns every
  * filesystem interaction with that queue and enforces the governance contract:
  *
@@ -16,12 +16,14 @@
  * - Credential-shaped instructions are rejected at enqueue time.
  * - Cancellation only ever appends CANCEL_REQUESTED to control.jsonl. Terminal
  *   receipts (COMPLETED/FAILED/CANCELLED) are written exclusively by the ZCode
- *   free-window worker coordinator; this control plane can never write them.
+ *   queue coordinator; this control plane can never write them.
  */
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { sanitizeExecutionOutput } from "./sanitize.js";
+import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import type { WorkspaceRegistry } from "../workspace/registry.js";
 
 /**
  * The only queue root this control plane may ever touch. Operator-configured
@@ -204,77 +206,263 @@ function withFileLock<T>(file: string, fn: () => Promise<T> | T): Promise<T> {
   return next;
 }
 
-export class ZcodeControl {
-  constructor(private readonly root: string = FIXED_ZCODE_QUEUE_ROOT) {}
+export interface ZcodeQueueResolutionOptions {
+  root?: string;
+  workspaceRoot?: string;
+  stateDir?: string;
+  env?: NodeJS.ProcessEnv;
+  registry?: WorkspaceRegistry;
+}
 
-  /** Resolved real root; fails closed when the configured root is missing. */
-  private realRoot(): string {
-    let real: string;
-    try {
-      real = fs.realpathSync(this.root);
-    } catch {
-      throw new ZcodeControlError(
-        "ZCODE_ROOT_MISSING",
-        "the ZCode queue root is not configured (set C2C_ZCODE_QUEUE_ROOT) or does not exist",
-      );
+function resolveEngineeringAiWorkspaceRoot(
+  options: ZcodeQueueResolutionOptions,
+  env: NodeJS.ProcessEnv
+): string | null {
+  // No hardcoded workspace id in source: the stable Engineering AI workspace
+  // id must come from the operator's environment (desktop-managed state).
+  const targetId = env.C2C_ENGINEERING_AI_WORKSPACE_ID?.trim() || null;
+  const targetName = env.C2C_ENGINEERING_AI_WORKSPACE_NAME?.trim().toLowerCase() || "engineering-ai";
+  // An explicit workspace root anchors queue resolution only when it IS the
+  // authorized Engineering AI workspace (stable id, registered name, or
+  // logical name match). Any other absolute root (e.g. a bridge repository
+  // workspace) must fall through to the registry chain instead of silently
+  // hosting the queue.
+  const matchesTarget = (candidate: string, id?: string | null, name?: string | null): boolean =>
+    (targetId ? id === targetId : false) ||
+    (name ? name.toLowerCase() === targetName : false) ||
+    /engineering-ai/i.test(candidate);
+
+  if (options.workspaceRoot && path.isAbsolute(options.workspaceRoot) && fs.existsSync(options.workspaceRoot)) {
+    const normalized = path.normalize(options.workspaceRoot);
+    if (matchesTarget(normalized)) {
+      return normalized;
     }
-    let expected: string;
-    try {
-      expected = fs.realpathSync(path.dirname(this.root));
-    } catch {
-      throw new ZcodeControlError("ZCODE_PATH_UNSAFE", "the fixed ZCode queue root parent is unsafe");
-    }
-    expected = path.join(expected, path.basename(this.root));
-    if (real.toLowerCase() !== expected.toLowerCase()) {
-      throw new ZcodeControlError("ZCODE_PATH_UNSAFE", "the fixed ZCode queue root resolved outside its declared location");
-    }
-    return real;
   }
 
-  /**
-   * Validate one truth file: must live inside the real root, must be a plain
-   * regular file (no symlink/junction/reparse point), and must be within the
-   * read cap. Returns its absolute path.
-   */
-  private safeFile(name: string, options: { mustExist: boolean }): string {
-    const root = this.realRoot();
-    const file = path.join(root, name);
-    const relative = path.relative(root, file);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `refusing to touch ${name} outside the fixed queue root`);
-    }
-    let stats: fs.Stats;
+  const envWsRoot = env.C2C_ENGINEERING_AI_WORKSPACE_ROOT?.trim();
+  if (envWsRoot && path.isAbsolute(envWsRoot) && fs.existsSync(envWsRoot)) {
+    return path.normalize(envWsRoot);
+  }
+
+  if (options.registry) {
     try {
-      stats = fs.lstatSync(file);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        if (options.mustExist) {
-          throw new ZcodeControlError("ZCODE_FILE_MISSING", `${name} does not exist in the fixed queue root`);
+      if (targetId && options.registry.has(targetId)) {
+        const canonical = options.registry.get(targetId).canonicalPath;
+        if (path.isAbsolute(canonical) && fs.existsSync(canonical)) {
+          return path.normalize(canonical);
         }
-        return file;
       }
-      throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} could not be inspected`);
-    }
-    if (stats.isSymbolicLink()) {
-      throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} is a symlink/junction; the queue only allows regular files`);
-    }
-    if (!stats.isFile()) {
-      throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} is not a regular file`);
-    }
-    let real: string;
-    try {
-      real = fs.realpathSync(file);
+      for (const id of options.registry.enabledIds()) {
+        const entry = options.registry.get(id);
+        if (matchesTarget(entry.canonicalPath, entry.id, entry.name)) {
+          if (path.isAbsolute(entry.canonicalPath) && fs.existsSync(entry.canonicalPath)) {
+            return path.normalize(entry.canonicalPath);
+          }
+        }
+      }
     } catch {
-      throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} could not be resolved`);
+      // Registry lookup fallback
     }
-    const realRelative = path.relative(root, real);
-    if (realRelative.startsWith("..") || path.isAbsolute(realRelative)) {
-      throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} resolves outside the fixed queue root (reparse-point escape)`);
+  }
+
+  const stateDir =
+    options.stateDir?.trim() ||
+    env.C2C_STATE_DIR?.trim() ||
+    (options.env !== undefined ? undefined : getStateDir(options.stateDir));
+
+  if (stateDir) {
+    const workspacesFile = path.join(stateDir, "workspaces.json");
+    const persisted = readJsonIfExists<{
+      workspaces?: Array<{ id?: string; name?: string; canonicalPath?: string; enabled?: boolean }>;
+    }>(workspacesFile);
+    if (persisted?.workspaces && Array.isArray(persisted.workspaces)) {
+      for (const entry of persisted.workspaces) {
+        if (
+          entry.enabled !== false &&
+          entry.canonicalPath &&
+          path.isAbsolute(entry.canonicalPath) &&
+          matchesTarget(entry.canonicalPath, entry.id, entry.name ?? null)
+        ) {
+          if (fs.existsSync(entry.canonicalPath)) {
+            return path.normalize(entry.canonicalPath);
+          }
+        }
+      }
     }
-    if (stats.size > MAX_FILE_BYTES) {
-      throw new ZcodeControlError("ZCODE_FILE_TOO_LARGE", `${name} exceeds the ${MAX_FILE_BYTES} byte read cap`);
+
+    const runtimeFile = targetId ? path.join(stateDir, "runtime", `${targetId}.json`) : null;
+    const runtime = runtimeFile ? readJsonIfExists<{ workspaceRoot?: string }>(runtimeFile) : null;
+    if (
+      runtime?.workspaceRoot &&
+      path.isAbsolute(runtime.workspaceRoot) &&
+      fs.existsSync(runtime.workspaceRoot)
+    ) {
+      return path.normalize(runtime.workspaceRoot);
     }
-    return file;
+  }
+
+  return null;
+}
+
+export function resolveFixedZcodeQueueRoot(options: ZcodeQueueResolutionOptions = {}): string {
+  if (options.root !== undefined && !options.root.trim()) {
+    throw new ZcodeControlError(
+      "ZCODE_ROOT_MISSING",
+      "the ZCode queue root is not configured (set C2C_ZCODE_QUEUE_ROOT) or does not exist",
+    );
+  }
+
+  const env = options.env ?? process.env;
+  const configured = (options.root ?? env.C2C_ZCODE_QUEUE_ROOT)?.trim();
+
+  if (configured) {
+    if (configured.split(/[\\/]/).includes("..")) {
+      throw new ZcodeControlError("ZCODE_PATH_UNSAFE", "the fixed ZCode queue root cannot contain path traversal");
+    }
+    if (path.isAbsolute(configured)) {
+      const normalized = path.normalize(configured);
+      if (normalized.split(path.sep).includes("..")) {
+        throw new ZcodeControlError("ZCODE_PATH_UNSAFE", "the fixed ZCode queue root cannot contain path traversal");
+      }
+      return normalized;
+    }
+
+    const engWsRoot = resolveEngineeringAiWorkspaceRoot(options, env);
+    if (engWsRoot) {
+      const resolved = path.resolve(engWsRoot, configured);
+      const rel = path.relative(engWsRoot, resolved);
+      if (rel.startsWith("..") || path.isAbsolute(rel) || rel.split(path.sep).includes("..")) {
+        throw new ZcodeControlError("ZCODE_PATH_UNSAFE", "configured ZCode queue root escapes the authorized workspace root");
+      }
+      return resolved;
+    }
+
+    throw new ZcodeControlError(
+      "ZCODE_PATH_UNSAFE",
+      "relative C2C_ZCODE_QUEUE_ROOT cannot be resolved without an authorized workspace root; refusing to use process cwd",
+    );
+  }
+
+  const engWsRoot = resolveEngineeringAiWorkspaceRoot(options, env);
+  if (engWsRoot) {
+    const queueRoot = path.join(engWsRoot, "var", "c2c-zcode");
+    return path.normalize(queueRoot);
+  }
+
+  throw new ZcodeControlError(
+    "ZCODE_ROOT_MISSING",
+    "the ZCode queue root is not configured (set C2C_ZCODE_QUEUE_ROOT) or does not exist",
+  );
+}
+
+/** Resolved real root; fails closed when the configured root is missing. */
+function realQueueRoot(rawRoot: string | undefined): string {
+  if (!rawRoot || !rawRoot.trim()) {
+    throw new ZcodeControlError(
+      "ZCODE_ROOT_MISSING",
+      "the ZCode queue root is not configured (set C2C_ZCODE_QUEUE_ROOT) or does not exist",
+    );
+  }
+  if (!path.isAbsolute(rawRoot)) {
+    throw new ZcodeControlError(
+      "ZCODE_PATH_UNSAFE",
+      "the fixed ZCode queue root must be an absolute path independent of process cwd",
+    );
+  }
+  if (rawRoot.split(/[\\/]/).includes("..")) {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", "the fixed ZCode queue root cannot contain path traversal");
+  }
+  const normalized = path.normalize(rawRoot);
+  if (normalized.split(path.sep).includes("..")) {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", "the fixed ZCode queue root cannot contain path traversal");
+  }
+  let real: string;
+  try {
+    real = fs.realpathSync(normalized);
+  } catch {
+    throw new ZcodeControlError(
+      "ZCODE_ROOT_MISSING",
+      "the ZCode queue root is not configured (set C2C_ZCODE_QUEUE_ROOT) or does not exist",
+    );
+  }
+  let expected: string;
+  try {
+    expected = fs.realpathSync(path.dirname(normalized));
+  } catch {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", "the fixed ZCode queue root parent is unsafe");
+  }
+  expected = path.join(expected, path.basename(normalized));
+  if (real.toLowerCase() !== expected.toLowerCase()) {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", "the fixed ZCode queue root resolved outside its declared location");
+  }
+  return real;
+}
+
+/**
+ * Validate one truth file: must live inside the real root, must be a plain
+ * regular file (no symlink/junction/reparse point), and must be within the
+ * read cap. Returns its absolute path.
+ */
+function safeTruthFile(root: string, name: string, options: { mustExist: boolean }): string {
+  const file = path.join(root, name);
+  const relative = path.relative(root, file);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `refusing to touch ${name} outside the fixed queue root`);
+  }
+  let stats: fs.Stats;
+  try {
+    stats = fs.lstatSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (options.mustExist) {
+        throw new ZcodeControlError("ZCODE_FILE_MISSING", `${name} does not exist in the fixed queue root`);
+      }
+      return file;
+    }
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} could not be inspected`);
+  }
+  if (stats.isSymbolicLink()) {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} is a symlink/junction; the queue only allows regular files`);
+  }
+  if (!stats.isFile()) {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} is not a regular file`);
+  }
+  let real: string;
+  try {
+    real = fs.realpathSync(file);
+  } catch {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} could not be resolved`);
+  }
+  const realRelative = path.relative(root, real);
+  if (realRelative.startsWith("..") || path.isAbsolute(realRelative)) {
+    throw new ZcodeControlError("ZCODE_PATH_UNSAFE", `${name} resolves outside the fixed queue root (reparse-point escape)`);
+  }
+  if (stats.size > MAX_FILE_BYTES) {
+    throw new ZcodeControlError("ZCODE_FILE_TOO_LARGE", `${name} exceeds the ${MAX_FILE_BYTES} byte read cap`);
+  }
+  return file;
+}
+
+export class ZcodeControl {
+  private readonly root?: string;
+  private readonly resolutionOptions?: ZcodeQueueResolutionOptions;
+
+  constructor(rootOrOptions?: string | ZcodeQueueResolutionOptions) {
+    if (typeof rootOrOptions === "string") {
+      this.root = rootOrOptions;
+    } else if (rootOrOptions && typeof rootOrOptions === "object") {
+      this.resolutionOptions = rootOrOptions;
+      this.root = rootOrOptions.root;
+    }
+  }
+
+  private realRoot(): string {
+    const rawRoot = this.root !== undefined ? this.root : resolveFixedZcodeQueueRoot(this.resolutionOptions);
+    return realQueueRoot(rawRoot);
+  }
+
+  private safeFile(name: string, options: { mustExist: boolean }): string {
+    return safeTruthFile(this.realRoot(), name, options);
   }
 
   private readJsonl(name: string): Record<string, unknown>[] {
@@ -475,6 +663,18 @@ export class ZcodeControl {
   }
 
   /**
+   * Unsanitized instruction of one queued task, for coordinator dispatch
+   * fidelity only. MCP views deliberately never expose this field; the
+   * instruction already passed credential rejection at enqueue time and the
+   * executor needs it verbatim (the view excerpt is redacted and truncated).
+   */
+  rawInstructionFor(taskId: string): string | null {
+    if (!TASK_ID_PATTERN.test(taskId)) return null;
+    const task = this.queueRecords().find((record) => record.task_id === taskId);
+    return task && typeof task.instruction === "string" && task.instruction.length > 0 ? task.instruction : null;
+  }
+
+  /**
    * Append one governed task to queue.jsonl. Returns the stored record.
    * Duplicate ids are rejected against both queue.jsonl and receipts.jsonl.
    */
@@ -504,7 +704,7 @@ export class ZcodeControl {
       throw new ZcodeControlError("ZCODE_INVALID_TASK", `instruction exceeds ${MAX_INSTRUCTION_CHARS} characters`);
     }
     if (input.network === true) {
-      throw new ZcodeControlError("ZCODE_INVALID_TASK", "network must be false; the free-window worker never runs networked tasks");
+      throw new ZcodeControlError("ZCODE_INVALID_TASK", "network must be false; the scheduled queue worker never runs networked tasks");
     }
     if (input.mode !== undefined && !MODES.includes(input.mode as ZcodeMode)) {
       throw new ZcodeControlError("ZCODE_INVALID_TASK", `mode must be one of ${MODES.join("|")}`);
@@ -596,6 +796,270 @@ export class ZcodeControl {
 }
 
 class AlreadyRequestedSignal extends Error {}
+
+/** Bounded, sanitized terminal-receipt record the coordinator may append. */
+export interface ZcodeCoordinatorReceipt {
+  task_id: string;
+  event: "START" | "COMPLETED" | "FAILED" | "CANCELLED";
+  model?: string | null;
+  session?: string | null;
+  workspace?: string | null;
+  verification_summary?: string | null;
+  error?: string | null;
+}
+
+/**
+ * The ONE writer allowed to append lifecycle receipts and worker state: the
+ * Governed ZCode queue coordinator owned by this bridge. The ChatGPT-facing
+ * control plane (ZcodeControl) deliberately has no path to this class, so it
+ * can never forge a terminal receipt.
+ */
+export class ZcodeCoordinatorStore {
+  private readonly root: string;
+
+  constructor(rootOrOptions?: string | ZcodeQueueResolutionOptions) {
+    const rawRoot =
+      typeof rootOrOptions === "string"
+        ? rootOrOptions
+        : resolveFixedZcodeQueueRoot(rootOrOptions ?? {});
+    this.root = realQueueRoot(rawRoot);
+  }
+
+  /** Append one lifecycle receipt (serialized, sanitized, bounded). */
+  async appendReceipt(receipt: ZcodeCoordinatorReceipt): Promise<void> {
+    if (!TERMINAL_EVENTS.has(receipt.event) && receipt.event !== "START") {
+      throw new ZcodeControlError("ZCODE_INVALID_TASK", `event ${receipt.event} is not a coordinator receipt`);
+    }
+    if (typeof receipt.task_id !== "string" || !TASK_ID_PATTERN.test(receipt.task_id)) {
+      throw new ZcodeControlError("ZCODE_INVALID_TASK", "receipt task_id is malformed");
+    }
+    const payload: Record<string, unknown> = {
+      task_id: receipt.task_id,
+      timestamp: new Date().toISOString(),
+      event: receipt.event,
+    };
+    payload.model = receipt.model ? sanitizeText(receipt.model, 80) : null;
+    payload.session = receipt.session ? sanitizeText(receipt.session, 80) : null;
+    payload.workspace = receipt.workspace ? sanitizeText(receipt.workspace, MAX_STRING_FIELD_CHARS) : null;
+    payload.verification_summary = receipt.verification_summary
+      ? sanitizeText(receipt.verification_summary, 2000)
+      : null;
+    payload.error = receipt.error ? sanitizeText(receipt.error, 500) : null;
+    await withFileLock(path.join(this.root, RECEIPTS_FILE), () => {
+      appendCoordinatorJsonl(this.root, RECEIPTS_FILE, payload);
+    });
+  }
+
+  /** Persist the bounded worker-state cache (atomically, owner-only). */
+  writeWorkerState(state: Record<string, unknown>): void {
+    const file = safeTruthFile(this.root, STATE_FILE, { mustExist: false });
+    writeSecureJson(file, state);
+  }
+
+  /** Raw worker-state JSON for the coordinator (not the sanitized view). */
+  readRawWorkerState(): Record<string, unknown> | null {
+    const file = safeTruthFile(this.root, STATE_FILE, { mustExist: false });
+    if (!fs.existsSync(file)) return null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      return parsed as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Serialized claim of pending intent before dispatch (crash-recovery proof). */
+  async withDispatchIntent<T>(task: { task_id: string; dispatch: () => Promise<T> }): Promise<T> {
+    return withFileLock(path.join(this.root, STATE_FILE), async () => {
+      const state = (this.readRawWorkerState() ?? {}) as Record<string, unknown>;
+      const pending = Array.isArray(state.pending) ? [...(state.pending as Record<string, unknown>[])] : [];
+      if (!pending.some((entry) => entry.task_id === task.task_id)) {
+        pending.push({ task_id: task.task_id, submitted_at: new Date().toISOString() });
+        this.writeWorkerState({ ...state, pending });
+      }
+      try {
+        return await task.dispatch();
+      } finally {
+        const latest = (this.readRawWorkerState() ?? {}) as Record<string, unknown>;
+        const remaining = Array.isArray(latest.pending)
+          ? (latest.pending as Record<string, unknown>[]).filter((entry) => entry.task_id !== task.task_id)
+          : [];
+        if (remaining.length !== (latest.pending as unknown[] | undefined)?.length) {
+          this.writeWorkerState({ ...latest, pending: remaining });
+        }
+      }
+    });
+  }
+}
+
+/** Serialized single-line append after full truth-file validation. */
+function appendCoordinatorJsonl(root: string, name: string, payload: Record<string, unknown>): void {
+  const file = safeTruthFile(root, name, { mustExist: false });
+  const serialized = JSON.stringify(payload);
+  if (serialized.includes("\n")) {
+    throw new ZcodeControlError("ZCODE_INVALID_TASK", "refusing to append a multi-line JSON record");
+  }
+  fs.appendFileSync(file, serialized + "\n", "utf8");
+}
+
+// ── Control-plane status layers ─────────────────────────────────────────────
+
+export type ZcodeControlPlaneLevel =
+  | "QUEUE_ROOT_MISSING"
+  | "QUEUE_ROOT_UNSAFE"
+  | "WORKSPACE_BINDING_FAILED"
+  | "COORDINATOR_NOT_RUNNING"
+  | "OUTSIDE_CLAIM_WINDOW"
+  | "ZCODE_DESKTOP_UNAVAILABLE"
+  | "AUTH_NOT_ATTESTED"
+  | "WRONG_PROVIDER"
+  | "READY";
+
+export interface ZcodeControlPlaneStatus {
+  level: ZcodeControlPlaneLevel;
+  queue_root: "OK" | "MISSING" | "UNSAFE";
+  workspace_binding: "OK" | "UNRESOLVED" | "UNKNOWN" | "FAILED";
+  coordinator: {
+    running: boolean;
+    status: string | null;
+    owner_pid: number | null;
+    within_window: boolean | null;
+    window: string | null;
+    active: number;
+    last_error: string | null;
+    heartbeat_age_ms: number | null;
+  };
+  native: {
+    observed: boolean;
+    available: boolean | null;
+    provider: string | null;
+    model: string | null;
+    attested: boolean | null;
+    observed_at: string | null;
+  };
+}
+
+const COORDINATOR_STALE_HEARTBEAT_MS = 5 * 60_000;
+
+/**
+ * Bounded, operator-facing explanation of which control-plane layer is broken.
+ * Derived from cheap local state (queue-root resolution + worker-state cache);
+ * it never probes Z2C synchronously and never exposes secrets or raw output.
+ */
+export function describeControlPlane(options: ZcodeQueueResolutionOptions & { now?: Date }): ZcodeControlPlaneStatus {
+  const now = options.now ?? new Date();
+  let queueRoot: string | null = null;
+  let queueRootState: "OK" | "MISSING" | "UNSAFE" = "MISSING";
+  try {
+    queueRoot = resolveFixedZcodeQueueRoot(options);
+    queueRootState = queueRoot && fs.existsSync(queueRoot) ? "OK" : "MISSING";
+  } catch (error) {
+    queueRootState =
+      error instanceof ZcodeControlError && error.code === "ZCODE_PATH_UNSAFE" ? "UNSAFE" : "MISSING";
+  }
+
+  const status: ZcodeControlPlaneStatus = {
+    level: "READY",
+    queue_root: queueRootState,
+    workspace_binding: queueRootState === "OK" ? "UNKNOWN" : "UNRESOLVED",
+    coordinator: {
+      running: false,
+      status: null,
+      owner_pid: null,
+      within_window: null,
+      window: null,
+      active: 0,
+      last_error: null,
+      heartbeat_age_ms: null,
+    },
+    native: {
+      observed: false,
+      available: null,
+      provider: null,
+      model: null,
+      attested: null,
+      observed_at: null,
+    },
+  };
+  if (queueRootState !== "OK") {
+    status.level = queueRootState === "UNSAFE" ? "QUEUE_ROOT_UNSAFE" : "QUEUE_ROOT_MISSING";
+    return status;
+  }
+
+  let store: ZcodeCoordinatorStore;
+  try {
+    store = new ZcodeCoordinatorStore(queueRoot ?? undefined);
+  } catch (error) {
+    status.level =
+      error instanceof ZcodeControlError && error.code === "ZCODE_ROOT_MISSING"
+        ? "QUEUE_ROOT_MISSING"
+        : "QUEUE_ROOT_UNSAFE";
+    return status;
+  }
+  const raw = store.readRawWorkerState() ?? {};
+  const coordinator = status.coordinator;
+  coordinator.status = typeof raw.status === "string" ? sanitizeText(raw.status, 40) : null;
+  const owner = (raw.owner ?? null) as { pid?: unknown; started_at?: unknown } | null;
+  coordinator.owner_pid = owner && typeof owner.pid === "number" ? owner.pid : null;
+  coordinator.window = typeof raw.window === "string" ? sanitizeText(raw.window, 120) : null;
+  coordinator.within_window = typeof raw.within_window === "boolean" ? raw.within_window : null;
+  coordinator.active = Array.isArray(raw.active)
+    ? (raw.active as unknown[]).filter(
+        (entry) => entry && typeof entry === "object" && typeof (entry as { task_id?: unknown }).task_id === "string",
+      ).length
+    : 0;
+  coordinator.last_error = typeof raw.last_error === "string" && raw.last_error
+    ? sanitizeText(raw.last_error, 300)
+    : null;
+  const updatedAt = typeof raw.updated_at === "string" ? Date.parse(raw.updated_at) : NaN;
+  coordinator.heartbeat_age_ms = Number.isFinite(updatedAt) ? Math.max(0, now.getTime() - updatedAt) : null;
+  const heartbeatFresh =
+    coordinator.heartbeat_age_ms !== null && coordinator.heartbeat_age_ms < COORDINATOR_STALE_HEARTBEAT_MS;
+  coordinator.running = heartbeatFresh && coordinator.status !== "stopped" && coordinator.owner_pid !== null;
+
+  const native = status.native;
+  const nativeState = (raw.native ?? null) as
+    | { available?: unknown; provider?: unknown; model?: unknown; attested?: unknown; observed_at?: unknown; namespace_mismatch?: unknown }
+    | null;
+  if (nativeState && typeof nativeState === "object") {
+    native.observed = true;
+    native.available = typeof nativeState.available === "boolean" ? nativeState.available : null;
+    native.provider = typeof nativeState.provider === "string" ? sanitizeText(nativeState.provider, 80) : null;
+    native.model = typeof nativeState.model === "string" ? sanitizeText(nativeState.model, 80) : null;
+    native.attested = typeof nativeState.attested === "boolean" ? nativeState.attested : null;
+    native.observed_at =
+      typeof nativeState.observed_at === "string" ? sanitizeText(nativeState.observed_at, 40) : null;
+  }
+
+  if (!coordinator.running) {
+    status.level = "COORDINATOR_NOT_RUNNING";
+    return status;
+  }
+  if (coordinator.within_window === false) {
+    status.level = "OUTSIDE_CLAIM_WINDOW";
+    return status;
+  }
+  if (nativeState?.namespace_mismatch === true) {
+    status.level = "WORKSPACE_BINDING_FAILED";
+    status.workspace_binding = "FAILED";
+    return status;
+  }
+  if (!native.observed || native.available !== true) {
+    status.level = "ZCODE_DESKTOP_UNAVAILABLE";
+    return status;
+  }
+  if (native.attested !== true) {
+    const providerOk = native.provider === ZCODE_NATIVE_EXPECTED_PROVIDER;
+    status.level = providerOk ? "AUTH_NOT_ATTESTED" : "WRONG_PROVIDER";
+    return status;
+  }
+  status.workspace_binding = "OK";
+  return status;
+}
+
+/** The only desktop provider identity the coordinator may dispatch against. */
+export const ZCODE_NATIVE_EXPECTED_PROVIDER = "zcode-desktop";
 
 function validateStringArray(value: unknown, field: string): string[] {
   if (!Array.isArray(value)) {

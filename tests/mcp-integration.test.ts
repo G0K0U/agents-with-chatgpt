@@ -69,7 +69,9 @@ afterAll(async () => {
 describe("MCP tools over Streamable HTTP", () => {
   it("lists the complete stabilized tool surface and exposes its routing schemas", async () => {
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(33);
+    // Six deprecated Omnigent tools were removed; exact native session read
+    // was added. Keep the explicit names as the contract, not just a count.
+    expect(tools).toHaveLength(28);
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
       "agent_route",
@@ -82,12 +84,6 @@ describe("MCP tools over Streamable HTTP", () => {
       "git_diff",
       "git_status",
       "list_directory",
-      "omnigent_cancel_task",
-      "omnigent_followup_task",
-      "omnigent_get_task",
-      "omnigent_list_tasks",
-      "omnigent_status",
-      "omnigent_submit_task",
       "read_file",
       "search_workspace",
       "submit_codex_task",
@@ -101,11 +97,16 @@ describe("MCP tools over Streamable HTTP", () => {
       "zcode_native_cancel_task",
       "zcode_native_execution_output",
       "zcode_native_get_task",
+      "zcode_native_read_session",
       "zcode_native_resume_session",
       "zcode_native_self_test",
       "zcode_native_status",
       "zcode_native_submit_task",
     ]);
+    for (const name of ["zcode_native_read_session", "zcode_native_resume_session"]) {
+      const schema = tools.find((tool) => tool.name === name)?.inputSchema;
+      expect(schema?.required).toEqual(expect.arrayContaining(["workspace_id", "session_id"]));
+    }
     const submitTool = tools.find((tool) => tool.name === "submit_codex_task");
     const submitSchema = submitTool?.inputSchema as {
       properties?: { network?: { default?: unknown; description?: string } };
@@ -404,6 +405,26 @@ describe("MCP tools over Streamable HTTP", () => {
       requestInit: { headers: { authorization: `Bearer ${limited.accessToken}` } },
     });
     await limitedClient.connect(transport);
+    // Scopes gate invocation, not discovery: a limited token must see the
+    // same catalog, including native controls, without being able to use them.
+    const [limitedCatalog, fullCatalog] = await Promise.all([
+      limitedClient.listTools(), client.listTools(),
+    ]);
+    expect(limitedCatalog.tools.map((tool) => tool.name).sort()).toEqual(
+      fullCatalog.tools.map((tool) => tool.name).sort(),
+    );
+    for (const name of ["zcode_native_read_session", "zcode_native_resume_session"]) {
+      const nativeDenied = await limitedClient.callTool({
+        name,
+        arguments: {
+          workspace_id: bridge.workspace.id,
+          session_id: "sess_00000000-0000-0000-0000-000000000000",
+          ...(name === "zcode_native_resume_session" ? { instruction: "must not dispatch" } : {}),
+        },
+      });
+      expect(nativeDenied.isError).toBe(true);
+      expect(textOf(nativeDenied)).toContain("INSUFFICIENT_SCOPE");
+    }
     const denied = await limitedClient.callTool({ name: "git_diff", arguments: {} });
     expect(denied.isError).toBe(true);
     expect(textOf(denied)).toContain("INSUFFICIENT_SCOPE");

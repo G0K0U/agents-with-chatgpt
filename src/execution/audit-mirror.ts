@@ -45,8 +45,35 @@ export const ENGINEERING_AI_AUDIT_LEDGER_RELATIVE_PATH = ENGINEERING_AI_AUDIT_ST
  */
 export const ENGINEERING_AI_WORKSPACE_ID = process.env.C2C_ENGINEERING_AI_WORKSPACE_ID?.trim() ?? "";
 export const AUDIT_MIRROR_SCOPE = "audit_mirror.write";
-export const MAX_AUDIT_MIRROR_BYTES = 256 * 1024;
-const MAX_AUDIT_MIRROR_LINES = 2_000;
+export const MAX_AUDIT_STATUS_MIRROR_BYTES = 256 * 1024;
+export const MAX_AUDIT_STATUS_MIRROR_LINES = 2_000;
+
+export const MAX_AUDIT_TIMELINE_MIRROR_BYTES = 8 * 1024 * 1024;
+export const MAX_AUDIT_TIMELINE_MIRROR_LINES = 100_000;
+
+/** Legacy status limit aliases retained for existing callers. */
+export const MAX_AUDIT_MIRROR_BYTES = MAX_AUDIT_STATUS_MIRROR_BYTES;
+export const MAX_AUDIT_MIRROR_LINES = MAX_AUDIT_STATUS_MIRROR_LINES;
+
+export interface TargetMirrorLimits {
+  maxBytes: number;
+  maxLines: number;
+}
+
+export function targetMirrorLimits(
+  filename: typeof ENGINEERING_AI_AUDIT_MIRROR_FILENAMES[number]
+): TargetMirrorLimits {
+  if (filename === ENGINEERING_AI_AUDIT_TIMELINE_FILENAME) {
+    return {
+      maxBytes: MAX_AUDIT_TIMELINE_MIRROR_BYTES,
+      maxLines: MAX_AUDIT_TIMELINE_MIRROR_LINES,
+    };
+  }
+  return {
+    maxBytes: MAX_AUDIT_STATUS_MIRROR_BYTES,
+    maxLines: MAX_AUDIT_STATUS_MIRROR_LINES,
+  };
+}
 
 const STANDARD_ONEDRIVE_ENVIRONMENT_KEYS = ["OneDriveCommercial", "OneDriveConsumer", "OneDrive"] as const;
 const WORKSPACE_ID_PATTERN = /^[0-9a-f]{12}$/;
@@ -535,7 +562,7 @@ function requestedTargetMetadata(requestedPath: string | undefined): {
   }
 }
 
-function payloadBytes(content: unknown): Buffer {
+function payloadBytes(content: unknown, limits: TargetMirrorLimits): Buffer {
   if (typeof content !== "string") {
     throw new AuditMirrorError("SOURCE_REQUIRED", "A bounded text payload is required");
   }
@@ -543,8 +570,14 @@ function payloadBytes(content: unknown): Buffer {
     throw new AuditMirrorError("SOURCE_INVALID", "The audit mirror source must be text without null bytes");
   }
   const bytes = Buffer.from(content, "utf8");
-  if (bytes.length > MAX_AUDIT_MIRROR_BYTES) {
-    throw new AuditMirrorError("SOURCE_TOO_LARGE", `The audit mirror source exceeds ${MAX_AUDIT_MIRROR_BYTES} bytes`);
+  if (bytes.length > limits.maxBytes) {
+    throw new AuditMirrorError("SOURCE_TOO_LARGE", `The audit mirror source exceeds ${limits.maxBytes} bytes`);
+  }
+  const lineCount = bytes.length === 0
+    ? 0
+    : bytes.reduce((count, byte) => count + (byte === 0x0a ? 1 : 0), 0) + (bytes.at(-1) === 0x0a ? 0 : 1);
+  if (lineCount > limits.maxLines) {
+    throw new AuditMirrorError("SOURCE_TOO_LARGE", `The audit mirror source exceeds ${limits.maxLines} lines`);
   }
   return bytes;
 }
@@ -553,10 +586,11 @@ async function resolveSource(
   input: WriteEngineeringAiAuditMirrorOptions,
   target: ResolvedAuditMirrorTarget
 ): Promise<Buffer> {
+  const limits = targetMirrorLimits(target.filename);
   const source = input.source ?? "payload";
   if (source === "payload") {
     if (input.content === undefined) throw new AuditMirrorError("SOURCE_REQUIRED", "A bounded text payload is required");
-    return payloadBytes(input.content);
+    return payloadBytes(input.content, limits);
   }
   if (source !== "engineering_ai_ledger") {
     throw new AuditMirrorError("SOURCE_INVALID", "Unsupported audit mirror source");
@@ -588,33 +622,33 @@ async function resolveSource(
       const resolved = workspaceWithResolver.resolve(ledgerPath);
       const stat = fs.statSync(resolved.abs);
       if (!stat.isFile()) throw new AuditMirrorError("ENGINEERING_AI_LEDGER_UNAVAILABLE", "The canonical Engineering AI audit ledger is unavailable");
-      if (stat.size > MAX_AUDIT_MIRROR_BYTES) {
-        throw new AuditMirrorError("SOURCE_TOO_LARGE", `The canonical audit ledger exceeds ${MAX_AUDIT_MIRROR_BYTES} bytes`);
+      if (stat.size > limits.maxBytes) {
+        throw new AuditMirrorError("SOURCE_TOO_LARGE", `The canonical audit ledger exceeds ${limits.maxBytes} bytes`);
       }
       const bytes = fs.readFileSync(resolved.abs);
-      if (bytes.length > MAX_AUDIT_MIRROR_BYTES) {
-        throw new AuditMirrorError("SOURCE_TOO_LARGE", `The canonical audit ledger exceeds ${MAX_AUDIT_MIRROR_BYTES} bytes`);
+      if (bytes.length > limits.maxBytes) {
+        throw new AuditMirrorError("SOURCE_TOO_LARGE", `The canonical audit ledger exceeds ${limits.maxBytes} bytes`);
       }
       const lineCount = bytes.length === 0
         ? 0
         : bytes.reduce((count, byte) => count + (byte === 0x0a ? 1 : 0), 0) + (bytes.at(-1) === 0x0a ? 0 : 1);
-      if (lineCount > MAX_AUDIT_MIRROR_LINES) {
-        throw new AuditMirrorError("SOURCE_TOO_LARGE", `The canonical audit ledger exceeds ${MAX_AUDIT_MIRROR_LINES} lines`);
+      if (lineCount > limits.maxLines) {
+        throw new AuditMirrorError("SOURCE_TOO_LARGE", `The canonical audit ledger exceeds ${limits.maxLines} lines`);
       }
-      return payloadBytes(bytes.toString("utf8"));
+      return payloadBytes(bytes.toString("utf8"), limits);
     }
     ledger = await ledgerWorkspace.readFile(ledgerPath, {
-      maxLines: MAX_AUDIT_MIRROR_LINES,
-      maxBytes: MAX_AUDIT_MIRROR_BYTES,
+      maxLines: limits.maxLines,
+      maxBytes: limits.maxBytes,
     });
   } catch (error) {
     if (error instanceof AuditMirrorError) throw error;
     throw new AuditMirrorError("ENGINEERING_AI_LEDGER_UNAVAILABLE", "The canonical Engineering AI audit ledger is unavailable");
   }
   if (ledger.truncated) {
-    throw new AuditMirrorError("SOURCE_TOO_LARGE", `The canonical audit ledger exceeds ${MAX_AUDIT_MIRROR_BYTES} bytes`);
+    throw new AuditMirrorError("SOURCE_TOO_LARGE", `The canonical audit ledger exceeds ${limits.maxBytes} bytes`);
   }
-  return payloadBytes(ledger.content);
+  return payloadBytes(ledger.content, limits);
 }
 
 function writeAtomically(target: ResolvedAuditMirrorTarget, bytes: Buffer): void {

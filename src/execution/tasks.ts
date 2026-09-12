@@ -42,6 +42,7 @@ import { AntigravityBackend, DEFAULT_GEMINI_MODEL, KNOWN_GEMINI_MODELS, type Ant
 import { OmnigentBackend, sanitizeOmnigentOutput, type OmnigentBackendOptions } from "./omnigent.js";
 import { OmnigentError } from "./omnigent-client.js";
 import { executionOrchestrator, type ExecutionOrchestrator } from "./orchestrator.js";
+import type { TaskLifecycleEvent, TaskLifecycleEventType } from "./audit-maintenance.js";
 import type { C2CSessionRegistry } from "../session/registry.js";
 import {
   acquireWorkspaceSlot,
@@ -117,7 +118,7 @@ interface TaskErrorInfo {
   message: string;
 }
 
-interface PersistedTaskRecord {
+export interface PersistedTaskRecord {
   continuation?: { idempotencyKey: string; model: "gpt-6-astra"; effort: "high"; timeoutMs: number };
   actualModel?: NativeModelEvidence | string | null;
   stableVerification?: { passed: boolean; sourceHash: string | null; commands: Array<{ command: string; exitCode: number | null; sourceHash?: string | null }> };
@@ -389,6 +390,8 @@ export interface TaskManagerOptions {
   queueSize?: number;
   /** Alias for maxQueueSize used by older local integrations. */
   queueLimit?: number;
+  /** Optional lifecycle event listener for audit maintenance or external observation. */
+  onTaskLifecycleEvent?: (event: TaskLifecycleEvent) => void;
 }
 
 const TERMINAL_STATUSES = new Set<TaskStatus>(["completed", "failed", "cancelled", "interrupted", "timed_out"]);
@@ -1127,6 +1130,7 @@ export class CodexTaskManager {
   private writerSlotTimer: ReturnType<typeof setTimeout> | undefined;
   private closed = false;
   private closePromise: Promise<void> | null = null;
+  private readonly onTaskLifecycleEvent?: (event: TaskLifecycleEvent) => void;
 
   constructor(
     readonly workspace: Workspace,
@@ -1160,11 +1164,33 @@ export class CodexTaskManager {
     );
     this.maxQueueSize = boundedQueueSize(opts.maxQueueSize ?? opts.queueSize ?? opts.queueLimit, DEFAULT_TASK_QUEUE_SIZE);
     this.queuePauseState = readWorkspaceQueuePauseState(this.workspace.id, this.stateDir);
+    this.onTaskLifecycleEvent = opts.onTaskLifecycleEvent;
     this.loadTasks();
     this.reconcileActiveSlot();
     this.recovering = false;
     this.schedulePump();
     void this.reconcileNativeSlot().finally(() => this.watchWriterSlot());
+  }
+
+  private emitLifecycleEvent(
+    type: TaskLifecycleEventType,
+    record?: PersistedTaskRecord,
+    timestamp?: string,
+    paused?: boolean
+  ): void {
+    if (!this.onTaskLifecycleEvent) return;
+    try {
+      this.onTaskLifecycleEvent({
+        type,
+        workspaceId: this.workspace.id,
+        taskId: record?.taskId,
+        record: record ? { ...record } : undefined,
+        paused,
+        timestamp: timestamp ?? new Date().toISOString(),
+      });
+    } catch (err) {
+      this.logger.warn(`Task lifecycle listener failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private native(): NonNullable<TaskManagerOptions["nativeClient"]> {
@@ -1205,7 +1231,7 @@ export class CodexTaskManager {
 
   resumeNative(input: Parameters<ZcodeNativeClient["resumeSession"]>[0]): Promise<ZcodeNativeTaskView> {
     this.assertNativeWorkspace(input.workspace_id);
-    return this.dispatchNative(true, hook => this.native().resumeSession(input, hook));
+    return this.dispatchNative(true, hook => this.native().resumeSession({ ...input, expected_workspace_path: this.workspace.root }, hook));
   }
 
   /** Reserve, dispatch and bind the same workspace slot to the native task. */
@@ -1497,6 +1523,8 @@ export class CodexTaskManager {
       throw error;
     }
 
+    this.emitLifecycleEvent("submit", record, record.submittedAt);
+
     let profile: VerificationProfile | null = null;
     if (input.runTests) {
       try {
@@ -1682,6 +1710,12 @@ export class CodexTaskManager {
     if (typeof paused !== "boolean") throw new TaskError("INVALID_TASK", "Queue pause state must be boolean");
     this.queuePauseState = writeWorkspaceQueuePauseState(this.workspace.id, paused, this.stateDir);
     if (!paused) this.schedulePump();
+    this.emitLifecycleEvent(
+      paused ? "queue_paused" : "queue_resumed",
+      undefined,
+      this.queuePauseState.updatedAt ?? new Date().toISOString(),
+      paused
+    );
     return this.getQueueState(access);
   }
 
@@ -1992,6 +2026,11 @@ export class CodexTaskManager {
     record.executionRecorded = true;
     this.writeTask(record);
     this.releaseTaskSlot(record, null);
+    const recoveredType: TaskLifecycleEventType =
+      record.exitStatus === "timeout" || record.status === "timed_out"
+        ? "timed_out"
+        : (record.status as TaskLifecycleEventType);
+    this.emitLifecycleEvent(recoveredType, record, record.completedAt ?? record.submittedAt);
     return true;
   }
 
@@ -2408,6 +2447,7 @@ export class CodexTaskManager {
     record.startedAt = new Date().toISOString();
     this.writeTask(record);
     this.updateSession(record);
+    this.emitLifecycleEvent("start", record, record.startedAt);
     runtime.taskTimeout = setTimeout(() => {
       void this.timeoutTask(runtime);
     }, record.continuation?.timeoutMs ?? this.taskTimeoutMs);
@@ -2500,7 +2540,7 @@ export class CodexTaskManager {
         cwd: this.workspace.root,
         approvalPolicy: input.fullAccess ? "never" : "on-request",
         sandboxPolicy: input.fullAccess
-          ? { type: "dangerFullAccess", networkAccess: input.network }
+          ? { type: "dangerFullAccess" }
           : {
               type: "workspaceWrite",
               writableRoots: input.writableRoots,
@@ -2841,6 +2881,7 @@ export class CodexTaskManager {
     record.providerRuntime = "omnigent:codex-native";
     this.writeTask(record);
     this.updateSession(record);
+    this.emitLifecycleEvent("start", record, record.startedAt);
     let unconfirmed = false;
     // Detect changes to files that were already dirty before this task too.
     // Only hash paths C2C's workspace layer allows us to inspect.
@@ -2955,6 +2996,7 @@ export class CodexTaskManager {
     record.networkReported = input.networkEffective;
     this.writeTask(record);
     this.updateSession(record);
+    this.emitLifecycleEvent("start", record, record.startedAt);
 
     runtime.taskTimeout = setTimeout(() => {
       void this.timeoutTask(runtime);
@@ -3595,5 +3637,11 @@ export class CodexTaskManager {
     // recognizes a line that was appended before a process died.
     this.ensureExecutionRecord(record);
     this.reconcileSessionTruth();
+
+    const terminalEventType: TaskLifecycleEventType =
+      timedOut
+        ? "timed_out"
+        : (record.status as TaskLifecycleEventType);
+    this.emitLifecycleEvent(terminalEventType, record, record.completedAt ?? new Date().toISOString());
   }
 }

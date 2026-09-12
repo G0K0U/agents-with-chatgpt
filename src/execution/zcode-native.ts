@@ -18,7 +18,7 @@
  *    comma-separated operator-owned environment variable) may be forwarded.
  *    This allowlist is defense in depth; principal ownership is enforced
  *    separately via C2C's resolveWorkspace (see the MCP tool layer).
- *  - Desktop-managed Start Plan only: the execution identity of an accepted
+ *  - Desktop-managed auth only: the execution identity of an accepted
  *    task is the model binding Z2C OBSERVED for that exact session at
  *    admission (native session/read). Z2C admits only observed
  *    builtin:zai-start-plan/GLM-5.3-Flash sessions, and this client re-verifies
@@ -31,13 +31,14 @@
  *  - Bearer/registration tokens are never echoed: upstream payloads are
  *    scrubbed of the configured token before parsing, and only projected
  *    fields are released.
- *  - No fallback: failures never route into the free-window queue.
+ *  - No fallback: failures never route into the governed scheduled queue.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { canonicalizeWorkspaceRoot } from "../workspace/identity.js";
 import { createHash } from "node:crypto";
 import { rejectCredentialLikeInstruction } from "./zcode-control.js";
 
@@ -58,6 +59,11 @@ export function nativeAllowedWorkspaces(env: NodeJS.ProcessEnv = process.env): R
   );
 }
 
+// 2026-09-12: a fresh live Desktop session observed through the
+// desktop-agent chain reports builtin:zai-start-plan / GLM-5.3-Flash, which
+// replaces the previously required builtin:zai-coding-plan / GLM-5.3
+// comparison target. Comparison target only — never evidence; the accepted
+// binding must be OBSERVED from the exact session's own state.
 export const ZCODE_NATIVE_REQUIRED_IDENTITY = {
   provider: "zcode-desktop", // DesktopZcodeProvider.name — the only desktop-managed provider
   provider_id: "builtin:zai-start-plan",
@@ -218,6 +224,7 @@ export interface SubmitNativeInput {
 }
 
 export interface ResumeNativeInput {
+  expected_workspace_path?: string;
   workspace_id: string;
   session_id: string;
   instruction: string;
@@ -415,12 +422,33 @@ export class ZcodeNativeClient {
     return projectTaskView(raw, { ...input, session_id: task.session_id ?? undefined });
   }
 
+  async readSession(input: { workspace_id: string; session_id: string; expected_workspace_path?: string }) {
+    this.assertWorkspaceAllowed(input.workspace_id);
+    if (!SESSION_ID_RE.test(input.session_id)) throw new ZcodeNativeError("ZCODE_NATIVE_INSTRUCTION_REJECTED", "Invalid native session id");
+    const raw = await this.callTool("read_zcode_session", { workspace_id: input.workspace_id, session_id: input.session_id }) as Record<string, unknown>;
+    if (raw.workspace_id !== input.workspace_id || raw.session_id !== input.session_id || typeof raw.canonical_path !== "string") {
+      throw new ZcodeNativeError("ZCODE_NATIVE_NAMESPACE_MISMATCH", "Exact session namespace mismatch");
+    }
+    if (input.expected_workspace_path) {
+      const normalize = (p: string) => process.platform === "win32" ? resolve(p).toLowerCase() : resolve(p);
+      if (normalize(canonicalizeWorkspaceRoot(raw.canonical_path)) !== normalize(canonicalizeWorkspaceRoot(input.expected_workspace_path))) {
+        throw new ZcodeNativeError("ZCODE_NATIVE_NAMESPACE_MISMATCH", "Native workspace path differs from C2C registry");
+      }
+    }
+    const binding = projectBinding(raw.model_binding);
+    if (binding?.provider_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id || binding?.model_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.model_id || binding.source !== "desktop-session-read" || raw.immediate_resume !== "native-session-v1") {
+      throw new ZcodeNativeError("ZCODE_NATIVE_NOT_ATTESTED", "Exact native session binding or immediate continuation contract unavailable");
+    }
+    return { workspace_id: input.workspace_id, session_id: input.session_id, canonical_path: raw.canonical_path, model_binding: binding };
+  }
+
   async resumeSession(input: ResumeNativeInput, beforeDispatch?: () => void): Promise<ZcodeNativeTaskView> {
     this.assertWorkspaceAllowed(input.workspace_id);
     this.assertInstruction(input.instruction);
     if (!SESSION_ID_RE.test(input.session_id)) {
       throw new ZcodeNativeError("ZCODE_NATIVE_INSTRUCTION_REJECTED", "session_id must match sess_<uuid>");
     }
+    await this.readSession(input);
     beforeDispatch?.();
     const raw = await this.callTool("resume_zcode_session", {
       workspace_id: input.workspace_id,

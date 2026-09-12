@@ -293,6 +293,11 @@ export class CodexAppServerClient implements AppServerClient {
     if (this.child) return;
     if (this.closed) throw new Error("Codex App Server client is closed");
 
+    // Installed dangerFullAccess has no networkAccess field. MCP tool removal
+    // cannot stop a host shell from networking. Fail before spawning, not online.
+    if (this.opts.fullAccess === true && this.opts.networkAccess !== true) {
+      throw new Error("NETWORK_POLICY_UNSUPPORTED: Codex full-access execution cannot enforce network=false; no provider was launched");
+    }
     const executable = (this.launcher.resolveExecutable ?? resolveCodexExecutable)();
     let child: ChildProcessWithoutNullStreams;
     try {

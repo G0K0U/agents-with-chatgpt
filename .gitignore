@@ -8,3 +8,12 @@ dist/
 .env.*
 !.env.example
 coverage/
+.codex-tmp/
+.serena/
+var/
+/queue.jsonl
+/control.jsonl
+*.error-protocol-backup-*
+*.protocol-v2-backup-*
+*.lazy-manager-backup-*
+*.p0-backup-*

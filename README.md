@@ -34,10 +34,10 @@ full-access 模式运行执行器：Codex 可以使用 bridge 进程拥有的文
 Codex coding sessions, while Codex keeps ownership of local execution. Your
 repository is never uploaded: ChatGPT reads exactly the lines it needs through
 an OAuth-protected MCP connection and may submit work through the local Codex
-App Server. The CLI deployment runs that executor with the user-selected full-access
+App Server. An explicitly opted-in CLI deployment runs that executor with full-access
 mode; network remains disabled by default and is enabled only for a task that
 explicitly sets `network: true` in this locally authorized deployment. The public
-surface remains a fixed 14-tool MCP contract with one separately scoped,
+surface remains a fixed 28-tool MCP contract with one separately scoped,
 exact-target audit-mirror writer.
 
 Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
@@ -83,7 +83,7 @@ install prompt below is unchanged and battle-tested:
 请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
 所有事情你自己做：
 
-1. 环境自检：需要 git 和 Node.js ≥ 22，缺什么就自动安装
+1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
   （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
 2. 下载：把 https://github.com/G0K0U/agents-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
@@ -108,7 +108,7 @@ paragraph below, paste it to your coding agent (Codex), and go grab a coffee:
 Please install and configure "Codex with ChatGPT" for me, fully automatically.
 I am a non-technical user — do everything yourself:
 
-1. Check the environment: git and Node.js >= 22 must be available. Install
+1. Check the environment: git and Node.js >= 20 must be available. Install
    anything missing yourself (macOS: Homebrew, Windows: winget). Also install
    cloudflared.
 2. Download: clone https://github.com/G0K0U/agents-with-chatgpt into
@@ -264,13 +264,12 @@ c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
 c2c status / doctor / pair / unpair / logs / stop
 ```
 
-Requirements: Node.js >= 22, git. `cloudflared` for the public connection
+Requirements: Node.js >= 20, git. `cloudflared` for the public connection
 (auto-detected; the Skill installs it for you).
 
 Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 [security](docs/security.md) · [troubleshooting](docs/troubleshooting.md) ·
-[agent prompts](docs/agent-prompts.md) · [support matrix](docs/support-matrix.md) ·
-[ZCode](docs/zcode.md)
+[agent prompts](docs/agent-prompts.md) · [support matrix](docs/support-matrix.md)
 
 ## Project layout
 
@@ -287,7 +286,7 @@ src/
   cli/        the c2c CLI
 skill/        the Codex Skill (the real UX layer)
 tests/        unit + integration tests
-docs/         architecture / protocol / security / troubleshooting / zcode
+docs/         architecture / protocol / security / troubleshooting
 ```
 
 ## Public infrastructure boundary
@@ -306,14 +305,10 @@ resume task metadata after restart, and run the CLI executor in full-access mode
 The full-access choice is intentional: anyone holding the connector's execution
 scopes can direct local Codex actions within the OS permissions of the bridge.
 
-Native ZCode companion integration is VERIFIED on Windows 11 x64: status and
-self-test passed, exact session binding is `builtin:zai-start-plan / GLM-5.3-Flash`,
-a real native model turn completed, same-session resume returned the new turn
-response, and the Engineering AI workspace probe completed. The companion Z2C
-Desktop bridge is external to this repository and Desktop owns authentication.
-
 **Unofficial community project. Not affiliated with or endorsed by OpenAI.**
 
 ## License
 
 [MIT](LICENSE)
+
+Full-access development is opt-in via `C2C_FULL_ACCESS_DEVELOPMENT=true`; otherwise the CLI uses restricted execution. See [deployment policy](docs/full-access-development.md).
