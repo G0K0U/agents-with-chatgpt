@@ -30,6 +30,7 @@ import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT, resolveStateDir, writeSecureJson } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { currentRuntimeDir, resolveRuntimeIdentity, type RuntimeIdentity } from "./runtime-identity.js";
 import {
   acquireStateDomainOwner,
   resolveOwnedAuthStorage,
@@ -295,6 +296,28 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   let publicBaseUrl: string | null = null;
   let publicProbe: PublicProbeResult | null = null;
 
+  // Deterministic runtime identity: which source tree produced the code this
+  // process is executing, and whether that code still matches the trees on
+  // disk. Computed once at startup; surfaces drift instead of hiding it.
+  let runtimeIdentity: RuntimeIdentity | null = null;
+  try {
+    runtimeIdentity = resolveRuntimeIdentity({ runtimeDir: currentRuntimeDir() });
+  } catch (error) {
+    logger.warn(
+      `Runtime identity resolution failed: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  const releaseSummary = runtimeIdentity?.manifest
+    ? {
+        version: runtimeIdentity.manifest.version,
+        sourceCommit: runtimeIdentity.manifest.sourceCommit,
+        buildHash: runtimeIdentity.manifest.buildHash,
+        releaseId: runtimeIdentity.releaseId,
+        sourceParity: runtimeIdentity.sourceParity,
+        buildParity: runtimeIdentity.buildParity,
+      }
+    : null;
+
   const app = express();
   app.set("trust proxy", true);
   app.disable("x-powered-by");
@@ -315,6 +338,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
       workspaceId: workspace.id,
       workspaceCount: authorizedWorkspaceIds.length,
       status: "ok",
+      release: releaseSummary,
     });
   });
 
@@ -424,6 +448,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
       startedAt,
       stateDir,
       stateDomainGeneration: stateOwner?.generation,
+      runtimeIdentity,
     });
   });
 
@@ -503,6 +528,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
       startedAt,
       stateDir,
       stateDomainGeneration: stateOwner?.generation,
+      release: releaseSummary ?? undefined,
     };
     writeRuntimeState(state, stateDir);
   };

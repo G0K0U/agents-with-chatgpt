@@ -27,7 +27,7 @@ bridge with read/review tools and an explicitly authorized local task path.
 连接按需读取代码，并可通过本地 Codex App Server 提交任务。当前 CLI 按已选择的
 full-access 模式运行执行器：Codex 可以使用 bridge 进程拥有的文件系统和进程权限；
 网络默认关闭，只有任务明确设置 `network: true` 且本地 full-access 部署允许时才开启。
-公开 MCP 接口仍保持固定的 14 个工具，其中外部写入仅限单独授权的审计镜像工具，
+公开 MCP 接口仍保持固定的 28 个工具，其中外部写入仅限单独授权的审计镜像工具，
 不新增通用 Shell 工具。
 
 **EN** — Use the ChatGPT web app as the planning and review brain for your
@@ -187,42 +187,91 @@ Credentials stay in the OS app state directory, not in the project.
 ## How it works
 
 ```
-             ┌───────────────────────────┐
-             │       ChatGPT Web         │
-             │  Reason / Plan / Review   │
-             └──────────┬──────────▲─────┘
-                        │          │
-               MCP      │          │ Computer Use
-            Data Plane  │          │ Control Plane (<1 KB messages)
-                        ▼          │
-             ┌─────────────────────┐
-             │      C2C Bridge     │   loopback-only HTTP server
-             │  MCP read/review    │   OAuth 2.1 + one-time pairing code
-             │  scoped task adapter│
-             │  OAuth + Pairing    │   Cloudflare Quick Tunnel
-             │  Tunnel Manager     │
-             └──────────┬──────────┘
-                        │  policy-validated task / review data
-                        ▼
-             ┌─────────────────────┐          ┌─────────────────────┐
-             │   Local Workspace   │◀─────────│ Official Codex      │
-             └─────────────────────┘ scoped  │ App Server (v2)     │
-                                              │ writes / tests       │
-                                              └─────────────────────┘
+                ┌──────────────────────────┐
+                │       ChatGPT Web        │
+                │  Reason / Plan / Review  │
+                └───────────┬────────▲─────┘
+                            │        │
+                  MCP       │        │ Computer Use
+               Data Plane   │        │ Control Plane (<1 KB messages)
+                            ▼        │
+                ┌─────────────────────────────────┐
+                │            C2C Core             │  loopback-only bridge
+                │  MCP read/review + task tools   │  OAuth 2.1 + pairing
+                │  runtime identity + release     │  Cloudflare tunnel
+                │  bounded supervisor + doctor    │
+                └───────┬──────────┬─────────┬────┘
+                        │          │         │
+             ON_DEMAND  │          │ ON_DEMAND   MANAGED_PERSISTENT
+                        ▼          ▼             ▼
+              ┌────────────┐ ┌────────────┐ ┌──────────────────┐
+              │   Codex    │ │  Gemini /  │ │ ZCode / GLM      │
+              │  App Server│ │ Antigravity│ │ Z2C →            │
+              │            │ │    AGY     │ │ ZCode Desktop    │
+              └────────────┘ └────────────┘ └──────────────────┘
 ```
 
 - **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
   `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
   no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: ChatGPT pulls what it needs through the 9 existing
-  read/review tools and can use the separate `submit_codex_task`,
-  `get_codex_task`, `cancel_codex_task`, and `execution_queue` tools when
-  explicitly authorized. The separately scoped `write_engineering_ai_audit_mirror`
-  tool writes only the operator-configured Engineering AI status target
-  (disabled unless `C2C_ENGINEERING_AI_WORKSPACE_ID` is set).
-- **Independent review**: after Codex executes, ChatGPT inspects the actual
+- **Data plane (MCP)**: a fixed 28-tool contract. ChatGPT pulls what it needs
+  through the read/review tools (`workspace_info`, `list_directory`,
+  `read_file`, `search_workspace`, `git_status`, `git_diff`, `test_status`,
+  `execution_summary`, `execution_output`), drives the Codex task lifecycle
+  (`submit_codex_task`, `get_codex_task`, `cancel_codex_task`) and the scoped
+  `execution_queue` control tool when explicitly authorized, and reaches the
+  ZCode lane through the `zcode_*` queue/native tools plus the agent-routing
+  tools. The separately scoped `write_engineering_ai_audit_mirror` tool writes
+  only the operator-configured Engineering AI status target (disabled unless
+  `C2C_ENGINEERING_AI_WORKSPACE_ID` is set).
+- **Isolated provider lanes**: Codex and Gemini/Antigravity AGY run
+  on-demand; ZCode/GLM runs as a managed-persistent lane behind Z2C and
+  ZCode Desktop. Each lane has its own bootstrap strategy and failure domain —
+  one lane degrading never takes the others down.
+- **Independent review**: after an agent executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
+
+## Runtime lifecycle & reliability (Stability R1 / R1.1)
+
+- **Immutable releases (LKG)**: `c2c release build` produces `dist/` plus a
+  build manifest and promotes an immutable copy under `releases/<id>/`;
+  `c2c release activate` runs the release gate before repointing `LKG.json`.
+  A failed gate leaves the previous last-known-good release untouched, so a
+  bad build can never destroy a working runtime. The daemon prefers the LKG
+  release when launching the bridge.
+- **Runtime identity**: each build records which source tree and dist tree it
+  was produced from; at runtime the trees are re-hashed, so drift
+  (`SOURCE_BUILD_MISMATCH`, `BUILD_RUNTIME_MISMATCH`) is detected instead of a
+  process silently serving stale output.
+- **Bounded supervisor**: one lightweight process observes the control plane
+  and performs targeted recovery — re-probe, reconcile, reconnect the affected
+  provider, restart the affected companion, and restart C2C only when C2C
+  itself is unhealthy. Restarts are backoff-bounded (immediate, 5s, 15s, 30s,
+  then FAILED and manual intervention), so restart storms are structurally
+  impossible. The supervisor never writes durable state (task records,
+  receipts, auth, workspace ownership stay read-only to it).
+- **Windows autostart**: `install/register-autostart.ps1` registers a logon
+  scheduled task that runs `c2c supervisor run`; the supervisor then owns boot
+  ordering (bridge → tunnel → provider lanes).
+- **Provider bootstrap strategies**:
+  - `codex` / `gemini` (Antigravity AGY) — **on-demand**: local, cost-free
+    readiness checks only (executable resolves, isolated state preparable).
+    No persistent process and no quota spend while idle. Requires the Codex
+    CLI, respectively Gemini/Antigravity access, to be installed and signed in.
+  - `zcode` (GLM) — **managed-persistent**: the ZCode Desktop GUI is the lane;
+    when absent it is launched with the desktop-agent proxy environment so the
+    registration → Z2C → workspace binding → native attestation chain can come
+    up on its own. Requires ZCode Desktop to be installed.
+- **Unified doctor**: `c2c doctor`/status assembles one operational view from
+  durable local surfaces (runtime pointer, release pointer, supervisor status,
+  bounded liveness probes), strips admin tokens, and reports per-section
+  failures instead of failing wholesale.
+
+These mechanisms bound and detect failure; they do not make providers
+always-online or failures impossible. External prerequisites still apply per
+lane, and platform support is Windows 11 x64 first — see the
+[support matrix](docs/support-matrix.md).
 
 ## Permission model (short version)
 
@@ -256,12 +305,14 @@ Full threat model: [docs/security.md](docs/security.md)
 
 ```bash
 pnpm install
-pnpm build          # -> dist/, exposes the `c2c` bin
+pnpm build          # -> dist/ + build manifest, exposes the `c2c` bin
 pnpm test           # vitest: full unit + integration + full-access bridge suite
 
 c2c setup           # bridge + tunnel + pairing code, all in one
 c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
 c2c status / doctor / pair / unpair / logs / stop
+c2c release build / c2c release activate   # immutable LKG release lifecycle
+c2c supervisor run                          # bounded recovery loop (autostart entry)
 ```
 
 Requirements: Node.js >= 20, git. `cloudflared` for the public connection
@@ -275,18 +326,19 @@ Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 
 ```
 src/
-  bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        9 read/review tools + 4 task/queue tools + exact-target audit mirror
-  auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
-  pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
-  workspace/  stable registry ids, path containment, sensitive-file policy, search, git
-  tunnel/     TunnelProvider abstraction + Cloudflare Quick/Named Tunnel
-  execution/  App Server adapter, task records, and review-loop records
-  process/    daemon lifecycle
-  cli/        the c2c CLI
-skill/        the Codex Skill (the real UX layer)
-tests/        unit + integration tests
-docs/         architecture / protocol / security / troubleshooting
+  bridge/       loopback HTTP server, port recovery, admin API, runtime identity
+  mcp/          fixed 28-tool MCP contract (see "How it works")
+  auth/         OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
+  pairing/      one-time pairing codes (CSPRNG, TTL, rate limits)
+  workspace/    stable registry ids, path containment, sensitive-file policy, search, git
+  tunnel/       TunnelProvider abstraction + Cloudflare Quick/Named Tunnel
+  execution/    App Server adapter, task records, review-loop records, ZCode lanes
+  supervisor/   bounded supervisor + provider bootstrap strategies
+  process/      daemon lifecycle, immutable release/LKG lifecycle, unified reporting
+  cli/          the c2c CLI
+skill/          the Codex Skill (the real UX layer)
+tests/          unit + integration tests
+docs/           architecture / protocol / security / troubleshooting
 ```
 
 ## Public infrastructure boundary
@@ -299,11 +351,17 @@ This public repository derives from and upstreams [XiaoDuoYa/codex-with-chatgpt]
 
 ## Status & disclaimer
 
-Bootstrap upgrade verified end-to-end: one authorized connector can select the
-registered engineering workspace and the bridge workspace, persist sessions,
-resume task metadata after restart, and run the CLI executor in full-access mode.
-The full-access choice is intentional: anyone holding the connector's execution
-scopes can direct local Codex actions within the OS permissions of the bridge.
+Verified for the v0.2.0 release: the source/regression suite green on the
+release tree, the installer exercised end-to-end on Windows 11 x64, the live
+OAuth control loop with real cooperating agent sessions, and the Antigravity
+direct provider adapter. Stability R1/R1.1 (immutable LKG releases, runtime
+identity, bounded supervisor, provider bootstrap) ships in this source with
+release/regression tests. Windows 11 x64 is the only verified platform — see
+the [support matrix](docs/support-matrix.md) and the
+[v0.2.0 acceptance summary](docs/release-acceptance-v0.2.0.md) for what is and
+is not verified. The full-access choice is intentional: anyone holding the
+connector's execution scopes can direct local agent actions within the OS
+permissions of the bridge.
 
 **Unofficial community project. Not affiliated with or endorsed by OpenAI.**
 
@@ -311,4 +369,5 @@ scopes can direct local Codex actions within the OS permissions of the bridge.
 
 [MIT](LICENSE)
 
-Full-access development is opt-in via `C2C_FULL_ACCESS_DEVELOPMENT=true`; otherwise the CLI uses restricted execution. See [deployment policy](docs/full-access-development.md).
+Full-access development is opt-in via `C2C_FULL_ACCESS_DEVELOPMENT=true`;
+otherwise the CLI uses restricted execution.

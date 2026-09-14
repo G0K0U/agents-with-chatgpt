@@ -167,11 +167,13 @@ try {
   Step 'setup: bridge + pairing ready' ($setupExit -eq 0) "c2c setup exit=$setupExit; complete the browser login, then re-run setup"
 
   # ── optional autostart (explicit opt-in only) ──────────────────────────────
+  # The supervisor is the boot owner: logon -> supervisor -> bridge -> tunnel,
+  # then the supervisor reconnects provider lanes (Z2C, desktop agent) itself.
   if ($EnableAutoStart) {
-    $action = New-ScheduledTaskAction -Execute 'node.exe' -Argument "`"$Cli`" start --workspace `"$Workspace`" --state-dir `"$StateDir`"" -WorkingDirectory $InstallRoot
+    $action = New-ScheduledTaskAction -Execute 'node.exe' -Argument "`"$Cli`" supervisor run --workspace `"$Workspace`"" -WorkingDirectory $InstallRoot
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     Register-ScheduledTask -TaskName 'C2C Bridge' -Action $action -Trigger $trigger -Force | Out-Null
-    Step 'autostart registered (opt-in)' $true 'Scheduled Task "C2C Bridge" at logon'
+    Step 'autostart registered (opt-in)' $true 'Scheduled Task "C2C Bridge" at logon runs the bounded supervisor'
   } else {
     Step 'autostart not requested' $true 'pass -EnableAutoStart to register a logon task'
   }

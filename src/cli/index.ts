@@ -2,7 +2,7 @@ import { fullAccessDevelopmentEnabled } from "../config/development.js";
 import { Command } from "commander";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
 import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
@@ -10,6 +10,7 @@ import { readAuthStatePointer } from "../bridge/state-owner.js";
 import { reconcileStateDomains } from "../bridge/state-migration.js";
 import { adminFetch, ensureBridge, stopBridge, findSharedBridgeObservation as findBridgeObservation,
   type SharedBridgeObservation } from "../process/daemon.js";
+import { activateRelease, promoteCurrentBuild, releaseRepoRoot, releaseStatus, runReleaseGate } from "../process/release.js";
 import { diagnoseSharedTunnel } from "../process/shared-doctor.js";
 import { requestRestart, waitRestartHandoff } from "../process/restart.js";
 import { Workspace } from "../workspace/manager.js";
@@ -896,7 +897,30 @@ program
     }
 
     if (opts.json) {
-      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair }));
+      // One operational truth source: unified machine-readable view.
+      let unified: unknown = null;
+      try {
+        const { buildUnifiedReport } = await import("../process/unified-report.js");
+        unified = await buildUnifiedReport({
+          repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."),
+          stateDir: getStateDir(opts.stateDir),
+          workspaceId: workspace?.id ?? "",
+          workspaceRoot: root,
+          runtime,
+        });
+      } catch (error) {
+        unified = { error: error instanceof Error ? error.message : String(error) };
+      }
+      // R1.1: surface provider bootstrap states in the flat doctor report too.
+      const p = (unified as { providers?: { state?: string; data?: unknown } } | null)?.providers;
+      if (p?.data) {
+        const d = p.data as { codex?: { state?: string }; gemini?: { state?: string }; zcode?: { state?: string; registrationLive?: boolean; workspaceBinding?: string; attested?: boolean | null } };
+        report.providers = {
+          ok: p.state === "READY",
+          detail: `codex=${d.codex?.state} gemini=${d.gemini?.state} zcode=${d.zcode?.state} (registration=${String(d.zcode?.registrationLive)} binding=${d.zcode?.workspaceBinding} attested=${String(d.zcode?.attested)})`,
+        };
+      }
+      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair, unified }));
       return;
     }
     say(`${PRODUCT_NAME} Doctor`);
@@ -909,6 +933,7 @@ program
       mcp: "MCP",
       oauth: "OAuth",
       tunnel: "Tunnel",
+      providers: "Providers",
     };
     let allOk = true;
     for (const [key, value] of Object.entries(report)) {
@@ -1105,6 +1130,217 @@ program
     fs.mkdirSync(getStateDir(), { recursive: true });
     fs.writeFileSync(file, JSON.stringify({ date: today, updateAvailable, remoteCommit }), { mode: 0o600 });
     emit({ checked: true, updateAvailable, localCommit: local.stdout, remoteCommit });
+  });
+
+// ---------------------------------------------------------------- release (deterministic runtime identity)
+
+const release = program
+  .command("release")
+  .description("Build, verify, and activate immutable release artifacts (last-known-good)");
+
+release
+  .command("build")
+  .description("Typecheck, build, write the build manifest, and promote an immutable release copy")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const root = releaseRepoRoot();
+    const gate = runReleaseGate(root, { quick: true });
+    const promoted = gate.ok ? promoteCurrentBuild(root) : { ok: false, releaseId: null, manifest: null, error: "gate failed" };
+    const payload = { ok: promoted.ok, gate, releaseId: promoted.releaseId, error: promoted.error };
+    if (opts.json) say(JSON.stringify(payload));
+    else {
+      for (const step of gate.steps) say(`${step.ok ? "✓" : "✗"} ${step.name} (${step.durationMs}ms)${step.ok ? "" : `\n  ${step.detail ?? ""}`}`);
+      say(promoted.ok ? `Release promoted: ${promoted.releaseId}` : `Release build failed: ${promoted.error}`);
+    }
+    if (!payload.ok) process.exitCode = 1;
+  });
+
+release
+  .command("activate")
+  .description("Run the full release gate and atomically repoint the last-known-good release")
+  .option("--quick", "run focused regression suites instead of the full suite", false)
+  .option("--json", "machine-readable output", false)
+  .action((opts: { quick: boolean; json: boolean }) => {
+    const root = releaseRepoRoot();
+    const result = activateRelease(root, { quick: opts.quick });
+    if (opts.json) say(JSON.stringify({ ok: result.ok, gate: result.gate, pointer: result.pointer, error: result.error }));
+    else {
+      for (const step of result.gate.steps) say(`${step.ok ? "✓" : "✗"} ${step.name} (${step.durationMs}ms)${step.ok ? "" : `\n  ${step.detail ?? ""}`}`);
+      say(result.ok ? `Last-known-good release activated: ${result.pointer?.releaseId}` : `Activation failed: ${result.error}`);
+    }
+    if (!result.ok) process.exitCode = 1;
+  });
+
+release
+  .command("status", { isDefault: true })
+  .description("Show release identity, source/build parity, and drift")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const root = releaseRepoRoot();
+    const status = releaseStatus(root);
+    if (opts.json) say(JSON.stringify({ ok: status.drift.every(d => d === "NONE" || d === "LKG_AHEAD_OF_DIST"), ...status }));
+    else {
+      say(`dist release: ${status.distReleaseId ?? "none (no build manifest)"}`);
+      say(`source parity: ${status.distSourceParity}  build parity: ${status.distBuildParity}`);
+      say(`last-known-good: ${status.pointer?.releaseId ?? "none"}`);
+      say(`drift: ${status.drift.join(", ") || "NONE"}`);
+    }
+    if (status.drift.some(d => d !== "NONE" && d !== "LKG_AHEAD_OF_DIST")) process.exitCode = 1;
+  });
+
+// ---------------------------------------------------------------- supervisor (bounded self-healing)
+
+const supervisorCmd = program
+  .command("supervisor")
+  .description("Bounded control-plane supervisor: observe and perform targeted recovery");
+
+supervisorCmd
+  .command("start")
+  .description("Start the supervisor as a detached background process")
+  .option("--workspace <dir>", "supervised control-plane workspace root", process.cwd())
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace: string; stateDir?: string; json: boolean }) => {
+    const stateDir = getStateDir(opts.stateDir);
+    const statusFile = path.join(stateDir, "supervisor", "status.json");
+    // Pre-flight: refuse to double-start a live supervisor.
+    const lockFile = path.join(stateDir, "supervisor", "supervisor.lock");
+    if (fs.existsSync(lockFile)) {
+      try {
+        const lock = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { pid: number };
+        try { process.kill(lock.pid, 0); say(`Supervisor already running (pid ${lock.pid}).`); return; }
+        catch { /* stale lock: the run loop reclaims it */ }
+      } catch { /* unparseable lock: reclaim */ }
+    }
+    // Spawn THIS same CLI entry (dist or tsx dev) detached for the run loop.
+    const entry = fileURLToPath(import.meta.url);
+    const entryArgs = entry.endsWith(".ts") ? ["--import", "tsx/esm", entry] : [entry];
+    const runArgs = [...entryArgs, "supervisor", "run", "--workspace", opts.workspace];
+    if (opts.stateDir) runArgs.push("--state-dir", opts.stateDir);
+    const child = spawn(process.execPath, runArgs, {
+      cwd: process.cwd(),
+      detached: true,
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    // Wait briefly for the first heartbeat so failures surface now.
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        const snap = JSON.parse(fs.readFileSync(statusFile, "utf8")) as { pid: number };
+        if (snap.pid === child.pid) {
+          say(opts.json ? JSON.stringify({ ok: true, pid: child.pid }) : `Supervisor running (pid ${child.pid}).`);
+          return;
+        }
+      } catch { /* not yet */ }
+    }
+    say(opts.json ? JSON.stringify({ ok: false, pid: child.pid }) : `Supervisor spawned (pid ${child.pid}) but no heartbeat yet; check ${statusFile}.`);
+    if (!opts.json) process.exitCode = 1;
+  });
+
+supervisorCmd
+  .command("run", { hidden: true })
+  .description("Supervisor loop entry (used by the detached start command)")
+  .option("--workspace <dir>", "supervised control-plane workspace root", process.cwd())
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .action(async (opts: { workspace: string; stateDir?: string }) => {
+    const { Supervisor } = await import("../supervisor/supervisor.js");
+    const stateDir = getStateDir(opts.stateDir);
+    const supervisor = new Supervisor({
+      repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."),
+      stateDir,
+      workspaceRoot: path.resolve(opts.workspace),
+    });
+    if (!supervisor.acquireLock()) {
+      say("Another live supervisor holds the lock; exiting.");
+      return;
+    }
+    // R1.1 takeover bootstrap: reconcile provider desired state (on-demand
+    // readiness + managed ZCode Desktop) once, bounded and idempotent, before
+    // the observation loop takes over continuous reconciliation.
+    await supervisor.bootstrapOnTakeover().catch((error) => {
+      say(`Provider bootstrap failed (non-fatal): ${error instanceof Error ? error.message : String(error)}`);
+    });
+    const shutdown = (): void => { supervisor.stop(); supervisor.releaseLock(); process.exit(0); };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    await supervisor.run();
+  });
+
+supervisorCmd
+  .command("stop")
+  .description("Stop a running supervisor")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const stateDir = getStateDir();
+    const lockFile = path.join(stateDir, "supervisor", "supervisor.lock");
+    let stopped = false;
+    if (fs.existsSync(lockFile)) {
+      try {
+        const lock = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { pid: number };
+        try { process.kill(lock.pid); stopped = true; } catch { stopped = false; }
+      } catch { /* fall through */ }
+    }
+    try { fs.rmSync(lockFile, { force: true }); } catch { /* best effort */ }
+    say(opts.json ? JSON.stringify({ ok: stopped }) : (stopped ? "Supervisor stopped." : "No live supervisor found (stale lock cleared)."));
+    if (!stopped && opts.json) process.exitCode = 1;
+  });
+
+supervisorCmd
+  .command("status", { isDefault: true })
+  .description("Show the supervisor snapshot")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const statusFile = path.join(getStateDir(), "supervisor", "status.json");
+    if (!fs.existsSync(statusFile)) {
+      say(opts.json ? JSON.stringify({ ok: false, running: false }) : "No supervisor status found; is it running?");
+      process.exitCode = 1;
+      return;
+    }
+    const snap = JSON.parse(fs.readFileSync(statusFile, "utf8")) as Record<string, unknown>;
+    if (opts.json) say(JSON.stringify({ ok: true, ...snap }));
+    else {
+      say(`overall: ${snap.overall}  (pid ${snap.pid}, tick ${snap.tick}, last ${snap.lastTickAt})`);
+      for (const c of (snap.components as Array<Record<string, unknown>>) ?? []) {
+        say(`  ${String(c.component).padEnd(18)} ${String(c.state).padEnd(10)} ${c.detail ? String(c.detail) : ""}`);
+      }
+      const log = (snap.recoveryLog as Array<Record<string, unknown>>) ?? [];
+      if (log.length) say("recent recovery:");
+      for (const entry of log.slice(-5)) say(`  ${entry.at} ${entry.component}: ${entry.action} -> ${entry.outcome}`);
+    }
+    if (snap.overall !== "READY" && snap.overall !== "DEGRADED") process.exitCode = 1;
+  });
+
+supervisorCmd
+  .command("reconcile")
+  .description("Run one bounded provider-bootstrap reconciliation pass (safe alongside a live supervisor)")
+  .option("--workspace <dir>", "supervised control-plane workspace root", process.cwd())
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace: string; stateDir?: string; json: boolean }) => {
+    const { ZcodeDesktopReconciler } = await import("../supervisor/provider-bootstrap.js");
+    const stateDir = getStateDir(opts.stateDir);
+    const reconciler = new ZcodeDesktopReconciler({
+      workspaceRoot: path.resolve(opts.workspace),
+      stateDir,
+      z2cRepoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "zcode-with-chatgpt"),
+    });
+    const obs = reconciler.observe();
+    let action = "none";
+    if (obs.launch) {
+      action = await obs.launch();
+    }
+    const after = reconciler.observe();
+    if (opts.json) {
+      say(JSON.stringify({ ok: true, before: { state: obs.state, detail: obs.detail }, action, after: { state: after.state, detail: after.detail, managed: after.managed, desktopPid: after.desktopPid, registrationLive: after.registrationLive } }));
+    } else {
+      say(`before: ${obs.state}${obs.detail ? ` (${obs.detail})` : ""}`);
+      say(`action: ${action}`);
+      say(`after:  ${after.state}${after.detail ? ` (${after.detail})` : ""}`);
+    }
+    if (after.state !== "READY" && after.state !== "RECOVERING") process.exitCode = 1;
   });
 
 // ---------------------------------------------------------------- session (ChatGPT conversation / Project memory)

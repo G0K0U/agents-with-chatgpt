@@ -1,38 +1,40 @@
 # Architecture
 
 ```
-             ┌───────────────────────────┐
-             │    ChatGPT Web / Sol      │
-             │  Reason / Plan / Review   │
-             └──────────┬──────────▲─────┘
-                        │          │
-               MCP      │          │ Computer Use
-            Data Plane  │          │ Control Plane
-                        ▼          │
-             ┌─────────────────────┐
-             │      C2C Bridge     │
-             │  MCP read/review    │
-             │  scoped task adapter│
-             │  OAuth AS + PRM     │
-             │  Pairing Manager    │
-             │  Tunnel Manager     │
-             │  Admin API (local)  │
-             └──────────┬──────────┘
-                        │  policy-validated task / review data
-                        ▼
-             ┌─────────────────────┐
-             │   Local Workspace   │
-             └──────────▲──────────┘
+                ┌──────────────────────────┐
+                │       ChatGPT Web        │
+                │  Reason / Plan / Review  │
+                └───────────┬────────▲─────┘
+                            │        │
+                  MCP       │        │ Computer Use
+               Data Plane   │        │ Control Plane
+                            ▼        │
+                ┌─────────────────────────────────┐
+                │            C2C Core             │
+                │  MCP read/review + task tools   │
+                │  OAuth AS + PRM, pairing        │
+                │  runtime identity + release     │
+                │  bounded supervisor + doctor    │
+                │  Admin API (local)              │
+                └───────┬──────────┬─────────┬────┘
+                        │          │         │
+             ON_DEMAND  │          │ ON_DEMAND   MANAGED_PERSISTENT
+                        ▼          ▼             ▼
+              ┌────────────┐ ┌────────────┐ ┌──────────────────┐
+              │   Codex    │ │  Gemini /  │ │ ZCode / GLM      │
+              │  App Server│ │ Antigravity│ │ Z2C →            │
+              │            │ │    AGY     │ │ ZCode Desktop    │
+              └────────────┘ └────────────┘ └──────────────────┘
+                        ▲
                         │ scoped writes / tests
-             ┌──────────┴──────────┐
-             │ Official Codex      │
-             │ App Server (v2)     │
-             └─────────────────────┘
+                ┌───────┴───────────┐
+                │  Local Workspace  │
+                └───────────────────┘
 ```
 
 ## Principles
 
-- **ChatGPT thinks. Codex works.** The bridge never re-implements a coding harness.
+- **ChatGPT thinks. Agents work.** The bridge never re-implements a coding harness.
 - **Computer Use = control plane**: tiny `[C2C]` state messages (< 1 KB).
 - **MCP = data plane**: ChatGPT pulls files/diffs/search results itself.
 - **Explicit deployment mode**: the CLI may run the official Codex App Server in
@@ -43,19 +45,65 @@
 - **Registry is the routing boundary**: one bridge owns a local registry of
   authorized workspace ids and canonical roots; one connector may select among
   those entries while owner/session checks remain in force.
+- **Isolated provider lanes**: every provider declares a bootstrap strategy
+  (see "Provider lanes" below); a lane failing degrades only itself.
+
+## Provider lanes (Stability R1.1)
+
+Each provider declares one bootstrap strategy, and the takeover/tick paths
+reconcile observed state toward it:
+
+| Lane | Strategy | Bootstrap behavior |
+| --- | --- | --- |
+| Codex | `on-demand` | Local, cost-free readiness checks only (executable resolves, isolated state preparable). No persistent process, no remote canary, no quota spend while idle. |
+| Gemini / Antigravity AGY | `on-demand` | Same local readiness checks. No persistent process while idle. |
+| ZCode / GLM | `managed-persistent` | The ZCode Desktop GUI is the lane. When absent it is launched with the desktop-agent proxy environment so the registration → Z2C → workspace binding → native attestation chain can come up on its own. |
+
+Lanes are isolated: one lane degrading never restarts or blocks the others.
+
+## Runtime lifecycle & reliability (Stability R1)
+
+- **Immutable releases (LKG)** — `src/process/release.ts`: deterministic
+  `source → typecheck → build → verified release → atomic activation`.
+  `c2c release build` produces `dist/` plus a build manifest and promotes an
+  immutable copy into `releases/<id>/`; `c2c release activate` runs the release
+  gate and only then repoints `LKG.json`. A failed gate leaves the previous
+  last-known-good release untouched. The daemon prefers the LKG release when
+  launching a bridge.
+- **Runtime identity** — `src/bridge/runtime-identity.ts` +
+  `scripts/write-build-manifest.mjs`: a build records which source and dist
+  trees it was produced from; at runtime the trees are re-hashed so
+  `SOURCE_BUILD_MISMATCH` and `BUILD_RUNTIME_MISMATCH` become typed, detectable
+  conditions instead of silent staleness.
+- **Bounded supervisor** — `src/supervisor/supervisor.ts`: one lightweight
+  process observes control-plane surfaces and performs targeted recovery:
+  re-probe → reconcile metadata → reconnect the affected provider → restart
+  the affected companion → restart C2C only when C2C itself is unhealthy.
+  Restarts are backoff-bounded (immediate, 5s, 15s, 30s; then FAILED and
+  manual intervention), making restart storms structurally impossible. The
+  supervisor reads durable state but never writes it.
+- **Windows autostart** — `install/register-autostart.ps1`: registers a logon
+  scheduled task that runs `c2c supervisor run`; the supervisor owns boot
+  ordering (bridge → tunnel → provider lanes).
+- **Unified reporting** — `src/process/unified-report.ts`: `c2c doctor`/status
+  assembles the operator view from durable local surfaces (runtime pointer,
+  queue/writer state files, release pointer, supervisor status, bounded
+  liveness probes), strips admin tokens, and never fails the whole report
+  because one section is unreadable.
 
 ## Components (src/)
 
 | Module | Responsibility |
 | --- | --- |
-| `bridge/` | Express app assembly, loopback-only listener, port fallback, runtime state, admin API |
-| `mcp/` | McpServer with 9 read/review tools, three task lifecycle tools, one separately scoped queue-control tool, and the exact-target Engineering AI audit-mirror writer; stateless Streamable HTTP transport |
+| `bridge/` | Express app assembly, loopback-only listener, port fallback, runtime state, runtime identity, admin API |
+| `mcp/` | McpServer with the fixed 28-tool contract (read/review tools, Codex task lifecycle, scoped queue control, ZCode queue/native tools, agent-routing tools, and the exact-target Engineering AI audit-mirror writer); stateless Streamable HTTP transport |
 | `auth/` | OAuth 2.1 authorization server: discovery metadata (RFC 8414 + Protected Resource Metadata), dynamic client registration (RFC 7591), authorization-code + PKCE (S256 only), refresh rotation, revocation (RFC 7009). Opaque tokens stored as SHA-256 hashes |
 | `pairing/` | PairingCode lifecycle: CSPRNG generation, TTL, attempt limits, IP rate limit, one-time use |
 | `workspace/` | Canonical-path containment (realpath of deepest existing ancestor), sensitive-file policy, `.c2cignore`, paginated read/list, ripgrep search with Node fallback, git status/diff with pagination |
 | `tunnel/` | `TunnelProvider` interface + Cloudflare Quick and workspace-configured Named Tunnel implementations; business logic is vendor-agnostic |
-| `execution/` | Official App Server stdio adapter, C2C-owned per-workspace runtime isolation, typed local verification profiles, exact-target audit-mirror writer, persisted task metadata, compatible JSONL execution records, and optional sanitized command output (`execution_output`) |
-| `process/` | Daemon spawn/reuse, health probing, graceful shutdown |
+| `execution/` | Official App Server stdio adapter, C2C-owned per-workspace runtime isolation, typed local verification profiles, exact-target audit-mirror writer, persisted task metadata, compatible JSONL execution records, optional sanitized command output (`execution_output`), ZCode queue/native lanes |
+| `supervisor/` | Bounded supervisor (recovery ladder, component states) and provider bootstrap/reconciliation strategies |
+| `process/` | Daemon spawn/reuse, health probing, graceful shutdown, immutable release/LKG lifecycle, unified reporting |
 | `cli/` | `c2c` commands; `--json` everywhere for the Skill |
 | `config/`, `logger/` | OS-convention state dir, secret-redacting logger |
 

@@ -92,6 +92,7 @@ export class ZcodeNativeError extends Error {
       | "ZCODE_NATIVE_TIMEOUT"
       | "ZCODE_NATIVE_SERVICE_MISMATCH"
       | "ZCODE_NATIVE_NOT_ATTESTED"
+      | "ZCODE_INCOMPATIBLE_PROVIDER_VERSION"
       | "ZCODE_NATIVE_WORKSPACE_FORBIDDEN"
       | "ZCODE_NATIVE_INSTRUCTION_REJECTED"
       | "ZCODE_NATIVE_NAMESPACE_MISMATCH"
@@ -261,8 +262,24 @@ export class ZcodeNativeClient {
    * Forward one tool call to Z2C. The bearer token is scrubbed from the
    * payload before parsing so it can never leak into released results or
    * errors.
+   *
+   * A Z2C restart invalidates the MCP session id this client holds. One
+   * re-handshake retry covers exactly that transport-level case
+   * (ZCODE_NATIVE_UNAVAILABLE). Upstream tool errors and timeouts are never
+   * retried here: the first attempt may already have executed upstream.
    */
   async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    try {
+      return await this.callToolAttempt(name, args);
+    } catch (err) {
+      const code = err instanceof ZcodeNativeError ? err.code : "ZCODE_NATIVE_UNAVAILABLE";
+      if (code !== "ZCODE_NATIVE_UNAVAILABLE") throw err;
+      this.resetSession();
+      return await this.callToolAttempt(name, args);
+    }
+  }
+
+  private async callToolAttempt(name: string, args: Record<string, unknown>): Promise<unknown> {
     const client = await this.ensureSession();
     let result: unknown;
     try {
@@ -586,6 +603,30 @@ export class ZcodeNativeClient {
  * session/read). A returned task without the required observed identity is
  * discarded before the task/session identity is bound anywhere.
  */
+/**
+ * Versioned provider compatibility manifest (Phase: no brittle identity
+ * assumptions). Marketing/plan identifiers drift; the REQUIRED identity is
+ * enforced on the OBSERVED binding, and identities that were previously
+ * required are listed as retired so a drifted environment reports the
+ * specific compatibility code instead of a generic attestation failure.
+ * Adding a newly observed identity later means updating this manifest —
+ * never loosening the observation requirement.
+ */
+const ZCODE_NATIVE_COMPATIBILITY_MANIFEST = {
+  required: { ...ZCODE_NATIVE_REQUIRED_IDENTITY },
+  retired: [
+    { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" },
+    { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3" },
+    { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3-Flash" },
+  ] as ReadonlyArray<{ provider_id: string; model_id: string }>,
+} as const;
+
+function isRetiredIdentity(providerId: string, modelId: string): boolean {
+  return ZCODE_NATIVE_COMPATIBILITY_MANIFEST.retired.some(
+    (entry) => entry.provider_id === providerId && entry.model_id === modelId,
+  );
+}
+
 function assertTaskBinding(view: ZcodeNativeTaskView): ZcodeNativeTaskView {
   const binding = view.model_binding;
   if (
@@ -593,12 +634,17 @@ function assertTaskBinding(view: ZcodeNativeTaskView): ZcodeNativeTaskView {
     binding.provider_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id ||
     binding.model_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.model_id
   ) {
-    throw new ZcodeNativeError(
-      "ZCODE_NATIVE_NOT_ATTESTED",
+    const observed = binding ? `${binding.provider_id}/${binding.model_id}` : "unknown";
+    const detail =
       `task ${view.task_id} carries unverified execution binding (observed ` +
-        `${binding ? `${binding.provider_id}/${binding.model_id}` : "unknown"}; ` +
-        `requires ${ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id}/${ZCODE_NATIVE_REQUIRED_IDENTITY.model_id})`,
-    );
+      `${observed}; requires ${ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id}/${ZCODE_NATIVE_REQUIRED_IDENTITY.model_id})`;
+    if (binding && isRetiredIdentity(binding.provider_id, binding.model_id)) {
+      throw new ZcodeNativeError(
+        "ZCODE_INCOMPATIBLE_PROVIDER_VERSION",
+        `${detail}; the observed identity is retired by the C2C provider compatibility manifest`,
+      );
+    }
+    throw new ZcodeNativeError("ZCODE_NATIVE_NOT_ATTESTED", detail);
   }
   return view;
 }

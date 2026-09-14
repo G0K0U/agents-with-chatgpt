@@ -103,43 +103,81 @@ Ready.
 ## 工作原理
 
 ```
-             ┌───────────────────────────┐
-             │      ChatGPT 网页版       │
-             │   推理 / 规划 / 审查      │
-             └──────────┬──────────▲─────┘
-                        │          │
-               MCP      │          │ Computer Use
-              数据面    │          │ 控制面（消息 < 1 KB）
-                        ▼          │
-             ┌─────────────────────┐
-             │      C2C Bridge     │   仅监听本机回环地址
-             │  MCP 读/审查        │   OAuth 2.1 + 一次性配对码
-             │  受限任务适配器      │
-             │  OAuth + 配对       │   Cloudflare Quick Tunnel
-             │  Tunnel 管理        │
-             └──────────┬──────────┘
-                        │  本地策略校验的任务 / 审查数据
-                        ▼
-             ┌─────────────────────┐          ┌─────────────────────┐
-             │     本地工作区      │◀─────────│ Official Codex      │
-             └─────────────────────┘ 受限写入 │ App Server (v2)     │
-                                              │ tests               │
-                                              └─────────────────────┘
+                ┌──────────────────────────┐
+                │       ChatGPT 网页版     │
+                │   推理 / 规划 / 审查     │
+                └───────────┬────────▲─────┘
+                            │        │
+                  MCP       │        │ Computer Use
+                数据面      │        │ 控制面（消息 < 1 KB）
+                            ▼        │
+                ┌─────────────────────────────────┐
+                │            C2C 核心             │  仅监听本机回环
+                │  MCP 读/审查 + 任务工具         │  OAuth 2.1 + 配对码
+                │  运行时身份 + 发布生命周期      │  Cloudflare 隧道
+                │  有界监督者 + doctor 诊断       │
+                └───────┬──────────┬─────────┬────┘
+                        │          │         │
+                按需    │          │  按需   │   托管常驻
+                        ▼          ▼         ▼
+              ┌────────────┐ ┌────────────┐ ┌──────────────────┐
+              │   Codex    │ │  Gemini /  │ │ ZCode / GLM      │
+              │ App Server │ │ Antigravity│ │ Z2C →            │
+              │            │ │    AGY     │ │ ZCode Desktop    │
+              └────────────┘ └────────────┘ └──────────────────┘
 ```
 
 - **控制面（Computer Use）**：Codex 与 ChatGPT 之间只交换极小的结构化 `[C2C]`
   状态消息——`INIT → PLAN → EXECUTED → REVIEW → DONE`。绝不粘贴 diff、日志
   或文件内容。
-- **数据面（MCP）**：ChatGPT 缺什么自己拉什么，共 9 个读/审查工具；另有明确授权的
-  `submit_codex_task`、`get_codex_task`、`cancel_codex_task`、`execution_queue` 四个受限
-  任务/队列工具：
-  `workspace_info`、`list_directory`、`read_file`、`search_workspace`、
+- **数据面（MCP）**：固定的 28 个工具契约。ChatGPT 通过读/审查工具
+  （`workspace_info`、`list_directory`、`read_file`、`search_workspace`、
   `git_status`、`git_diff`、`test_status`、`execution_summary`、
-  `execution_output`。`write_engineering_ai_audit_mirror` 使用单独 scope，且只允许
-  写入操作者自行配置的 Engineering AI 审计状态目标（未设置
-  `C2C_ENGINEERING_AI_WORKSPACE_ID` 时该功能关闭）。
-- **独立审查**：Codex 执行完毕后，ChatGPT 通过 MCP 亲自检查真实的 git diff
-  和测试记录——绝不因为 Codex 说"测试全过"就直接相信。
+  `execution_output`）按需拉取；在明确授权时通过 Codex 任务生命周期工具
+  （`submit_codex_task`、`get_codex_task`、`cancel_codex_task`）和受限的
+  `execution_queue` 控制工具提交/暂停任务；通过 `zcode_*` 队列/原生工具和
+  agent 路由工具触达 ZCode 通道。单独 scope 的
+  `write_engineering_ai_audit_mirror` 只允许写入操作者自行配置的
+  Engineering AI 审计状态目标（未设置 `C2C_ENGINEERING_AI_WORKSPACE_ID`
+  时该功能关闭）。
+- **供应商通道相互隔离**：Codex 与 Gemini/Antigravity AGY 按需启动；
+  ZCode/GLM 是经 Z2C 连接 ZCode Desktop 的托管常驻通道。每条通道有自己的
+  启动策略和故障域——一条通道降级不会拖垮其他通道。
+- **独立审查**：Agent 执行完毕后，ChatGPT 通过 MCP 亲自检查真实的 git diff
+  和测试记录——绝不因为对方说"测试全过"就直接相信。
+
+## 运行时生命周期与可靠性（Stability R1 / R1.1）
+
+- **不可变发布（LKG）**：`c2c release build` 产出 `dist/` 和构建清单，并把
+  不可变副本归档到 `releases/<id>/`；`c2c release activate` 先跑发布门禁，
+  通过后才改写 `LKG.json`。门禁失败时上一个 last-known-good 发布原封不动，
+  坏构建永远不会毁掉正在工作的运行时。守护进程启动 bridge 时优先使用 LKG
+  发布。
+- **运行时身份**：每次构建记录它由哪棵源码树、哪棵 dist 树产出；运行时会
+  重新哈希这两棵树，漂移（`SOURCE_BUILD_MISMATCH`、
+  `BUILD_RUNTIME_MISMATCH`）会被检测出来，而不是默默跑着过期输出。
+- **有界监督者**：一个轻量进程观察控制面并做定向恢复——重新探测、对账、
+  重连受影响的供应商、重启受影响的伴随进程，只有 C2C 自身不健康时才重启
+  C2C。重启按退避有界（立即、5s、15s、30s，之后 FAILED 等人工介入），
+  重启风暴在结构上不可能发生。监督者从不写持久状态（任务记录、回执、
+  认证、工作区归属对它只读）。
+- **Windows 开机自启**：`install/register-autostart.ps1` 注册登录触发的
+  计划任务运行 `c2c supervisor run`，由监督者接管启动顺序
+  （bridge → 隧道 → 供应商通道）。
+- **供应商启动策略**：
+  - `codex` / `gemini`（Antigravity AGY）——**按需**：只做本地、零成本的
+    就绪检查（可执行文件可解析、隔离状态可准备）。空闲时不驻留进程、
+    不消耗配额。前提：分别安装并登录 Codex CLI / Gemini 或 Antigravity。
+  - `zcode`（GLM）——**托管常驻**：ZCode Desktop GUI 本身就是通道；缺失时
+    监督者会带桌面代理环境变量启动它，让注册 → Z2C → 工作区绑定 →
+    原生证明链自行建立。前提：安装 ZCode Desktop。
+- **统一 doctor**：`c2c doctor`/status 从本地持久界面（运行时指针、发布
+  指针、监督者状态、有界存活探测）汇总出一张运维视图，剥离管理员令牌，
+  单个分区读取失败不会拖垮整份报告。
+
+这些机制用于界定和发现故障，并不意味着供应商永远在线或故障不可能发生。
+各通道仍有各自的外部前提；平台支持以 Windows 11 x64 为先——详见
+[支持矩阵](docs/support-matrix.md)。
 
 ## 权限模型（简版）
 
@@ -165,12 +203,14 @@ Ready.
 
 ```bash
 pnpm install
-pnpm build          # 产出 dist/，暴露 c2c 命令
+pnpm build          # 产出 dist/ + 构建清单，暴露 c2c 命令
 pnpm test           # vitest：完整单元、集成和 full-access bridge 测试
 
 c2c setup           # 一条命令：Bridge + 隧道 + 配对码
 c2c sandbox-allow   # 把本地设置目录加入 Codex 沙箱白名单（macOS / Windows）
 c2c status / doctor / pair / unpair / logs / stop
+c2c release build / c2c release activate   # 不可变 LKG 发布生命周期
+c2c supervisor run                          # 有界恢复循环（自启入口）
 ```
 
 环境要求：Node.js >= 20、git；公网连接需要 `cloudflared`
@@ -183,15 +223,16 @@ c2c status / doctor / pair / unpair / logs / stop
 
 ```
 src/
-  bridge/     本机回环 HTTP 服务、端口自动恢复、管理 API
-  mcp/        9 个读/审查工具 + 4 个任务/队列工具、无状态 HTTP
-  auth/       OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
-  pairing/    一次性配对码（CSPRNG、TTL、限速）
-  workspace/  稳定注册表 id、路径收敛、敏感文件策略、搜索、git
-  tunnel/     TunnelProvider 抽象 + Cloudflare Quick Tunnel
-  execution/  App Server 适配器、任务状态和审查闭环记录
-  process/    守护进程生命周期
-  cli/        c2c 命令行
+  bridge/       本机回环 HTTP 服务、端口自动恢复、管理 API、运行时身份
+  mcp/          固定 28 个工具的 MCP 契约（见「工作原理」）
+  auth/         OAuth 2.1（PKCE、动态注册、refresh 轮换、吊销）
+  pairing/      一次性配对码（CSPRNG、TTL、限速）
+  workspace/    稳定注册表 id、路径收敛、敏感文件策略、搜索、git
+  tunnel/       TunnelProvider 抽象 + Cloudflare Quick/Named Tunnel
+  execution/    App Server 适配器、任务状态、审查闭环记录、ZCode 通道
+  supervisor/   有界监督者 + 供应商启动策略
+  process/      守护进程生命周期、不可变发布/LKG 生命周期、统一报告
+  cli/          c2c 命令行
 skill/        Codex Skill（真正的 UX 层）
 tests/        单元 + 集成测试
 docs/         架构 / 协议 / 安全 / 故障排查
@@ -207,10 +248,14 @@ docs/         架构 / 协议 / 安全 / 故障排查
 
 ## 状态与声明
 
-Bootstrap 升级已端到端验证：Bridge、OAuth + 配对、公网隧道、同一 ChatGPT
-连接器选择多个已授权工作区、会话跨重启续接，以及 full-access 执行器。full-access
-是有意选择的权限模型：持有该 connector 执行权限的人可以让本地 Codex 使用 bridge
-进程在操作系统层面拥有的权限。
+v0.2.0 发布已验证的内容：发布树上源码/回归套件全绿，安装脚本在
+Windows 11 x64 上端到端跑通，真实 OAuth 控制闭环与多 Agent 协作会话，
+以及 Antigravity 直连适配器。Stability R1/R1.1（不可变 LKG 发布、运行时
+身份、有界监督者、供应商启动策略）已随本次源码发布并附带回归测试。
+Windows 11 x64 是唯一已验证平台——详见[支持矩阵](docs/support-matrix.md)
+与 [v0.2.0 验收摘要](docs/release-acceptance-v0.2.0.md)中明确列出
+已验证/未验证的内容。full-access 是有意选择的权限模型：持有该 connector
+执行权限的人可以让本地 Agent 使用 bridge 进程在操作系统层面拥有的权限。
 
 **非官方社区项目，与 OpenAI 无关联，未获其背书。**
 

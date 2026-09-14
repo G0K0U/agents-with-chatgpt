@@ -11,7 +11,9 @@ import {
   writeSecureJson,
 } from "../config/paths.js";
 import { stableWorkspaceId } from "../workspace/identity.js";
+import { readReleasePointer } from "./runtime-identity.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
+
 import { readStateDomainOwnerStatus } from "./state-owner.js";
 
 /**
@@ -34,6 +36,15 @@ export interface RuntimeState {
   /** State domain used by this bridge generation, when available. */
   stateDir?: string;
   stateDomainGeneration?: string;
+  /** Deterministic release identity of the running process, when resolvable. */
+  release?: {
+    version: string;
+    sourceCommit: string | null;
+    buildHash: string;
+    releaseId: string | null;
+    sourceParity: "ok" | "mismatch" | "unknown";
+    buildParity: "ok" | "mismatch" | "unknown";
+  };
 }
 
 export function runtimeFile(workspaceId: string, stateDir?: string): string {
@@ -243,11 +254,28 @@ function optionValue(tokens: readonly string[], option: string): string | null {
 
 function bridgeEntrypoints(): string[] {
   const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-  return [
+  const entries = [
     path.join(repositoryRoot, "dist", "cli", "index.js"),
     path.join(repositoryRoot, "src", "cli", "index.ts"),
     path.join(repositoryRoot, "bin", "c2c.js"),
-  ].map(comparablePath);
+  ];
+  // Immutable release artifacts are first-class bridge entries: the daemon
+  // launches the activated last-known-good release, so ownership validation
+  // must accept it. Only pointers/dirs produced by `c2c release activate`
+  // live here, and the pointer's entry is validated for containment.
+  const pointer = readReleasePointer(repositoryRoot);
+  if (pointer) {
+    const entry = path.join(repositoryRoot, pointer.entry);
+    const rel = path.relative(path.join(repositoryRoot, "releases"), entry);
+    if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel)) entries.push(entry);
+  }
+  const releasesDir = path.join(repositoryRoot, "releases");
+  try {
+    for (const dir of fs.readdirSync(releasesDir, { withFileTypes: true })) {
+      if (dir.isDirectory()) entries.push(path.join(releasesDir, dir.name, "cli", "index.js"));
+    }
+  } catch { /* no releases dir yet */ }
+  return entries.map(comparablePath);
 }
 
 function bridgeCommandTokens(processInfo: BridgeProcessIdentity): string[] {

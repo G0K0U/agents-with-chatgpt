@@ -294,6 +294,87 @@ afterEach(async () => {
 });
 
 describe("zcode native client (observed identity, namespace, ownership)", () => {
+  it("re-establishes the MCP session after an upstream restart with one transport retry", async () => {
+    // Simulates Z2C restarting between calls: the first tools/call hits the
+    // "Server not initialized" error a fresh upstream process returns for a
+    // stale session id. The client must re-handshake and recover within the
+    // same call instead of surfacing a transient failure.
+    let rejectedOnce = false;
+    const restarted = createServer((req: IncomingMessage, res: ServerResponse) => {
+      void (async () => {
+        const auth = req.headers.authorization ?? "";
+        if (auth !== `Bearer ${TEST_TOKEN}`) {
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "unauthorized" }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+          method?: string; id?: number | null; params?: { arguments?: { workspace_id?: string } };
+        };
+        const reply = (payload: unknown, status = 200): void => {
+          res.writeHead(status, { "content-type": "application/json" });
+          res.end(JSON.stringify(payload));
+        };
+        if (body.method === "initialize") {
+          reply({
+            jsonrpc: "2.0", id: body.id ?? null,
+            result: {
+              protocolVersion: "2025-03-26", capabilities: { tools: {} },
+              serverInfo: { name: "z2c-bridge", version: "0.1.0" },
+            },
+          });
+          return;
+        }
+        if (body.method?.startsWith("notifications/")) { res.writeHead(202); res.end(); return; }
+        if (body.method === "tools/call" && !rejectedOnce) {
+          rejectedOnce = true;
+          reply({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32000, message: "Bad Request: Server not initialized" } });
+          return;
+        }
+        if (body.method === "tools/call") {
+          reply({
+            jsonrpc: "2.0", id: body.id ?? null,
+            result: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  provider: ZCODE_NATIVE_REQUIRED_IDENTITY.provider,
+                  uses_desktop_managed_auth: true,
+                  status: "healthy",
+                  detail: null,
+                  zcode_version: null,
+                  capabilities: { ok: true, required: {} },
+                  workspace_id: body.params?.arguments?.workspace_id ?? "",
+                  durable_idempotency: "workspace-task-v1",
+                  model_binding: { ...SANCTIONED_BINDING },
+                }),
+              }],
+            },
+          });
+          return;
+        }
+        reply({ jsonrpc: "2.0", id: body.id ?? null, error: { code: -32601, message: "method not found" } });
+      })().catch(() => {
+        if (!res.headersSent) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "internal" }));
+        }
+      });
+    });
+    await new Promise<void>((resolve) => restarted.listen(0, "127.0.0.1", () => resolve()));
+    const addr = restarted.address();
+    if (addr === null || typeof addr === "string") throw new Error("no port");
+    const restartUrl = `http://127.0.0.1:${addr.port}/mcp`;
+    try {
+      const status = await new ZcodeNativeClient({ url: restartUrl, token: TEST_TOKEN, requestTimeoutMs: 5000 }).status(C2C_WS);
+      expect(status.available).toBe(true);
+      expect(rejectedOnce).toBe(true);
+    } finally {
+      await closeFakeServer(restarted);
+    }
+  });
   it("server-owned probe verifies one task over the real native MCP client path without leaking server auth", async () => {
     fake.durableIdempotency = true;
     fake.echoAuth = true;
@@ -386,7 +467,7 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     expect(status.start_plan?.model_id).toBe("GLM-5.3");
     expect(status.start_plan?.mismatches.join(";")).toContain("model_id=GLM-5.3");
     await expect(client().submitTask({ workspace_id: ENGINEERING_AI_WS, instruction: "x" })).rejects.toMatchObject({
-      code: "ZCODE_NATIVE_NOT_ATTESTED",
+      code: "ZCODE_INCOMPATIBLE_PROVIDER_VERSION",
     });
   });
 
@@ -398,7 +479,7 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     expect(status.start_plan?.mismatches.join(";")).toContain("provider_id=builtin:zai-coding-plan");
     expect(status.start_plan?.mismatches.join(";")).toContain("model_id=GLM-5.3");
     await expect(client().submitTask({ workspace_id: C2C_WS, instruction: "x" })).rejects.toMatchObject({
-      code: "ZCODE_NATIVE_NOT_ATTESTED",
+      code: "ZCODE_INCOMPATIBLE_PROVIDER_VERSION",
     });
   });
 

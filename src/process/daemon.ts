@@ -26,6 +26,7 @@ import {
   type RuntimeState,
 } from "../bridge/runtime.js";
 import { readStateDomainOwnerStatus, stateDomainOwnerFile, type StateDomainOwnerRecord } from "../bridge/state-owner.js";
+import { readBuildManifest, readReleasePointer } from "../bridge/runtime-identity.js";
 import type { TunnelStatus } from "../tunnel/provider.js";
 import type { PublicProbeResult } from "../tunnel/probe.js";
 import { Workspace } from "../workspace/manager.js";
@@ -35,12 +36,26 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /** Path to the CLI entry, works from dist/ and from tsx dev runs. */
 function cliEntry(): { cmd: string; args: string[] } {
+  // A verified last-known-good release outranks mutable dev output: a source
+  // edit can never put unverified code into production until it is activated.
+  const projectRoot = path.resolve(__dirname, "..", "..");
+  const pointer = readReleasePointer(projectRoot);
+  if (pointer) {
+    const releaseRoot = path.join(projectRoot, "releases");
+    const rel = path.relative(releaseRoot, path.join(projectRoot, pointer.entry));
+    const entry = path.join(projectRoot, pointer.entry);
+    // entry = releases/<id>/cli/index.js; the manifest sits at releases/<id>/.
+    const releaseDir = path.dirname(path.dirname(entry));
+    if (rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel) && fs.existsSync(entry)
+        && readBuildManifest(releaseDir)) {
+      return { cmd: process.execPath, args: [entry] };
+    }
+  }
   const distEntry = path.resolve(__dirname, "..", "cli", "index.js");
   if (fs.existsSync(distEntry)) {
     return { cmd: process.execPath, args: [distEntry] };
   }
   // dev fallback: run TypeScript sources through the tsx ESM loader
-  const projectRoot = path.resolve(__dirname, "..", "..");
   const tsEntry = path.join(projectRoot, "src", "cli", "index.ts");
   return { cmd: process.execPath, args: ["--import", "tsx/esm", tsEntry] };
 }
