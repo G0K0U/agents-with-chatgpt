@@ -21,7 +21,7 @@
  *  - Desktop-managed auth only: the execution identity of an accepted
  *    task is the model binding Z2C OBSERVED for that exact session at
  *    admission (native session/read). Z2C admits only observed
- *    builtin:zai-start-plan/GLM-5.3-Flash sessions, and this client re-verifies
+ *    the REQUIRED GLM identity (see ZCODE_NATIVE_REQUIRED_IDENTITY) at admission, and this client re-verifies
  *    the returned task binding before binding the task/session identity
  *    anywhere. Unobserved identity fails closed; the required identity
  *    constants are comparison targets, never evidence.
@@ -59,14 +59,18 @@ export function nativeAllowedWorkspaces(env: NodeJS.ProcessEnv = process.env): R
   );
 }
 
-// 2026-09-12: a fresh live Desktop session observed through the
-// desktop-agent chain reports builtin:zai-start-plan / GLM-5.3-Flash, which
-// replaces the previously required builtin:zai-coding-plan / GLM-5.3
-// comparison target. Comparison target only — never evidence; the accepted
-// binding must be OBSERVED from the exact session's own state.
+// 2026-09-17 (PRODUCT POLICY): governed ChatGPT-controlled GLM work is
+// FLASH-ONLY. The required Desktop-managed identity is
+// builtin:zai-coding-plan / GLM-5.3-Flash (the coding-plan Flash route is
+// available and live-verified on the agent; the retired start-plan route is
+// unentitled). The attestation contract itself is unchanged: the identity
+// must still be OBSERVED from the exact session's own state (native
+// session/read), never self-reported and never substituted. ZCode main-model
+// (GLM-5.3) remains available for manual/native use, never for governed C2C
+// execution, and there is no automatic main-model escalation.
 export const ZCODE_NATIVE_REQUIRED_IDENTITY = {
   provider: "zcode-desktop", // DesktopZcodeProvider.name — the only desktop-managed provider
-  provider_id: "builtin:zai-start-plan",
+  provider_id: "builtin:zai-coding-plan",
   model_id: "GLM-5.3-Flash",
 } as const;
 
@@ -615,9 +619,12 @@ export class ZcodeNativeClient {
 const ZCODE_NATIVE_COMPATIBILITY_MANIFEST = {
   required: { ...ZCODE_NATIVE_REQUIRED_IDENTITY },
   retired: [
-    { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" },
+    // Start-plan route: revoked by the 2026-09-16 entitlement change.
+    { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3-Flash" },
     { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3" },
-    { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3-Flash" },
+    // Main model: never governed under the Flash-only product policy
+    // (manual/native ZCode use of GLM-5.3 is unaffected).
+    { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" },
   ] as ReadonlyArray<{ provider_id: string; model_id: string }>,
 } as const;
 

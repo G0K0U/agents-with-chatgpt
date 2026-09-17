@@ -110,7 +110,7 @@ describe("G4 unified native/direct provider lifecycle (offline)", () => {
     fs.rmSync(resolved, { recursive: true, force: true });
   });
   function boot() {
-    const result = new CodexTaskManager(workspace, { stateDir: state, fullAccess: true, orchestrator: "legacy",
+    const result = new CodexTaskManager(workspace, { stateDir: state, fullAccess: true,
       appServerFactory: () => codex, antigravityBackend: gemini, nativeClient: native });
     managers.push(result); return result;
   }

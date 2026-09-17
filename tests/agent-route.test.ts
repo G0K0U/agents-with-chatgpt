@@ -236,7 +236,7 @@ describe("Policy-Governed Agent Router (agent_route)", () => {
     expect(note).toContain(`Generic Quanta GLM route: ${expected}`);
     expect(note).toContain("connection_mode and quota_pool: UNATTRIBUTED");
     expect(note).toContain("weekly=unknown");
-    expect(note).toContain("Outside that window, native ZCode Connection mode = Desktop-managed builtin:zai-start-plan with GLM-5.3-Flash");
+    expect(note).toContain("Outside that window, native ZCode Connection mode = Desktop-managed GLM (required identity per compatibility manifest)");
     expect(note).toContain("quota evidence for this route remains separate");
     expect(note).toContain("does not establish exhaustion of all GLM pipelines");
     expect(note).not.toMatch(/any GLM-dependent pipeline should be deferred|(?:all|any) GLM.*(?:defer|must wait)|free-window quota is currently exhausted/i);

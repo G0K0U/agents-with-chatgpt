@@ -26,7 +26,7 @@ import {
   type RuntimeState,
 } from "../bridge/runtime.js";
 import { readStateDomainOwnerStatus, stateDomainOwnerFile, type StateDomainOwnerRecord } from "../bridge/state-owner.js";
-import { readBuildManifest, readReleasePointer } from "../bridge/runtime-identity.js";
+import { installationRoot, readBuildManifest, readReleasePointer } from "../bridge/runtime-identity.js";
 import type { TunnelStatus } from "../tunnel/provider.js";
 import type { PublicProbeResult } from "../tunnel/probe.js";
 import { Workspace } from "../workspace/manager.js";
@@ -38,7 +38,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 function cliEntry(): { cmd: string; args: string[] } {
   // A verified last-known-good release outranks mutable dev output: a source
   // edit can never put unverified code into production until it is activated.
-  const projectRoot = path.resolve(__dirname, "..", "..");
+  const projectRoot = installationRoot();
   const pointer = readReleasePointer(projectRoot);
   if (pointer) {
     const releaseRoot = path.join(projectRoot, "releases");
@@ -126,6 +126,7 @@ export type SharedBridgeObservation =
         | "runtime_unreadable"
         | "runtime_changed"
         | "active_owner_conflict"
+        | "owner_runtime_unhealthy"
         | "admin_proof_unavailable"
         | "unauthorized_workspace";
       conflictOwner?: StateDomainOwnerRecord;
@@ -228,7 +229,7 @@ export async function findSharedBridgeObservation(
   const inspector = opts.processInspector ?? getSystemProcessInspector();
   const status = readStateDomainOwnerStatus(stateDir, inspector);
   if (status.state === "absent" || status.state === "stale") return observation;
-  const fail = (reason: "active_owner_conflict" | "admin_proof_unavailable" | "unauthorized_workspace" | "runtime_changed"): SharedBridgeObservation =>
+  const fail = (reason: "active_owner_conflict" | "owner_runtime_unhealthy" | "admin_proof_unavailable" | "unauthorized_workspace" | "runtime_changed"): SharedBridgeObservation =>
     ({ state: "unknown", runtime: null, reason });
   if (status.state !== "active") return fail("active_owner_conflict");
   const owner = status.owner;
@@ -247,7 +248,12 @@ export async function findSharedBridgeObservation(
     const ownerObservation = await findBridgeObservation(owner.workspaceId, owner.workspaceRoot, {
       ...opts, stateDir, repairRuntime: false,
     });
-    if (ownerObservation.state !== "healthy") return fail("active_owner_conflict");
+    // An active owner whose own runtime observation is unhealthy is a
+    // DIFFERENT fault from an ownership conflict: reporting the owner's
+    // actual degradation (e.g. stale_runtime) here is what makes a shared
+    // workspace's failure diagnosable instead of a misleading
+    // active_owner_conflict.
+    if (ownerObservation.state !== "healthy") return fail("owner_runtime_unhealthy");
     const runtime = ownerObservation.runtime;
     const matches = () => {
       const currentOwner = readStateDomainOwnerStatus(stateDir, inspector);

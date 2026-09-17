@@ -11,7 +11,12 @@
  *   - bounded executable discovery (override validated, standard locations,
  *     installed proxy metadata; no drive scan)
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as childProcess from "node:child_process";
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...await importOriginal<typeof import("node:child_process")>(),
+  spawn: vi.fn(),
+}));
 import fs from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -47,7 +52,25 @@ function mkdtemp(): string {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+it("passes the requested workspace to the production spawn for launch and open", async () => {
+  const spawn = vi.mocked(childProcess.spawn).mockReturnValue({ pid: 0, unref() {} } as childProcess.ChildProcess);
+  let rows: Array<{ pid: number; executable: string; commandLine: string }> = [];
+  const reconciler = new ZcodeDesktopReconciler({
+    workspaceRoot, stateDir: path.join(root, "state"), z2cRepoRoot: path.join(root, "z2c"),
+    env: { C2C_ZCODE_DESKTOP_EXECUTABLE: DESKTOP_EXE(), Z2C_STATE_DIR: path.join(root, "z2cstate") },
+    processInspector: () => ({ list: () => rows }), registrationWaitMs: 0, openWaitMs: 0,
+    sleep: async () => {},
+  });
+  await reconciler.launchManagedDesktop();
+  expect(spawn).toHaveBeenLastCalledWith(DESKTOP_EXE(), ["--open-workspace", workspaceRoot], expect.objectContaining({ cwd: workspaceRoot, windowsHide: true }));
+  rows = [{ pid: 99, executable: DESKTOP_EXE(), commandLine: DESKTOP_EXE() }];
+  const product = path.join(root, "product");
+  await reconciler.requestWorkspaceOpen([product]);
+  expect(spawn).toHaveBeenLastCalledWith(DESKTOP_EXE(), ["--open-workspace", product], expect.objectContaining({ cwd: product, windowsHide: true }));
 });
 
 const DESKTOP_EXE = () => path.join(root, "apps", "ZCode.exe");
@@ -59,6 +82,7 @@ interface HarnessOpts {
   env?: NodeJS.ProcessEnv;
   registrationWaitMs?: number;
   recordPid?: number;
+  gracefulClose?: (pid: number) => Promise<boolean>;
 }
 
 function makeReconciler(opts: HarnessOpts = {}) {
@@ -83,6 +107,7 @@ function makeReconciler(opts: HarnessOpts = {}) {
       return { pid: opts.recordPid ?? 0 };
     },
     processInspector: () => (opts.inspectorUnavailable ? null : { list: () => opts.processes ?? [] }),
+    ...(opts.gracefulClose ? { gracefulClose: opts.gracefulClose } : {}),
   };
   const reconciler = new ZcodeDesktopReconciler(deps);
   if (opts.registration !== undefined && opts.registration !== null) {
@@ -167,7 +192,9 @@ describe("managed ZCode Desktop desired-state reconciliation", () => {
     expect(h.spawnCalls.length).toBe(1);
     const launch = h.spawnCalls[0];
     expect(launch.cmd).toBe(DESKTOP_EXE());
-    expect(launch.args).toEqual([]); // direct spawn, no shell string
+    // Direct spawn (no shell string); the workspace path is passed as the
+    // official CLI argument so the Desktop opens it on first launch.
+    expect(launch.args).toEqual(["--open-workspace", workspaceRoot]);
     expect(launch.cwd).toBe(workspaceRoot);
     expect(launch.env?.ZCODE_AGENT_SERVER_COMMAND).toBe(process.execPath);
     const args = JSON.parse(launch.env?.ZCODE_AGENT_SERVER_ARGS_JSON ?? "[]") as string[];
@@ -208,7 +235,7 @@ describe("managed ZCode Desktop desired-state reconciliation", () => {
     expect(h.spawnCalls.length).toBe(0);
   });
 
-  it("desktop running + registration absent → ZCODE_DESKTOP_UNMANAGED, no second launch, no forced kill", async () => {
+  it("desktop running + registration absent → ZCODE_DESKTOP_UNMANAGED; launch refuses, graceful restart is offered instead", async () => {
     const h = makeReconciler({
       processes: [{ pid: 99, executable: DESKTOP_EXE(), commandLine: "" }],
     });
@@ -216,7 +243,9 @@ describe("managed ZCode Desktop desired-state reconciliation", () => {
     expect(obs.state).toBe("ZCODE_DESKTOP_UNMANAGED");
     expect(obs.managed).toBe(false);
     expect(obs.launch).toBeUndefined();
-    await expect(h.reconciler.launchManagedDesktop()).resolves.toMatch(/no launch/);
+    expect(obs.managedRestart).toBeDefined();
+    // Launching next to the unmanaged Desktop is still a guarded no-op.
+    await expect(h.reconciler.launchManagedDesktop()).resolves.toMatch(/graceful managed restart required/);
     expect(h.spawnCalls.length).toBe(0);
   });
 
@@ -347,5 +376,170 @@ describe("bounded executable discovery", () => {
     expect(obs.state).toBe("ZCODE_DESKTOP_EXECUTABLE_NOT_FOUND");
     expect(obs.launch).toBeUndefined();
     expect(h.spawnCalls.length).toBe(0);
+  });
+});
+
+// ── Automatic workspace activation + safe unmanaged-Desktop recovery (Z2/Z3/Z4) ──
+
+describe("desired-workspace registration and safe recovery", () => {
+  const engAiRoot = () => path.join(root, "engineering-ai");
+
+  function makeMultiReconciler(opts: HarnessOpts & { desired?: string[] } = {}) {
+    fs.mkdirSync(engAiRoot(), { recursive: true });
+    const h = makeReconciler(opts);
+    // Rebuild with desired roots (the harness passes fixed deps).
+    const deps: ZcodeDesktopReconcilerDeps = {
+      workspaceRoot,
+      stateDir: path.join(root, "state"),
+      z2cRepoRoot: path.join(root, "z2c"),
+      env: opts.env ?? {
+        Z2C_STATE_DIR: path.join(root, "z2cstate"),
+        C2C_ZCODE_DESKTOP_EXECUTABLE: DESKTOP_EXE(),
+      },
+      now: () => new Date(),
+      sleep: async () => {},
+      registrationWaitMs: 0,
+      openWaitMs: 0,
+      restartWaitMs: 0,
+      spawnDetached: (cmd, args, o) => {
+        h.spawnCalls.push({ cmd, args, cwd: o.cwd, env: o.env });
+        return { pid: 0 };
+      },
+      processInspector: () => (opts.inspectorUnavailable ? null : { list: () => opts.processes ?? [] }),
+      ...(opts.gracefulClose ? { gracefulClose: opts.gracefulClose } : {}),
+      desiredWorkspaceRoots: opts.desired,
+    };
+    return { reconciler: new ZcodeDesktopReconciler(deps), spawnCalls: h.spawnCalls, writeRegistration: h.writeRegistration };
+  }
+
+  it("primary registration live but desired workspace missing → ZCODE_WORKSPACE_NOT_OPEN with an open action", () => {
+    const h = makeMultiReconciler({
+      desired: [engAiRoot()],
+      registration: { pid: process.pid, workspace: workspaceRoot },
+    });
+    const obs = h.reconciler.observe();
+    expect(obs.state).toBe("ZCODE_WORKSPACE_NOT_OPEN");
+    expect(obs.missingWorkspaceRoots).toEqual([path.normalize(engAiRoot())]);
+    expect(obs.launch).toBeUndefined();
+    expect(obs.openWorkspaces).toBeDefined();
+    // READY requires EVERY desired workspace registration.
+    expect(obs.registrationLive).toBe(false);
+  });
+
+  it("open action spawns the official single-instance open request for the missing workspace only", async () => {
+    const h = makeMultiReconciler({
+      desired: [engAiRoot()],
+      processes: [{ pid: 500, executable: DESKTOP_EXE(), commandLine: "" }],
+      registration: { pid: process.pid, workspace: workspaceRoot },
+    });
+    const obs = h.reconciler.observe();
+    const outcome = await obs.openWorkspaces!();
+    expect(h.spawnCalls.length).toBe(1);
+    expect(h.spawnCalls[0].cmd).toBe(DESKTOP_EXE());
+    expect(h.spawnCalls[0].args).toEqual(["--open-workspace", path.normalize(engAiRoot())]);
+    expect(outcome).toMatch(/not yet live|accepted/);
+  });
+
+  it("open action with no running Desktop never spawns an unmanaged instance", async () => {
+    const h = makeMultiReconciler({ desired: [engAiRoot()] });
+    const outcome = await h.reconciler.requestWorkspaceOpen([engAiRoot()]);
+    expect(h.spawnCalls.length).toBe(0);
+    expect(outcome).toMatch(/managed launch required/);
+  });
+
+  it("exact workspace binding survives recovery: desired roots dedupe and never bind a neighbor", async () => {
+    const h = makeMultiReconciler({ desired: [workspaceRoot, workspaceRoot.toUpperCase()] });
+    const obs = h.reconciler.observe();
+    // workspaceRoot duplicated (case-variant) must collapse; registration missing → ABSENT.
+    expect(obs.state).toBe("ZCODE_DESKTOP_ABSENT");
+    expect(obs.missingWorkspaceRoots).toEqual([path.normalize(workspaceRoot)]);
+  });
+
+  it("unmanaged Desktop: graceful close accepted → managed relaunch with proxy env, never a force kill", async () => {
+    const closeCalls: number[] = [];
+    const processes = [{ pid: 99, executable: DESKTOP_EXE(), commandLine: "" }];
+    const h = makeMultiReconciler({
+      processes,
+      desired: [engAiRoot()],
+      gracefulClose: async (pid) => {
+        closeCalls.push(pid);
+        processes.splice(0, processes.length); // the Desktop actually exits
+        return true;
+      },
+    });
+    const obs = h.reconciler.observe();
+    expect(obs.state).toBe("ZCODE_DESKTOP_UNMANAGED");
+    expect(obs.managedRestart).toBeDefined();
+    const outcome = await obs.managedRestart!();
+    // Exactly one graceful close of the unmanaged pid, then the managed launch.
+    expect(closeCalls).toEqual([99]);
+    const launch = h.spawnCalls.find((c) => c.args.includes(workspaceRoot) && c.env?.ZCODE_AGENT_SERVER_COMMAND);
+    expect(launch).toBeDefined();
+    expect(launch!.cwd).toBe(workspaceRoot);
+    expect(outcome).toMatch(/launched/);
+  });
+
+  it("unmanaged Desktop refusing graceful close → USER_ACTION_REQUIRED_UNSAVED_STATE, no force kill, once per generation", async () => {
+    const closeCalls: number[] = [];
+    const h = makeMultiReconciler({
+      processes: [{ pid: 99, executable: DESKTOP_EXE(), commandLine: "" }],
+      gracefulClose: async (pid) => {
+        closeCalls.push(pid);
+        return false;
+      },
+    });
+    const obs = h.reconciler.observe();
+    const outcome = await obs.managedRestart!();
+    expect(closeCalls).toEqual([99]);
+    expect(outcome).toMatch(/did not close gracefully/);
+    // Refusal is now authoritative for this Desktop generation.
+    const after = h.reconciler.observe();
+    expect(after.state).toBe("USER_ACTION_REQUIRED_UNSAVED_STATE");
+    expect(after.managedRestart).toBeUndefined();
+    // A second restart attempt short-circuits (no duplicate closes).
+    const reconciler = h.reconciler as unknown as { attemptManagedRestart(pid: number): Promise<string> };
+    await expect(reconciler.attemptManagedRestart(99)).resolves.toMatch(/already refused/);
+    expect(closeCalls).toEqual([99]);
+  });
+
+  it("a NEW Desktop generation is recoverable again after an earlier refusal", async () => {
+    let alive = true;
+    const h = makeMultiReconciler({
+      processes: [{ pid: 99, executable: DESKTOP_EXE(), commandLine: "" }],
+      gracefulClose: async () => false,
+    });
+    await h.reconciler.observe().managedRestart!();
+    expect(h.reconciler.observe().state).toBe("USER_ACTION_REQUIRED_UNSAVED_STATE");
+    // The old instance exits; the user (or OS) starts a different one.
+    const deps = h.reconciler["deps"] as unknown as { processInspector: () => { list: () => Array<{ pid: number; executable: string; commandLine: string }> } | null };
+    deps.processInspector = () => ({ list: () => [{ pid: 200, executable: DESKTOP_EXE(), commandLine: "" }] });
+    const obs2 = h.reconciler.observe();
+    expect(obs2.state).toBe("ZCODE_DESKTOP_UNMANAGED");
+    expect(obs2.managedRestart).toBeDefined();
+  });
+});
+
+describe("GUI main-process selection among same-exe processes", () => {
+  it("targets only the bare-command-line GUI process; agent children and helpers are excluded", async () => {
+    const closeCalls: number[] = [];
+    const processes = [
+      { pid: 10, executable: DESKTOP_EXE(), commandLine: `"${DESKTOP_EXE()}" --type=renderer --user-data-dir=X` },
+      { pid: 20, executable: DESKTOP_EXE(), commandLine: `${DESKTOP_EXE()} --no-warnings ${path.join(root, "z2c", "scripts", "desktop-agent-proxy.mjs")}` },
+      { pid: 30, executable: DESKTOP_EXE(), commandLine: `"${DESKTOP_EXE()}"` }, // the GUI main
+    ];
+    const h = makeReconciler({
+      processes,
+      gracefulClose: async (pid) => {
+        closeCalls.push(pid);
+        processes.splice(0, processes.length);
+        return true;
+      },
+    });
+    const obs = h.reconciler.observe();
+    expect(obs.state).toBe("ZCODE_DESKTOP_UNMANAGED");
+    expect(obs.desktopPid).toBe(30);
+    const outcome = await obs.managedRestart!();
+    expect(closeCalls).toEqual([30]);
+    expect(outcome).toMatch(/launched/);
   });
 });

@@ -18,3 +18,7 @@ releases/
 *.protocol-v2-backup-*
 *.lazy-manager-backup-*
 *.p0-backup-*
+
+# in-repo Z2C companion build artifacts
+z2c/node_modules/
+z2c/dist/

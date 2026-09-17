@@ -144,6 +144,20 @@ function isBridgeNodeExecutable(candidate: string): boolean {
   return nodeExecutable !== null && existingRegularFile(candidate) === nodeExecutable;
 }
 
+/**
+ * Shell-dependent script extensions are never accepted as a verification
+ * executable: spawning them safely would require a shell, and a shell turns
+ * argv into parseable text. Operators register real executables (or a plain
+ * basename resolved on PATH, e.g. node/python/uv) instead.
+ */
+const SHELL_SCRIPT_EXTENSIONS = new Set([".cmd", ".bat", ".sh", ".ps1", ".com", ".scr"]);
+
+export function isAcceptableOperatorExecutable(candidate: string): boolean {
+  if (!path.isAbsolute(candidate)) return false;
+  if (SHELL_SCRIPT_EXTENSIONS.has(path.extname(candidate).toLowerCase())) return false;
+  return existingRegularFile(candidate) !== null;
+}
+
 function within(candidate: string, root: string): boolean {
   const relative = path.relative(root, candidate);
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
@@ -165,10 +179,22 @@ function canonicalize(abs: string): string {
   }
 }
 
+/**
+ * Structural validation shared by the bridge-owned defaults and the trusted
+ * local operator registry. Executables may be: a plain basename (resolved on
+ * PATH without a shell), the bridge Node runtime, or — for operator
+ * registrations only, enforced at registration time — an absolute path to an
+ * existing non-shell-script executable file.
+ */
+export function assertVerificationProfile(profile: VerificationProfile): void {
+  assertProfile(profile);
+}
+
 function assertProfile(profile: VerificationProfile): void {
   if (!PROFILE_ID_PATTERN.test(profile.id)) throw new Error("Invalid verification profile id");
   if (!/^[0-9a-f]{12}$/.test(profile.workspaceId)) throw new Error("Invalid verification profile workspace id");
-  if (!EXECUTABLE_PATTERN.test(profile.executable) && !isBridgeNodeExecutable(profile.executable)) {
+  if (!EXECUTABLE_PATTERN.test(profile.executable) && !isBridgeNodeExecutable(profile.executable) &&
+      !isAcceptableOperatorExecutable(profile.executable)) {
     throw new Error("Invalid verification profile executable");
   }
   if (!Array.isArray(profile.argv) || profile.argv.length === 0 || profile.argv.length > 32) {

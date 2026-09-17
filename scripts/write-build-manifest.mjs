@@ -3,7 +3,7 @@
 // Runs after `tsc` so the dist tree is final. See src/bridge/runtime-identity.ts.
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +11,21 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const distDir = path.join(repoRoot, "dist");
 const srcDir = path.join(repoRoot, "src");
 const MANIFEST_NAME = "build-manifest.json";
+
+// TypeScript leaves emitted files behind when their source is deleted. Both
+// npm build and the release gate run this step before hashing/promoting dist.
+// Only remove compiler output without a matching source; preserve assets.
+function pruneDeletedSourceOutput(dir) {
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) pruneDeletedSourceOutput(full);
+    else if (entry.isFile() && /\.js(?:\.map)?$/.test(entry.name)) {
+      const relative = path.relative(distDir, full).replace(/\.js(?:\.map)?$/, ".ts");
+      if (!existsSync(path.join(srcDir, relative))) unlinkSync(full);
+    }
+  }
+}
 
 function collectFiles(root, out) {
   let entries;
@@ -49,6 +64,7 @@ function git(args) {
 }
 
 const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+pruneDeletedSourceOutput(distDir);
 const buildHash = treeHash(distDir);
 const sourceHash = treeHash(srcDir);
 if (!buildHash || !sourceHash) {

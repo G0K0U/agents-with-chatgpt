@@ -416,7 +416,7 @@ export class ContinuationController {
       const terminal = s.events.find(e => e.id === `terminal:${observedTask.taskId}` && e.type === "terminal");
       const task = terminal ? terminal.detail as CodexTaskView : observedTask;
       const normalizedScope = task.writeScope.map(scope => path.isAbsolute(scope) ? path.relative(this.manager.workspace.root, scope).replaceAll("\\", "/") : scope);
-      if (task.workspaceId !== m.workspaceId || task.taskId !== observedTask.taskId || task.provider !== n.provider || task.orchestrator !== "legacy" || JSON.stringify(normalizedScope) !== JSON.stringify(n.writeScope) || task.network !== n.network) {
+      if (task.workspaceId !== m.workspaceId || task.taskId !== observedTask.taskId || task.provider !== n.provider || JSON.stringify(normalizedScope) !== JSON.stringify(n.writeScope) || task.network !== n.network) {
         ns.state = "BLOCKED_POLICY"; ns.evidence = { taskId: task.taskId, reason: "Imported task provider/scope/network mismatch" }; continue;
       }
       ns.evidence = task;

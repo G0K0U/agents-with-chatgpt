@@ -226,7 +226,7 @@ export interface ZcodeQueueResolutionOptions {
   registry?: WorkspaceRegistry;
 }
 
-function resolveEngineeringAiWorkspaceRoot(
+export function resolveEngineeringAiWorkspaceRoot(
   options: ZcodeQueueResolutionOptions,
   env: NodeJS.ProcessEnv
 ): string | null {

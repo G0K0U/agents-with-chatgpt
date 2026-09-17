@@ -16,8 +16,6 @@ import { CodexTaskManagerPool } from "../execution/pool.js";
 import { EngineeringAiAuditMaintainer } from "../execution/audit-maintenance.js";
 import { startZcodeCoordinatorFromEnvironment, type ZcodeCoordinator } from "../execution/zcode-coordinator.js";
 import { installApprovedManifest, manifestSchema } from "../execution/continuation.js";
-import { executionOrchestrator, type ExecutionOrchestrator } from "../execution/orchestrator.js";
-import type { OmnigentBackendOptions } from "../execution/omnigent.js";
 import { C2CSessionRegistry } from "../session/registry.js";
 import type { AppServerFactory } from "../execution/app-server.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
@@ -71,9 +69,6 @@ export interface BridgeOptions {
   accessTokenTtlMs?: number;
   /** Test seam; production uses the fixed official `codex app-server --stdio` client. */
   appServerFactory?: AppServerFactory;
-  /** Local-only orchestration configuration; absent keeps legacy behavior. */
-  orchestrator?: ExecutionOrchestrator;
-  omnigent?: Omit<OmnigentBackendOptions, "stateDir">;
   /** Local full filesystem/process deployment; it is also the capability that may authorize task network opt-in. */
   fullAccess?: boolean;
   /** Local-only configured root of the named OneDrive account used by the fixed audit mirror. */
@@ -228,8 +223,6 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     logger,
     stateDir,
     appServerFactory: opts.appServerFactory,
-    orchestrator: executionOrchestrator(opts.orchestrator),
-    omnigent: opts.omnigent,
     bridgeWorkspaceId: bridgeRoot.id,
     fullAccess: opts.fullAccess,
     maxQueueSize: opts.maxQueueSize,

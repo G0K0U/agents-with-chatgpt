@@ -97,21 +97,25 @@ describe("G3 Antigravity full-workspace contract", () => {
     }
   });
 
-  it("requires successful session evidence beyond CLI version and rejects empty success", async () => {
+  it("reports on-demand callable without a live process; only real task evidence degrades; rejects empty success", async () => {
     const { backend, request } = fixture();
     vi.mocked(execSync).mockReturnValue(Buffer.from("1.2.3"));
-    expect(await backend.getProviderStatus()).toMatchObject({ status: "DEGRADED", cliInstalled: true, cliVersion: "1.2.3", providerReachable: false });
+    // On-demand truth: zero active sessions is NORMAL, never degraded (G3).
+    expect(await backend.getProviderStatus()).toMatchObject({ status: "AVAILABLE", readiness: "READY_ON_DEMAND", cliInstalled: true, cliVersion: "1.2.3", providerReachable: true, activeSessionsCount: 0 });
     let child = manualChild();
     let pending = backend.execute(request);
     child.emit("close", 0);
     expect(await pending).toMatchObject({ status: "failed", actualProvider: null });
-    expect((await backend.getProviderStatus()).providerReachable).toBe(false);
+    // The failed real attempt is durable evidence of a non-callable lane.
+    const degraded = await backend.getProviderStatus();
+    expect(degraded).toMatchObject({ status: "DEGRADED", readiness: "FAILED", providerReachable: false });
+    expect(degraded.notCallableReason).toMatch(/failed/i);
     child = manualChild();
     pending = backend.execute(request);
     child.stdout.write(JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "ok" } }) + "\n");
     child.emit("close", 0);
     expect((await pending).status).toBe("completed");
-    expect(await backend.getProviderStatus()).toMatchObject({ status: "AVAILABLE", providerReachable: true });
+    expect(await backend.getProviderStatus()).toMatchObject({ status: "AVAILABLE", readiness: "READY_ON_DEMAND", providerReachable: true });
     vi.mocked(execSync).mockReturnValue(Buffer.from(process.execPath));
     const status = await backend.getProviderStatus();
     expect(status.cliVersion).toBeNull();
@@ -153,7 +157,6 @@ describe("G3 Antigravity full-workspace contract", () => {
 
   it("C2C manager submits provider=gemini with the full workspace to the real backend contract", async () => {
     const { backend, root, parent } = fixture();
-    vi.stubEnv("C2C_ORCHESTRATOR", "legacy");
     await installContractChild("shell");
     const execute = vi.spyOn(backend, "execute");
     const codexFactory = vi.fn(() => { throw new Error("Provider fallback is forbidden"); });

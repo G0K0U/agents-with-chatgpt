@@ -483,7 +483,7 @@ export class EngineeringAiAuditMaintainer {
     // 1. Build prompt for Gemini
     const prompt = this.buildGeminiPrompt(validEvents, timestampUtc);
 
-    // 2. Execute via GEMINI ONLY — no silent fallback to Codex, GLM, Omnigent, etc.
+    // 2. Execute via GEMINI ONLY — no silent fallback to other providers.
     let executionResult: BackendExecutionResult;
     try {
       executionResult = await this.geminiBackend.execute({
@@ -499,6 +499,7 @@ export class EngineeringAiAuditMaintainer {
         runTests: false,
         model: DEFAULT_GEMINI_MODEL,
         timeoutMs: 60_000,
+        evidence: false,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

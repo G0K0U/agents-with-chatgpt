@@ -11,7 +11,7 @@ import {
   writeSecureJson,
 } from "../config/paths.js";
 import { stableWorkspaceId } from "../workspace/identity.js";
-import { readReleasePointer } from "./runtime-identity.js";
+import { installationRoot, readReleasePointer } from "./runtime-identity.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 
 import { readStateDomainOwnerStatus } from "./state-owner.js";
@@ -253,7 +253,7 @@ function optionValue(tokens: readonly string[], option: string): string | null {
 }
 
 function bridgeEntrypoints(): string[] {
-  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const repositoryRoot = installationRoot();
   const entries = [
     path.join(repositoryRoot, "dist", "cli", "index.js"),
     path.join(repositoryRoot, "src", "cli", "index.ts"),

@@ -1,0 +1,23 @@
+{
+  "name": "zcode-with-chatgpt",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Z2C bridge: bounded MCP control plane in front of the real ZCode Desktop agent (zcode app-server)",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "MIT"
+}

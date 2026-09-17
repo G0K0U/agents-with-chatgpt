@@ -437,9 +437,11 @@ export function createMcpServer(ctx: McpContext): McpServer {
           requestObservation: { authenticated: Boolean(extra.authInfo), correlation: String(extra.requestId), origin: "unknown", chatGptScheduledAudit: "unverified" },
           antigravity: {
             status: antigravityStatus?.status ?? "UNAVAILABLE",
+            readiness: antigravityStatus?.readiness ?? (antigravityStatus ? undefined : "EXECUTABLE_MISSING"),
             cliInstalled: antigravityStatus?.cliInstalled ?? false,
             cliVersion: antigravityStatus?.cliVersion && /^v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(antigravityStatus.cliVersion) ? antigravityStatus.cliVersion : null,
             providerReachable: antigravityStatus?.providerReachable ?? false,
+            notCallableReason: antigravityStatus?.notCallableReason,
             writeScopeGranularity: "workspace",
             subdirectoryPreventiveWriteScope: "unsupported",
             readOnlyNativeTools: "unsupported",
@@ -1177,7 +1179,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
     }
   );
 
-  // Omnigent is deprecated; native provider tools are the only execution lanes.
+  // Native provider tools are the execution lanes.
 
   // Governed C2C → ZCode scheduled-queue surface (fixed root; see zcode-control.ts).
   registerZcodeTools(server, {

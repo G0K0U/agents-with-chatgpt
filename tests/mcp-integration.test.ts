@@ -69,8 +69,7 @@ afterAll(async () => {
 describe("MCP tools over Streamable HTTP", () => {
   it("lists the complete stabilized tool surface and exposes its routing schemas", async () => {
     const { tools } = await client.listTools();
-    // Six deprecated Omnigent tools were removed; exact native session read
-    // was added. Keep the explicit names as the contract, not just a count.
+    // Assert the complete native-provider tool contract.
     expect(tools).toHaveLength(28);
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([

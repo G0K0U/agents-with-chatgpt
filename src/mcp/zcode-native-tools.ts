@@ -177,7 +177,7 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
         "Dispatch a realtime native ZCode task through Z2C in an authorized governed " +
         "workspace enabled via ZCODE_NATIVE_ALLOWED_WORKSPACES. Honors the shared workspace " +
         "queue pause/freeze and writer slot. Z2C admits the task only after observing " +
-        "the sanctioned Desktop-managed binding (builtin:zai-start-plan/GLM-5.3-Flash) on the " +
+        "the sanctioned Desktop-managed binding (the required identity per the C2C compatibility manifest) on the " +
         "exact created session, and the returned task " +
         "binding is re-verified here — fails closed, never falls back to the scheduled queue. " +
         deps.untrustedNote,

@@ -418,6 +418,29 @@ describe("controlled Codex task execution", () => {
     expect(upgraded.network).toBe(true);
   });
 
+  it.each(["queued", "running", "cancelling", "completed"])("never dispatches saved retired-backend work (%s)", async (status) => {
+    await manager.close();
+    const taskId = "c2c_deadbeef";
+    const file = path.join(getStateDir(), "tasks", workspace.id, `${taskId}.json`);
+    writeSecureJson(file, {
+      taskId, workspaceId: workspace.id, ownerId: "owner",
+      orchestrator: "retired-backend", provider: "codex",
+      instructionHash: "historical", instruction: "do not replay this work",
+      writeScope: ["tests"], network: false, runTests: false,
+      approvalMode: "workspace_write", status,
+      submittedAt: new Date().toISOString(), changedFiles: [], tests: null,
+      outputIds: [], approvalEvents: [], executionRecorded: true,
+    });
+    manager = new CodexTaskManager(workspace, { appServerFactory: () => fake });
+    const result = manager.get(taskId);
+    expect(result.status).toBe(status === "completed" ? "completed" : "interrupted");
+    if (status !== "completed") expect(result.error?.code).toBe("UNSUPPORTED_SAVED_BACKEND");
+    expect(result).not.toHaveProperty("orchestrator");
+    await manager.close();
+    expect(fake.requests).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).status).toBe(result.status);
+  });
+
   it("preserves a persisted effective network flag before exposing task metadata", () => {
     const taskId = "c2c_deadbeef";
     const file = path.join(getStateDir(), "tasks", workspace.id, `${taskId}.json`);

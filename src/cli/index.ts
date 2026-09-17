@@ -1,7 +1,9 @@
+import { installationRoot } from "../bridge/runtime-identity.js";
 import { fullAccessDevelopmentEnabled } from "../config/development.js";
 import { Command } from "commander";
 import fs from "node:fs";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
@@ -10,7 +12,7 @@ import { readAuthStatePointer } from "../bridge/state-owner.js";
 import { reconcileStateDomains } from "../bridge/state-migration.js";
 import { adminFetch, ensureBridge, stopBridge, findSharedBridgeObservation as findBridgeObservation,
   type SharedBridgeObservation } from "../process/daemon.js";
-import { activateRelease, promoteCurrentBuild, releaseRepoRoot, releaseStatus, runReleaseGate } from "../process/release.js";
+import { activateRelease, promoteCurrentBuild, releaseRepoRoot, releaseStatus, rollbackRelease, runReleaseGate } from "../process/release.js";
 import { diagnoseSharedTunnel } from "../process/shared-doctor.js";
 import { requestRestart, waitRestartHandoff } from "../process/restart.js";
 import { Workspace } from "../workspace/manager.js";
@@ -35,6 +37,7 @@ import {
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir, initializeStateDir } from "../config/paths.js";
+import { resolveZ2cRepoRoot } from "../config/z2c-repo.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
@@ -65,6 +68,18 @@ import {
 } from "../session/state.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
+import {
+  listOperatorVerificationProfiles,
+  readOperatorVerificationProfile,
+  registerOperatorVerificationProfile,
+  removeOperatorVerificationProfile,
+  resolveVerificationProfile,
+} from "../execution/operator-verification.js";
+import {
+  cleanupVerificationRuntime,
+  materializeVerificationProfile,
+  prepareVerificationRuntime,
+} from "../execution/verification.js";
 
 const program = new Command();
 
@@ -902,7 +917,7 @@ program
       try {
         const { buildUnifiedReport } = await import("../process/unified-report.js");
         unified = await buildUnifiedReport({
-          repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."),
+          repoRoot: installationRoot(),
           stateDir: getStateDir(opts.stateDir),
           workspaceId: workspace?.id ?? "",
           workspaceRoot: root,
@@ -1073,7 +1088,7 @@ program
 
 // ---------------------------------------------------------------- update-check (once per local day)
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const repoRoot = installationRoot();
 
 function runGit(args: string[]): { ok: boolean; stdout: string } {
   const result = spawnSync("git", args, {
@@ -1172,6 +1187,23 @@ release
   });
 
 release
+  .command("rollback")
+  .description("Repoint the last-known-good release to the previously activated release (validated; bounded A/B swap)")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const root = releaseRepoRoot();
+    const result = rollbackRelease(root);
+    if (opts.json) say(JSON.stringify(result));
+    else {
+      const msg = result.ok
+        ? `Rolled back to ${result.pointer?.releaseId}${result.error ? ` (${result.error})` : ""}`
+        : `Rollback failed: ${result.error}`;
+      say(msg);
+    }
+    if (!result.ok) process.exitCode = 1;
+  });
+
+release
   .command("status", { isDefault: true })
   .description("Show release identity, source/build parity, and drift")
   .option("--json", "machine-readable output", false)
@@ -1213,7 +1245,7 @@ supervisorCmd
       } catch { /* unparseable lock: reclaim */ }
     }
     // Spawn THIS same CLI entry (dist or tsx dev) detached for the run loop.
-    const entry = fileURLToPath(import.meta.url);
+    const entry = path.join(installationRoot(), "bin", "c2c.js");
     const entryArgs = entry.endsWith(".ts") ? ["--import", "tsx/esm", entry] : [entry];
     const runArgs = [...entryArgs, "supervisor", "run", "--workspace", opts.workspace];
     if (opts.stateDir) runArgs.push("--state-dir", opts.stateDir);
@@ -1249,11 +1281,11 @@ supervisorCmd
     const { Supervisor } = await import("../supervisor/supervisor.js");
     const stateDir = getStateDir(opts.stateDir);
     const supervisor = new Supervisor({
-      repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."),
+      repoRoot: installationRoot(),
       stateDir,
       workspaceRoot: path.resolve(opts.workspace),
     });
-    if (!supervisor.acquireLock()) {
+    if (!await supervisor.acquireLock()) {
       say("Another live supervisor holds the lock; exiting.");
       return;
     }
@@ -1325,7 +1357,7 @@ supervisorCmd
     const reconciler = new ZcodeDesktopReconciler({
       workspaceRoot: path.resolve(opts.workspace),
       stateDir,
-      z2cRepoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "zcode-with-chatgpt"),
+      z2cRepoRoot: resolveZ2cRepoRoot(installationRoot()),
     });
     const obs = reconciler.observe();
     let action = "none";
@@ -1341,6 +1373,216 @@ supervisorCmd
       say(`after:  ${after.state}${after.detail ? ` (${after.detail})` : ""}`);
     }
     if (after.state !== "READY" && after.state !== "RECOVERING") process.exitCode = 1;
+  });
+
+// ---------------------------------------------------------------- verification (trusted operator profiles)
+
+// F01: run_tests=true only executes a test command the LOCAL OPERATOR
+// registered (or a bridge-owned built-in). These commands manage that trust
+// registry; task input can never define or alter a verification command.
+const verificationCmd = program
+  .command("verification")
+  .description("Manage trusted local verification profiles (run_tests) for workspaces");
+
+interface VerificationRegisterOptions {
+  workspace?: string;
+  stateDir?: string;
+  id?: string;
+  executable: string;
+  arg: readonly string[];
+  cwd: string;
+  timeoutMs: string;
+  sandbox: string;
+  summaryKind: string;
+  force?: boolean;
+  json: boolean;
+}
+
+function registerOrUpdate(input: VerificationRegisterOptions, mode: "register" | "update"): void {
+  const workspace = new Workspace(resolveWorkspace(input.workspace));
+  const cwd = input.cwd.trim().toLowerCase();
+  if (cwd !== "workspace" && cwd !== "verification") throw new Error("--cwd must be workspace or verification");
+  const sandbox = input.sandbox.trim().toLowerCase();
+  if (sandbox !== "readonly" && sandbox !== "workspacewrite") throw new Error("--sandbox must be readonly or workspaceWrite");
+  const summaryKind = input.summaryKind.trim().toLowerCase();
+  if (summaryKind !== "pytest" && summaryKind !== "generic") throw new Error("--summary-kind must be pytest or generic");
+  const timeoutMs = parseInt(input.timeoutMs, 10);
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 30 * 60_000) {
+    throw new Error("--timeout-ms must be an integer between 1000 and 1800000");
+  }
+  const argv = [...input.arg];
+  if (argv.length === 0) throw new Error("at least one --arg is required (the verifier argv vector)");
+  const existing = (() => {
+    try { return readOperatorVerificationProfile(workspace.id, input.stateDir); }
+    catch { return null; }
+  })();
+  if (mode === "register" && existing && !input.force) {
+    throw new Error(`a verification profile already exists for this workspace (id ${existing.id}); use 'verification update' or --force`);
+  }
+  if (mode === "update" && !existing) {
+    throw new Error("no existing profile to update; use 'verification register'");
+  }
+  const record = registerOperatorVerificationProfile({
+    workspaceRoot: workspace.root,
+    id: input.id?.trim() || existing?.id || "operator",
+    executable: input.executable,
+    argv,
+    cwd,
+    timeoutMs,
+    sandbox: sandbox === "readonly" ? "readOnly" : "workspaceWrite",
+    summaryKind,
+  }, input.stateDir);
+  say(JSON.stringify({ ok: true, action: mode, record }));
+}
+
+verificationCmd
+  .command("list")
+  .description("List registered verification profiles (validity-checked, never executed)")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { stateDir?: string; json: boolean }) => {
+    const entries = listOperatorVerificationProfiles(opts.stateDir);
+    const payload = entries.map(({ record, error }) => record
+      ? { workspaceId: record.workspaceId, workspaceRoot: record.workspaceRoot, id: record.id, executable: record.executable, argv: record.argv, cwd: record.cwd, timeoutMs: record.timeoutMs, sandbox: record.sandbox, summaryKind: record.summaryKind, valid: true }
+      : { valid: false, error });
+    say(opts.json ? JSON.stringify({ ok: true, profiles: payload }) : (payload.length === 0
+      ? "No operator verification profiles registered."
+      : payload.map((p) => p.valid
+        ? `${p.workspaceId}  ${p.id}  ${p.executable}  (${p.sandbox}, ${p.timeoutMs}ms)\n    workspace: ${p.workspaceRoot}`
+        : `INVALID ${p.error}`).join("\n")));
+  });
+
+verificationCmd
+  .command("inspect")
+  .description("Show the profile that run_tests=true would use for a workspace")
+  .option("-w, --workspace <path>")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; stateDir?: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const profile = resolveVerificationProfile(workspace, opts.stateDir);
+    const operatorId = (() => {
+      try { return readOperatorVerificationProfile(workspace.id, opts.stateDir).id; }
+      catch { return null; }
+    })();
+    const source = profile === null ? "none" : (operatorId !== null && profile.id === operatorId ? "operator" : "builtin");
+    const payload = {
+      ok: profile !== null,
+      workspaceId: workspace.id,
+      workspaceRoot: workspace.root,
+      source,
+      profile,
+    };
+    say(opts.json ? JSON.stringify(payload) : (profile
+      ? `source: ${source}\nprofile: ${profile.id}\nexecutable: ${profile.executable}\nargv: ${profile.argv.join(" ")}\ncwd: ${profile.cwd}  timeout: ${profile.timeoutMs}ms  sandbox: ${profile.sandbox}  network: false`
+      : `No verification profile resolves for workspace ${workspace.name} (${workspace.id}). run_tests=true tasks fail with NO_VERIFICATION_PROFILE. Register one with 'c2c verification register'.`));
+  });
+
+  verificationCmd
+  .command("register")
+  .description("Register the trusted verification profile for a workspace (operator trust decision)")
+  .option("-w, --workspace <path>")
+  .requiredOption("--executable <path-or-basename>", "real executable (absolute path or PATH basename; shell scripts rejected)")
+  .requiredOption("--arg <value>", "argv element; repeat for every argument", (value: string, previous: string[]) => [...(previous ?? []), value], [] as string[])
+  .option("--id <id>", "profile id", "operator")
+  .option("--cwd <choice>", "workspace or verification", "workspace")
+  .option("--timeout-ms <n>", "bounded runtime in milliseconds", "300000")
+  .option("--sandbox <choice>", "readOnly or workspaceWrite", "workspaceWrite")
+  .option("--summary-kind <choice>", "pytest or generic", "generic")
+  .option("--force", "replace an existing registration", false)
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: VerificationRegisterOptions) => {
+    try { registerOrUpdate(opts, "register"); }
+    catch (error) { handleCliError(error, opts.json); }
+  });
+
+verificationCmd
+  .command("update")
+  .description("Replace the registered verification profile for a workspace")
+  .option("-w, --workspace <path>")
+  .requiredOption("--executable <path-or-basename>")
+  .requiredOption("--arg <value>", "argv element; repeat for every argument", (value: string, previous: string[]) => [...(previous ?? []), value], [] as string[])
+  .option("--id <id>", "profile id")
+  .option("--cwd <choice>", "workspace or verification", "workspace")
+  .option("--timeout-ms <n>", "bounded runtime in milliseconds", "300000")
+  .option("--sandbox <choice>", "readOnly or workspaceWrite", "workspaceWrite")
+  .option("--summary-kind <choice>", "pytest or generic", "generic")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: VerificationRegisterOptions) => {
+    try { registerOrUpdate(opts, "update"); }
+    catch (error) { handleCliError(error, opts.json); }
+  });
+
+verificationCmd
+  .command("remove")
+  .description("Remove the registered verification profile for a workspace")
+  .option("-w, --workspace <path>")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; stateDir?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const removed = removeOperatorVerificationProfile(workspace.id, opts.stateDir);
+      say(opts.json ? JSON.stringify({ ok: removed }) : (removed ? "Verification profile removed." : "No profile was registered for this workspace."));
+      if (!removed) process.exitCode = 1;
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+verificationCmd
+  .command("preflight")
+  .description("Dry-run: resolve and materialize the verification profile WITHOUT executing anything")
+  .option("-w, --workspace <path>")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; stateDir?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const stateDir = getStateDir(opts.stateDir);
+      const profile = resolveVerificationProfile(workspace, opts.stateDir);
+      if (!profile) {
+        const payload = { ok: false, reason: "NO_VERIFICATION_PROFILE", workspaceId: workspace.id };
+        say(opts.json ? JSON.stringify(payload) : "No verification profile resolves; run_tests=true tasks will fail closed.");
+        process.exitCode = 1;
+        return;
+      }
+      const runtimeRoot = path.join(stateDir, "verification-preflight");
+      fs.mkdirSync(runtimeRoot, { recursive: true });
+      const taskId = `c2c_${randomBytes(6).toString("hex")}`;
+      const runtime = prepareVerificationRuntime(runtimeRoot, taskId);
+      try {
+        const materialized = materializeVerificationProfile(profile, workspace, runtime);
+        const payload = {
+          ok: true,
+          profileId: materialized.profileId,
+          workspaceId: materialized.workspaceId,
+          executable: materialized.executable,
+          argv: materialized.argv,
+          cwd: materialized.cwd,
+          cwdAlias: materialized.cwdAlias,
+          timeoutMs: materialized.timeoutMs,
+          network: materialized.network,
+          sandbox: materialized.sandboxPolicy,
+          commandLabel: materialized.commandLabel,
+          argvHash: materialized.argvHash,
+        };
+        say(opts.json ? JSON.stringify(payload) : [
+          `preflight OK — run_tests=true would execute:`,
+          `  ${materialized.commandLabel}`,
+          `  executable : ${materialized.executable}`,
+          `  cwd        : ${materialized.cwdAlias} (${materialized.cwd})`,
+          `  timeout    : ${materialized.timeoutMs}ms   network: false   sandbox: ${materialized.sandbox}`,
+          `  argvHash   : ${materialized.argvHash.slice(0, 16)}…`,
+        ].join("\n"));
+      } finally {
+        cleanupVerificationRuntime(runtimeRoot, runtime);
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
   });
 
 // ---------------------------------------------------------------- session (ChatGPT conversation / Project memory)

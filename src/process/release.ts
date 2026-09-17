@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  installationRoot,
   readBuildManifest,
   readReleasePointer,
   releaseIdFor,
@@ -28,7 +29,7 @@ export const __releaseFilename = fileURLToPath(import.meta.url);
 
 export function releaseRepoRoot(): string {
   // dist/process/release.js -> repo root; src/process/release.ts -> repo root.
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  return installationRoot();
 }
 
 export interface GateStep {
@@ -130,6 +131,8 @@ export interface ActivateResult {
 /**
  * Run the release gate, promote the build, and atomically repoint the
  * last-known-good release. The previous pointer is preserved on any failure.
+ * The previously activated pointer is retained as releases/LKG.previous.json
+ * so `c2c release rollback` can restore it without a rebuild.
  */
 export function activateRelease(repoRoot: string, opts: { quick?: boolean } = {}): ActivateResult {
   const previous = readReleasePointer(repoRoot);
@@ -140,6 +143,9 @@ export function activateRelease(repoRoot: string, opts: { quick?: boolean } = {}
   const promoted = promoteCurrentBuild(repoRoot);
   if (!promoted.ok || !promoted.manifest || !promoted.releaseId) {
     return { ok: false, gate, pointer: previous, error: promoted.error ?? "release promotion failed" };
+  }
+  if (previous) {
+    writePreviousReleasePointer(repoRoot, previous);
   }
   const pointer = {
     schema: 1 as const,
@@ -152,6 +158,69 @@ export function activateRelease(repoRoot: string, opts: { quick?: boolean } = {}
   };
   writeReleasePointer(repoRoot, pointer);
   return { ok: true, gate, pointer };
+}
+
+const POINTER_FIELDS = ["schema", "releaseId", "entry", "version", "sourceCommit", "buildHash", "activatedAt"] as const;
+
+function writePreviousReleasePointer(repoRoot: string, pointer: NonNullable<ReturnType<typeof readReleasePointer>>): void {
+  const dir = path.join(repoRoot, "releases");
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `LKG.previous.json.tmp-${process.pid}-${Date.now()}`);
+  fs.writeFileSync(tmp, JSON.stringify(pointer, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  fs.renameSync(tmp, path.join(dir, "LKG.previous.json"));
+}
+
+function readPreviousReleasePointer(repoRoot: string): ReturnType<typeof readReleasePointer> {
+  const file = path.join(repoRoot, "releases", "LKG.previous.json");
+  if (!fs.existsSync(file)) return null;
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8")) as ReturnType<typeof readReleasePointer>;
+    return value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export interface RollbackResult {
+  ok: boolean;
+  pointer: ReturnType<typeof readReleasePointer>;
+  error?: string;
+}
+
+/**
+ * Roll the last-known-good pointer back to the previously activated release.
+ * The candidate pointer is fully validated before it replaces LKG.json
+ * (schema, containment under releases/, matching build manifest, existing
+ * entry), so a corrupt or tampered previous file can never become the
+ * active release. The current pointer is preserved as LKG.previous.json,
+ * making rollback a bounded A/B swap.
+ */
+export function rollbackRelease(repoRoot: string): RollbackResult {
+  const current = readReleasePointer(repoRoot);
+  const previous = readPreviousReleasePointer(repoRoot);
+  if (!previous) {
+    return { ok: false, pointer: current, error: "no previous release pointer recorded; nothing to roll back to" };
+  }
+  if (previous.schema !== 1 || POINTER_FIELDS.some((f) => (previous as unknown as Record<string, unknown>)[f] === undefined)) {
+    return { ok: false, pointer: current, error: "previous release pointer is malformed; refusing to activate it" };
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(previous.releaseId) || previous.entry !== `releases/${previous.releaseId}/cli/index.js`) {
+    return { ok: false, pointer: current, error: "previous release pointer entry is not contained in releases/; refusing to activate it" };
+  }
+  const entry = path.join(repoRoot, previous.entry);
+  const releaseDir = path.join(repoRoot, "releases", previous.releaseId);
+  const manifest = readBuildManifest(releaseDir);
+  if (!fs.existsSync(entry) || !manifest || manifest.buildHash !== previous.buildHash) {
+    return { ok: false, pointer: current, error: `previous release ${previous.releaseId} is missing or its manifest does not match; refusing to activate it` };
+  }
+  if (current && current.releaseId === previous.releaseId) {
+    return { ok: true, pointer: current, error: "already running the previous release; pointer unchanged" };
+  }
+  if (current) {
+    writePreviousReleasePointer(repoRoot, current);
+  }
+  writeReleasePointer(repoRoot, previous);
+  return { ok: true, pointer: previous };
 }
 
 /** True when the release id's embedded build hash matches the manifest. */

@@ -27,21 +27,18 @@ import {
   cleanupVerificationRuntime,
   materializeVerificationProfile,
   prepareVerificationRuntime,
-  resolveDefaultVerificationProfile,
   summarizeVerification,
   type MaterializedVerification,
   type VerificationAudit,
   type VerificationCommandResult,
   type VerificationProfile,
 } from "./verification.js";
+import { resolveVerificationProfile } from "./operator-verification.js";
 import type { CodexRuntimeEnvironment } from "./runtime.js";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { Logger, nullLogger, redact } from "../logger/index.js";
 import { type ExecutionProvider, type ExecutionBackend, type TaskLifecyclePhase } from "./backend.js";
 import { AntigravityBackend, DEFAULT_GEMINI_MODEL, KNOWN_GEMINI_MODELS, type AntigravityProviderStatus } from "./antigravity.js";
-import { OmnigentBackend, sanitizeOmnigentOutput, type OmnigentBackendOptions } from "./omnigent.js";
-import { OmnigentError } from "./omnigent-client.js";
-import { executionOrchestrator, type ExecutionOrchestrator } from "./orchestrator.js";
 import type { TaskLifecycleEvent, TaskLifecycleEventType } from "./audit-maintenance.js";
 import type { C2CSessionRegistry } from "../session/registry.js";
 import {
@@ -142,12 +139,12 @@ export interface PersistedTaskRecord {
   runTests: boolean;
   approvalMode: "workspace_write";
   provider?: ExecutionProvider;
-  /** Missing on legacy history. Never reinterpret queued work on a flag change. */
-  orchestrator?: ExecutionOrchestrator;
   providerRuntime?: string;
   providerModel?: string;
   providerSessionId?: string;
   providerMetadata?: Record<string, unknown>;
+  /** Set when a dead resumed AGY conversation was discarded and a fresh session carried the task (G2). */
+  sessionRecoveredAt?: string;
   tokenUsage?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -214,7 +211,6 @@ export interface CodexTaskView {
   runTests: boolean;
   approvalMode: "workspace_write";
   provider?: ExecutionProvider;
-  orchestrator?: ExecutionOrchestrator;
   providerSessionId?: string | null;
   providerModel?: string | null;
   tokenUsage?: {
@@ -361,9 +357,6 @@ export interface TaskManagerOptions {
   logger?: Logger;
   appServerFactory?: AppServerFactory;
   antigravityBackend?: ExecutionBackend;
-  orchestrator?: ExecutionOrchestrator;
-  omnigentBackend?: ExecutionBackend;
-  omnigent?: Omit<OmnigentBackendOptions, "stateDir">;
   /** Local-only registry hook; never populated from MCP input. */
   verificationProfileResolver?: (workspace: Workspace) => VerificationProfile | null;
   /** Local-only policy seam; production uses the synchronous built-in policy. */
@@ -566,7 +559,6 @@ function publicView(record: PersistedTaskRecord): CodexTaskView {
     runTests: record.runTests,
     approvalMode: record.approvalMode,
     provider: record.provider ?? "codex",
-    orchestrator: record.orchestrator ?? "legacy",
     lifecyclePhase: record.lifecyclePhase,
     requestedProvider: record.requestedProvider,
     requestedModel: record.requestedModel,
@@ -1097,10 +1089,6 @@ export class CodexTaskManager {
   private readonly logger: Logger;
   private readonly appServerFactory: AppServerFactory;
   private readonly antigravityBackend: ExecutionBackend;
-  private readonly orchestrator: ExecutionOrchestrator;
-  private omnigentBackend: ExecutionBackend | undefined;
-  private readonly omnigentOptions: Omit<OmnigentBackendOptions, "stateDir">;
-  private readonly recoveringOmnigentTasks = new Set<string>();
   private readonly verificationProfileResolver: (workspace: Workspace) => VerificationProfile | null;
   private readonly approvalEvaluator: (
     method: string,
@@ -1142,10 +1130,11 @@ export class CodexTaskManager {
     this.logger = opts.logger ?? nullLogger;
     this.appServerFactory = opts.appServerFactory ?? defaultAppServerFactory;
     this.antigravityBackend = opts.antigravityBackend ?? new AntigravityBackend({ stateDir: this.stateDir });
-    this.orchestrator = executionOrchestrator(opts.orchestrator);
-    this.omnigentBackend = opts.omnigentBackend;
-    this.omnigentOptions = opts.omnigent ?? {};
-    this.verificationProfileResolver = opts.verificationProfileResolver ?? resolveDefaultVerificationProfile;
+    // Default resolution: the trusted local operator registration for this
+    // workspace first, then the bridge-owned built-ins. Explicit injection
+    // (tests) still wins.
+    this.verificationProfileResolver = opts.verificationProfileResolver ??
+      ((workspace) => resolveVerificationProfile(workspace, this.stateDir));
     this.approvalEvaluator = opts.approvalEvaluator ?? evaluateCodexApproval;
     this.taskTimeoutMs = boundedMilliseconds(opts.taskTimeoutMs, DEFAULT_TASK_TIMEOUT_MS, 100, 60 * 60_000);
     this.verificationTimeoutMs = boundedMilliseconds(
@@ -1338,7 +1327,7 @@ export class CodexTaskManager {
     if (access.continuation) {
       const pin = access.continuation;
       if (this.getQueueState().paused) throw new TaskError("TASK_NOT_AUTHORIZED", "Workspace queue is paused");
-      if (!access.ownerId || access.workspaceId !== this.workspace.id || !pin.authorize() || input.provider !== "codex" || this.orchestrator !== "legacy" || pin.model !== "gpt-6-astra" || pin.effort !== "high" || !Number.isInteger(pin.timeoutMs) || pin.timeoutMs < 100 || pin.timeoutMs > 30 * 60_000) throw new TaskError("INVALID_TASK", "Continuation owner/model/budget mismatch");
+      if (!access.ownerId || access.workspaceId !== this.workspace.id || !pin.authorize() || input.provider !== "codex" || pin.model !== "gpt-6-astra" || pin.effort !== "high" || !Number.isInteger(pin.timeoutMs) || pin.timeoutMs < 100 || pin.timeoutMs > 30 * 60_000) throw new TaskError("INVALID_TASK", "Continuation owner/model/budget mismatch");
       // Read durable admissions while holding the same lock as binding checks and creation.
       const dir = path.dirname(taskFile(this.workspace.id, "c2c_00000000", this.stateDir));
       if (fs.existsSync(dir)) for (const name of fs.readdirSync(dir).filter(n => /^c2c_[a-f0-9]+\.json$/.test(n))) {
@@ -1349,13 +1338,6 @@ export class CodexTaskManager {
       if (previous) {
         if (previous.instructionHash !== input.instructionHash || JSON.stringify(previous.writeScope) !== JSON.stringify(input.writeScope) || previous.network !== input.network) throw new TaskError("INVALID_TASK", "Idempotency scope mismatch");
         return previous;
-      }
-    }
-    if (this.orchestrator === "omnigent") {
-      if (input.provider !== "codex") throw new TaskError("OMNIGENT_PROVIDER_UNSUPPORTED", "Omnigent G1 supports provider=codex only");
-      const safe = sanitizeOmnigentOutput(input.instruction);
-      if (!safe.allowed || safe.text.includes("[REDACTED]")) {
-        throw new TaskError("SENSITIVE_TASK_INPUT", "Remove credentials from the instruction before submitting an Omnigent task");
       }
     }
     if (!this.fullAccess && this.protectedWriteScopes.some((protectedScope) =>
@@ -1459,7 +1441,6 @@ export class CodexTaskManager {
       runTests: input.runTests,
       approvalMode: "workspace_write",
       provider: input.provider,
-      orchestrator: this.orchestrator,
       providerSessionId: previousProviderSessionId,
       providerModel: effectiveModel,
       status: "queued",
@@ -1597,24 +1578,6 @@ export class CodexTaskManager {
     if (TERMINAL_STATUSES.has(record.status)) return access.remote ? remoteView(record) : publicView(record);
     const now = new Date().toISOString();
     record.cancelRequestedAt ??= now;
-    if (record.orchestrator === "omnigent" && record.status !== "queued") {
-      record.status = "cancelling";
-      this.writeTask(record);
-      try {
-        await (await this.getOmnigentBackend()).cancel(taskId, record.providerSessionId ? { providerSessionId: record.providerSessionId } : undefined);
-        await this.closeAppServer(); // Also stop any C2C fixed verification command.
-      } catch {
-        record.error = { code: "OMNIGENT_CANCEL_UNCONFIRMED", message: "Omnigent may still be running; retry cancellation before dispatching more work" };
-        this.writeTask(record);
-        throw new TaskError(record.error.code, record.error.message);
-      }
-      this.recoveringOmnigentTasks.delete(taskId);
-      const runtime = this.active?.record.taskId === taskId ? this.active : null;
-      this.recordTerminal(record, runtime, { status: "cancelled", threadId: record.threadId ?? "", turnId: record.turnId ?? "" });
-      if (runtime) this.active = null;
-      this.schedulePump();
-      return access.remote ? remoteView(record) : publicView(record);
-    }
     if (record.provider === "gemini") {
       await this.antigravityBackend.cancel(taskId);
     }
@@ -1931,7 +1894,7 @@ export class CodexTaskManager {
 
   private pump(): void {
     this.queuePauseState = readWorkspaceQueuePauseState(this.workspace.id, this.stateDir);
-    if (this.closed || this.recovering || this.collectorBusy || this.recoveringOmnigentTasks.size > 0 || this.active || this.queuePauseState.paused) return;
+    if (this.closed || this.recovering || this.collectorBusy || this.active || this.queuePauseState.paused) return;
     // Native reservations share this writer domain, including after restart.
     // Queued work waits for terminal status to release the slot.
     const slot = readWorkspaceSlot(this.workspace.id, this.stateDir);
@@ -2046,9 +2009,7 @@ export class CodexTaskManager {
       ? `; verification_profile=${record.verification.profileId}; verification_status=${record.verification.status}; verification_argv_sha256=${record.verification.argvHash}; verification_network=false; verification_sandbox=${record.verification.sandbox}`
       : "";
     const isGemini = record.provider === "gemini";
-    const notesString = record.orchestrator === "omnigent"
-      ? `backend=omnigent; provider=codex; task_status=${record.status}; network=${networkEffective}${verificationNote}`
-      : isGemini
+    const notesString = isGemini
       ? `provider=gemini; providerRuntime=${record.providerRuntime ?? "antigravity-cli"}; providerModel=${record.providerModel ?? "gemini-3.8-flash-high"}; task_status=${record.status}; network=${networkEffective}${verificationNote}`
       : `backend=codex-app-server; protocol=v2; task_status=${record.status}; network=${networkEffective}; approvals_accepted=${accepted}; approvals_declined=${declined}${verificationNote}`;
     return {
@@ -2058,7 +2019,6 @@ export class CodexTaskManager {
       sessionId: record.sessionId,
       taskStatus: record.status,
       provider: record.provider ?? "codex",
-      orchestrator: record.orchestrator ?? "legacy",
       providerRuntime: record.providerRuntime ?? (isGemini ? "antigravity-cli" : "codex-app-server"),
       providerModel: record.providerModel ?? (isGemini ? "gemini-3.8-flash-high" : undefined),
       providerSessionId: record.providerSessionId ?? record.threadId ?? undefined,
@@ -2200,6 +2160,14 @@ export class CodexTaskManager {
     // intentionally left queued: their persisted instruction and policy are
     // replayed by prepareQueuedTask and the normal FIFO pump.
     for (const record of loaded) {
+      // Historical backend selections are migration metadata only. Never
+      // dispatch saved work from a retired backend through a native provider.
+      const savedBackend = (record as unknown as { orchestrator?: unknown }).orchestrator;
+      if (!TERMINAL_STATUSES.has(record.status) && savedBackend !== undefined && savedBackend !== "legacy") {
+        this.recordTerminal(record, null, { status: "interrupted", threadId: record.threadId ?? "", turnId: record.turnId ?? "" },
+          new TaskError("UNSUPPORTED_SAVED_BACKEND", "The saved task backend is no longer supported; submit a new task explicitly"));
+        continue;
+      }
       if (TERMINAL_STATUSES.has(record.status)) {
         // The task registry wins over every historical line. Repair the
         // reverse crash window only by appending an audit line that matches
@@ -2221,13 +2189,6 @@ export class CodexTaskManager {
         continue;
       }
       if (!RECOVERABLE_STATUSES.has(record.status) || TERMINAL_STATUSES.has(record.status)) continue;
-      if (record.orchestrator === "omnigent") {
-        this.recoveringOmnigentTasks.add(record.taskId);
-        record.status = "cancelling";
-        this.writeTask(record);
-        void this.recoverOmnigentTask(record);
-        continue;
-      }
       record.error ??= {
         code: "BRIDGE_RESTARTED",
         message: "The bridge restarted before this task finished.",
@@ -2250,12 +2211,6 @@ export class CodexTaskManager {
   private prepareQueuedTask(record: PersistedTaskRecord): PreparedQueuedTask | null {
     if (record.continuation && (!record.ownerId || !this.continuationAuthorize?.(record.ownerId, record.workspaceId, "execution.submit"))) {
       this.failQueuedTask(record, new TaskError("TASK_NOT_AUTHORIZED", "Continuation owner authorization revoked or unavailable"));
-      return null;
-    }
-    if ((record.orchestrator ?? "legacy") !== this.orchestrator ||
-        (record.orchestrator === "omnigent" && (record.provider ?? "codex") !== "codex")) {
-      this.failQueuedTask(record, new TaskError("ORCHESTRATOR_CHANGED", "The queued task's original orchestrator is no longer selected; submit a new task explicitly"));
-      this.schedulePump();
       return null;
     }
     const pending = this.pendingInputs.get(record.taskId);
@@ -2436,10 +2391,6 @@ export class CodexTaskManager {
     }
     if (input.provider === "gemini") {
       await this.executeGeminiTask(record, input, runtime, verificationProfile);
-      return;
-    }
-    if (record.orchestrator === "omnigent") {
-      await this.executeOmnigentTask(record, input, runtime, verificationProfile);
       return;
     }
     this.active = runtime;
@@ -2640,11 +2591,6 @@ export class CodexTaskManager {
 
   private async stopRuntime(runtime: RuntimeTask, reason: "cancel" | "timeout" | "shutdown" | "policy"): Promise<void> {
     if (runtime.finalized) return;
-    if (runtime.record.orchestrator === "omnigent" && !runtime.verificationInFlight) {
-      await (await this.getOmnigentBackend()).cancel(runtime.record.taskId,
-        runtime.record.providerSessionId ? { providerSessionId: runtime.record.providerSessionId } : undefined);
-      return;
-    }
     if (runtime.record.provider === "gemini") {
       await this.antigravityBackend.cancel(runtime.record.taskId);
       return;
@@ -2848,139 +2794,6 @@ export class CodexTaskManager {
     runtime.approvalTimers.clear();
   }
 
-  private async getOmnigentBackend(): Promise<ExecutionBackend> {
-    this.omnigentBackend ??= new OmnigentBackend({ ...this.omnigentOptions, stateDir: this.stateDir });
-    if (this.omnigentBackend.provider !== "codex") throw new TaskError("OMNIGENT_PROVIDER_UNSUPPORTED", "Omnigent G1 requires the Codex provider");
-    await this.omnigentBackend.initialize(this.workspace.root);
-    if (this.omnigentBackend instanceof OmnigentBackend) this.omnigentBackend.bindWorkspaceId(this.workspace.id);
-    return this.omnigentBackend;
-  }
-
-  private async recoverOmnigentTask(record: PersistedTaskRecord): Promise<void> {
-    try {
-      await (await this.getOmnigentBackend()).cancel(record.taskId, record.providerSessionId ? { providerSessionId: record.providerSessionId } : undefined);
-      this.recoveringOmnigentTasks.delete(record.taskId);
-      this.recordTerminal(record, null, { status: "interrupted", threadId: record.threadId ?? "", turnId: record.turnId ?? "" },
-        new TaskError("BRIDGE_RESTARTED", "The bridge restarted; the previous Omnigent writer has been stopped"));
-      this.schedulePump();
-    } catch {
-      record.error = { code: "OMNIGENT_CANCEL_UNCONFIRMED", message: "The previous Omnigent writer could not be stopped; retry cancellation before dispatching more work" };
-      this.writeTask(record);
-    }
-  }
-
-  private async executeOmnigentTask(
-    record: PersistedTaskRecord,
-    input: ValidatedTaskInput,
-    runtime: RuntimeTask,
-    verificationProfile: VerificationProfile | null
-  ): Promise<void> {
-    this.active = runtime;
-    record.status = "running";
-    record.startedAt = new Date().toISOString();
-    record.providerRuntime = "omnigent:codex-native";
-    this.writeTask(record);
-    this.updateSession(record);
-    this.emitLifecycleEvent("start", record, record.startedAt);
-    let unconfirmed = false;
-    // Detect changes to files that were already dirty before this task too.
-    // Only hash paths C2C's workspace layer allows us to inspect.
-    const fingerprint = (file: string): string | null => {
-      try {
-        const resolved = this.workspace.resolve(file);
-        const stat = fs.statSync(resolved.abs);
-        if (!stat.isFile() || stat.size > 16 * 1024 * 1024) return `${stat.size}:${stat.mtimeMs}`;
-        return createHash("sha256").update(fs.readFileSync(resolved.abs)).digest("hex");
-      } catch { return null; }
-    };
-    const dirtyBefore = new Map([...runtime.baselineFiles].map((file) => [file, fingerprint(file)]));
-    try {
-      const backend = await this.getOmnigentBackend();
-      if (runtime.finalized || record.cancelRequestedAt || this.closed) return;
-      const result = await backend.execute({
-        taskId: record.taskId, workspaceId: this.workspace.id, workspaceRoot: this.workspace.root,
-        // G1 always uses scoped Codex sandboxing, even when the deployment is
-        // allowed full local access. The prompt describes that actual policy.
-        instruction: this.buildInstruction({ ...input, fullAccess: false }),
-        writeScope: input.writeScope, writableRoots: input.writableRoots,
-        networkRequested: input.networkRequested, networkEffective: input.networkEffective,
-        fullAccess: input.fullAccess, runTests: input.runTests, sessionId: record.sessionId,
-        timeoutMs: this.taskTimeoutMs,
-        onIdentity: (identity) => {
-          if (runtime.finalized) return;
-          record.providerSessionId = identity.providerSessionId;
-          record.threadId = identity.providerSessionId;
-          record.turnId = identity.providerTurnId;
-          this.writeTask(record);
-          this.updateSession(record);
-        },
-      });
-      if (runtime.finalized) return;
-      if (result.provider !== "codex") throw new TaskError("OMNIGENT_PROVIDER_UNSUPPORTED", "Omnigent returned a different provider");
-      record.providerSessionId = result.providerSessionId ?? record.providerSessionId;
-      record.threadId = record.providerSessionId;
-      record.turnId = result.providerTurnId ?? record.turnId;
-      record.providerModel = result.providerModel;
-      record.networkReported = result.networkReported ?? null;
-      if (result.quiescent === false) {
-        unconfirmed = true;
-        record.status = "cancelling";
-        record.error = { code: "OMNIGENT_CANCEL_UNCONFIRMED", message: "Omnigent may still be running; retry cancellation before dispatching more work" };
-        this.writeTask(record);
-        this.updateSession(record);
-        return;
-      }
-      if (result.output) {
-        const output = saveExecutionOutput(this.workspace.id, {
-          command: "omnigent:codex-native", raw: result.output, exitCode: result.status === "completed" ? 0 : 1,
-          taskId: record.taskId, ownerId: record.ownerId, sessionId: record.sessionId,
-        }, this.stateDir);
-        record.outputIds.push(output.id);
-        record.outputAvailable = output.allowed;
-      }
-      const changed = new Set(result.changedFiles);
-      for (const file of new Set([...currentGitFiles(this.workspace), ...dirtyBefore.keys()])) {
-        if (!dirtyBefore.has(file) || dirtyBefore.get(file) !== fingerprint(file)) changed.add(file);
-      }
-      for (const file of changed) {
-        try {
-          const resolved = this.workspace.resolve(file);
-          if (!withinAny(resolved.abs, input.writableRoots)) runtime.policyViolation ??= "Omnigent changed a file outside the declared write scope";
-          runtime.itemPaths.add(resolved.rel);
-        } catch {
-          runtime.policyViolation ??= "Omnigent reported a change outside the authorized workspace";
-        }
-      }
-      if (result.status === "timed_out") runtime.timedOut = true;
-      if (result.error) runtime.failure = new TaskError(result.error.code, result.error.message);
-      if (runtime.policyViolation) runtime.failure = new TaskError("WRITE_SCOPE_VIOLATION", runtime.policyViolation);
-      if (result.status === "completed" && !runtime.failure && input.runTests && !record.cancelRequestedAt && !this.closed) {
-        // Existing C2C-owned fixed command/exec verification, never a legacy
-        // coding turn. It runs only after a successful, stopped Omnigent turn.
-        const client = await this.getAppServer(input.network);
-        if (!verificationProfile || !this.codexRuntime) throw new TaskError("NO_VERIFICATION_PROFILE", "No registered verification profile is available");
-        runtime.verificationRuntimeRoot = this.codexRuntime.root;
-        runtime.verification = materializeVerificationProfile(verificationProfile, this.workspace,
-          prepareVerificationRuntime(this.codexRuntime.root, record.taskId));
-        await this.runVerification(runtime, client);
-      }
-      this.recordTerminal(record, runtime, { status: result.status, threadId: record.threadId ?? "", turnId: record.turnId ?? "" }, runtime.failure);
-    } catch (error) {
-      if (runtime.finalized || unconfirmed) return;
-      const failure = error instanceof TaskError || error instanceof OmnigentError
-        ? new TaskError(error.code, error.message)
-        : new TaskError("OMNIGENT_EXECUTION_FAILED", "Omnigent execution failed");
-      this.recordTerminal(record, runtime, { status: "failed", threadId: record.threadId ?? "", turnId: record.turnId ?? "" }, failure);
-    } finally {
-      if (runtime.verification && runtime.verificationRuntimeRoot) {
-        cleanupVerificationRuntime(runtime.verificationRuntimeRoot, runtime.verification.runtime);
-      }
-      await this.closeAppServer();
-      if (!unconfirmed && this.active?.record.taskId === record.taskId) this.active = null;
-      this.schedulePump();
-    }
-  }
-
   private async executeGeminiTask(
     record: PersistedTaskRecord,
     input: ValidatedTaskInput,
@@ -3054,6 +2867,15 @@ export class CodexTaskManager {
       if (result.providerSessionId) {
         record.providerSessionId = result.providerSessionId;
         record.threadId = result.providerSessionId;
+      } else if (result.error?.code === "ANTIGRAVITY_SESSION_START_FAILED" && record.providerSessionId) {
+        // G2: the resumed AGY conversation is dead — discard the stale C2C
+        // provider-session metadata so neither this record nor the session
+        // registry keeps handing it out as a resume target.
+        record.providerSessionId = undefined;
+        record.threadId = undefined;
+      }
+      if ((result as { sessionRecovered?: boolean }).sessionRecovered) {
+        record.sessionRecoveredAt = new Date().toISOString();
       }
       record.provider = "gemini";
       record.providerRuntime = result.providerRuntime;

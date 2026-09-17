@@ -425,8 +425,8 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
     expect(result.error?.code).toBe("INVALID_MODEL");
   });
 
-  // 18. total MCP tools remain exactly 14
-  it("18. existing MCP tool count remains exactly 14 tools", () => {
+  // The complete public inventory is asserted by mcp-integration.test.ts.
+  it("18. creates the MCP server with restricted execution", () => {
     const server = createMcpServer({
       workspace,
       workspaces: [workspace],

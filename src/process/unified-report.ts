@@ -1,3 +1,4 @@
+import { resolveZ2cRepoRoot } from "../config/z2c-repo.js";
 import fs from "node:fs";
 import path from "node:path";
 import { readWorkspaceQueuePauseState } from "../execution/queue-state.js";
@@ -65,7 +66,9 @@ export interface ProvidersSectionData {
     strategy: "on-demand";
     state: string;
     executableAvailable: boolean;
-    liveSession: boolean;
+    /** On-demand lifecycle state; zero active sessions is normal, not degraded. */
+    readiness: string;
+    notCallableReason?: string;
   };
   zcode: {
     strategy: "managed-persistent";
@@ -73,6 +76,8 @@ export interface ProvidersSectionData {
     managed: boolean | null;
     desktopPid: number | null;
     registrationLive: boolean;
+    /** Desired workspaces whose desktop-agent registration is not live. */
+    missingWorkspaceRoots: string[];
     workspaceBinding: string;
     attested: boolean | null;
   };
@@ -104,7 +109,7 @@ export interface UnifiedReportInputs {
 }
 
 function z2cRepoRoot(repoRoot: string): string {
-  return path.resolve(repoRoot, "..", "zcode-with-chatgpt");
+  return resolveZ2cRepoRoot(repoRoot);
 }
 
 function pidAlive(pid: number): boolean {
@@ -233,9 +238,22 @@ export async function buildUnifiedReport(inputs: UnifiedReportInputs): Promise<U
     const { reconcileCodexReadiness, reconcileAgyReadiness, ZcodeDesktopReconciler } =
       await import("../supervisor/provider-bootstrap.js");
     const codex = await reconcileCodexReadiness();
-    const gemini = reconcileAgyReadiness({ stateDir });
+    const geminiLocal = reconcileAgyReadiness({ stateDir });
     const reconciler = new ZcodeDesktopReconciler({ workspaceRoot, stateDir, z2cRepoRoot: z2cRepoRoot(repoRoot) });
     const zcodeObs = reconciler.observe();
+    // Gemini: local readiness + durable last-attempt evidence (real task
+    // traffic only; never a canary). Zero sessions never degrades.
+    let geminiState: string = geminiLocal.state;
+    let geminiReason: string | undefined;
+    try {
+      const { readAntigravityAttemptEvidence, antigravityEvidenceReadiness } = await import("../execution/antigravity.js");
+      const evidence = readAntigravityAttemptEvidence(stateDir);
+      const blocked = evidence ? antigravityEvidenceReadiness(evidence) : null;
+      if (blocked) {
+        geminiState = blocked.state;
+        geminiReason = blocked.detail;
+      }
+    } catch { /* evidence unreadable: local readiness stands */ }
     // Workspace binding + attestation come from the control-plane status layers
     // (cheap local reads); this report never overstates them.
     let workspaceBinding = "UNKNOWN";
@@ -246,18 +264,27 @@ export async function buildUnifiedReport(inputs: UnifiedReportInputs): Promise<U
       workspaceBinding = cp.workspace_binding;
       attested = cp.native.attested;
     } catch { /* control-plane status unavailable */ }
+    const geminiCallable = geminiState === "READY_ON_DEMAND";
+    const zcodeReady = zcodeObs.state === "READY";
     providers = section<ProvidersSectionData>(
-      codex.state === "READY_ON_DEMAND" && gemini.state === "READY_ON_DEMAND" && zcodeObs.state === "READY"
+      codex.state === "READY_ON_DEMAND" && geminiCallable && zcodeReady
         ? "READY" : "DEGRADED",
       {
         codex: { strategy: "on-demand", state: codex.state, executableAvailable: codex.executableAvailable },
-        gemini: { strategy: "on-demand", state: gemini.state, executableAvailable: gemini.executableAvailable, liveSession: false },
+        gemini: {
+          strategy: "on-demand",
+          state: geminiState,
+          executableAvailable: geminiLocal.executableAvailable,
+          readiness: geminiState,
+          ...(geminiReason ? { notCallableReason: geminiReason } : {}),
+        },
         zcode: {
           strategy: "managed-persistent",
           state: zcodeObs.state,
           managed: zcodeObs.managed,
           desktopPid: zcodeObs.desktopPid,
           registrationLive: zcodeObs.registrationLive,
+          missingWorkspaceRoots: zcodeObs.missingWorkspaceRoots ?? [],
           workspaceBinding,
           attested,
         },

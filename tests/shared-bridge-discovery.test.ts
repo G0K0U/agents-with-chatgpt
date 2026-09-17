@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
 import { writeSecureJson } from "../src/config/paths.js";
-import { readRuntimeState, writeRuntimeState, type RuntimeState, type BridgeProcessIdentity } from "../src/bridge/runtime.js";
+import { readRuntimeState, writeRuntimeState, findBridgeObservation, type RuntimeState, type BridgeProcessIdentity } from "../src/bridge/runtime.js";
 import { stateDomainOwnerFile, type StateDomainOwnerRecord } from "../src/bridge/state-owner.js";
 import { findSharedBridgeObservation, ensureBridge, stopBridge, type AdminInfo, type SharedBridgeObservationOptions } from "../src/process/daemon.js";
 import { diagnoseSharedTunnel } from "../src/process/shared-doctor.js";
@@ -96,6 +96,15 @@ describe("post-reboot shared bridge discovery (hermetic)", () => {
     fs.linkSync(file, path.join(base, "linked-runtime.json"));
     expect(await discover()).toMatchObject({ state: "unknown" });
     expect(options.adminFetchImpl).not.toHaveBeenCalled();
+  });
+  it("reports owner_runtime_unhealthy (not active_owner_conflict) when the owner's own runtime degraded", async () => {
+    // The active owner's serve process no longer holds its runtime port: the
+    // owner's OWN observation degrades to stale_runtime. A requesting shared
+    // workspace must surface THAT precise fault, not a misleading ownership
+    // conflict (the 2026-09-16 incident diagnosis).
+    rows[0].listeningPorts = [];
+    expect(await findBridgeObservation(a.id, a.root, options)).toMatchObject({ state: "unknown", reason: "stale_runtime" });
+    expect(await discover()).toMatchObject({ state: "unknown", reason: "owner_runtime_unhealthy" });
   });
   it("B doctor uses current authenticated owner named URL and public probe with no B tunnel file", async () => {
     const observation = await discover();

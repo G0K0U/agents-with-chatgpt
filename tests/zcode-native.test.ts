@@ -447,18 +447,19 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     });
   });
 
-  it("3. attests the CURRENT Desktop plan binding builtin:zai-start-plan (live-observed 2026-09-12)", async () => {
-    fake.modelBinding = { provider_id: "builtin:zai-start-plan", model_id: ZCODE_NATIVE_REQUIRED_IDENTITY.model_id };
+  it("3. attests the governed Flash-only binding builtin:zai-coding-plan/GLM-5.3-Flash (product policy 2026-09-17)", async () => {
+    fake.modelBinding = { provider_id: ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id, model_id: ZCODE_NATIVE_REQUIRED_IDENTITY.model_id };
     fake.submitBinding = { ...fake.modelBinding };
     const status = await client().status(C2C_WS);
     expect(status.start_plan?.attested).toBe(true);
-    expect(status.start_plan?.provider_id).toBe("builtin:zai-start-plan");
+    expect(status.start_plan?.provider_id).toBe("builtin:zai-coding-plan");
+    expect(status.start_plan?.model_id).toBe("GLM-5.3-Flash");
     expect(status.start_plan?.mismatches).toEqual([]);
     const view = await client().submitTask({ workspace_id: C2C_WS, instruction: "x" });
-    expect(view.model_binding).toMatchObject({ provider_id: "builtin:zai-start-plan" });
+    expect(view.model_binding).toMatchObject({ provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3-Flash" });
   });
 
-  it("4. rejects a wrong reported model binding (obsolete GLM-5.3 stays rejected)", async () => {
+  it("4. rejects the main model binding (Flash-only governed policy: no main-model escalation)", async () => {
     fake.modelBinding = { provider_id: ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id, model_id: "GLM-5.3" };
     fake.submitBinding = { ...fake.modelBinding };
     fake.bindingWorkspace = ENGINEERING_AI_WS; // admission passes; the returned binding is wrong
@@ -471,13 +472,12 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     });
   });
 
-  it("4b. rejects the RETIRED identity builtin:zai-coding-plan/GLM-5.3", async () => {
-    fake.modelBinding = { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" };
+  it("4b. rejects the RETIRED start-plan identity builtin:zai-start-plan/GLM-5.3-Flash (unentitled route)", async () => {
+    fake.modelBinding = { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3-Flash" };
     fake.submitBinding = { ...fake.modelBinding };
     const status = await client().status(C2C_WS);
     expect(status.start_plan?.attested).toBe(false);
-    expect(status.start_plan?.mismatches.join(";")).toContain("provider_id=builtin:zai-coding-plan");
-    expect(status.start_plan?.mismatches.join(";")).toContain("model_id=GLM-5.3");
+    expect(status.start_plan?.mismatches.join(";")).toContain("provider_id=builtin:zai-start-plan");
     await expect(client().submitTask({ workspace_id: C2C_WS, instruction: "x" })).rejects.toMatchObject({
       code: "ZCODE_INCOMPATIBLE_PROVIDER_VERSION",
     });

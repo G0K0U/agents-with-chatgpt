@@ -13,8 +13,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { computeTreeHash, readBuildManifest, readReleasePointer, type BuildManifest } from "../src/bridge/runtime-identity.js";
-import { activateRelease, promoteCurrentBuild, releaseStatus } from "../src/process/release.js";
+import { installationRoot, computeTreeHash, readBuildManifest, readReleasePointer, type BuildManifest } from "../src/bridge/runtime-identity.js";
+import { activateRelease, promoteCurrentBuild, releaseStatus, rollbackRelease } from "../src/process/release.js";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -23,9 +24,11 @@ let fixture: string;
 function makeFakeRepo(): string {
   const root = mkdtempSync(path.join(tmpdir(), "c2c-rel-"));
   mkdirSync(path.join(root, "src"), { recursive: true });
+  mkdirSync(path.join(root, "src", "cli"), { recursive: true });
   mkdirSync(path.join(root, "dist", "cli"), { recursive: true });
   mkdirSync(path.join(root, "scripts"), { recursive: true });
   writeFileSync(path.join(root, "src", "entry.ts"), "export const v = 1;\n");
+  writeFileSync(path.join(root, "src", "cli", "index.ts"), "export const v = 1;\n");
   writeFileSync(path.join(root, "dist", "cli", "index.js"), "export const v = 1;\n");
   writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "fixture", version: "0.2.0" }));
   // The gate's manifest step runs the REAL script; copy it into the fixture.
@@ -76,6 +79,23 @@ afterEach(() => {
 });
 
 describe("release lifecycle", () => {
+  it("prunes deleted compiler output before hashing and promoting a release", () => {
+    const stale = ["retired-backend.js", "retired-backend.js.map", "orphan.js.map"];
+    for (const name of stale) writeFileSync(path.join(fixture, "dist", name), "stale");
+    writeFileSync(path.join(fixture, "dist", "cli", "index.js.map"), "current map");
+    writeFileSync(path.join(fixture, "dist", "asset.json"), "{}");
+    const result = activateRelease(fixture, { quick: true });
+    expect(result.ok).toBe(true);
+    const pointer = readReleasePointer(fixture)!;
+    for (const name of stale) {
+      expect(existsSync(path.join(fixture, "dist", name))).toBe(false);
+      expect(existsSync(path.join(fixture, "releases", pointer.releaseId, name))).toBe(false);
+    }
+    expect(existsSync(path.join(fixture, "dist", "cli", "index.js.map"))).toBe(true);
+    expect(existsSync(path.join(fixture, "dist", "asset.json"))).toBe(true);
+    expect(computeTreeHash(path.join(fixture, "dist"))).toBe(readBuildManifest(path.join(fixture, "dist"))!.buildHash);
+  });
+
   it("failed gate preserves the previous last-known-good pointer", () => {
     const pointer = {
       schema: 1 as const,
@@ -138,4 +158,67 @@ describe("release lifecycle", () => {
     rmSync(path.join(fixture, "dist", "build-manifest.json"));
     expect(releaseStatus(fixture, null).drift).toEqual(["NO_BUILD_MANIFEST"]);
   });
+});
+
+
+it("resolves one installation from control sources, dist and served releases", () => {
+  for (const tree of ["src", "dist", "releases/0.2.0-old", "releases/0.2.0-new"]) {
+    expect(installationRoot(path.join(fixture, tree))).toBe(fixture);
+  }
+});
+
+it("autostart launcher follows each activated LKG and rejects broken pointers", () => {
+  mkdirSync(path.join(fixture, "bin"), { recursive: true });
+  writeFileSync(path.join(fixture, "package.json"), JSON.stringify({ type: "module" }));
+  writeFileSync(path.join(fixture, "bin/c2c.js"), readFileSync(path.join(repoRoot, "bin/c2c.js")));
+  const invoke = () => spawnSync(process.execPath, [path.join(fixture, "bin/c2c.js"), "supervisor", "run"], { encoding: "utf8" });
+  for (const id of ["0.2.0-first", "0.2.0-second"]) {
+    const dir = path.join(fixture, "releases", id);
+    mkdirSync(path.join(dir, "cli"), { recursive: true });
+    writeFileSync(path.join(dir, "cli/index.js"), `console.log(${JSON.stringify(id)});`);
+    writeFileSync(path.join(dir, "build-manifest.json"), JSON.stringify({ buildHash: id }));
+    writeFileSync(path.join(fixture, "releases/LKG.json"), JSON.stringify({ schema: 1, releaseId: id, entry: `releases/${id}/cli/index.js`, buildHash: id }));
+    expect(invoke().stdout.trim()).toBe(id);
+  }
+  writeFileSync(path.join(fixture, "releases/LKG.json"), JSON.stringify({ schema: 1, releaseId: "../escape", entry: "dist/cli/index.js" }));
+  expect(invoke().status).not.toBe(0);
+});
+
+it("release rollback repoints to the validated previous activation and refuses unsafe pointers", () => {
+  const buildPointer = (id, buildHash) => ({
+    schema: 1, releaseId: id, entry: `releases/${id}/cli/index.js`, version: "0.2.0",
+    sourceCommit: null, buildHash, activatedAt: new Date().toISOString(),
+  });
+  const stage = (id, buildHash) => {
+    const dir = path.join(fixture, "releases", id);
+    mkdirSync(path.join(dir, "cli"), { recursive: true });
+    writeFileSync(path.join(dir, "cli/index.js"), `console.log(${JSON.stringify(id)});`);
+    writeFileSync(path.join(dir, "build-manifest.json"), JSON.stringify({ schema: 1, buildHash, sourceHash: "source-" + buildHash }));
+    return buildPointer(id, buildHash);
+  };
+  const first = stage("0.2.0-first", "hash-first");
+  const second = stage("0.2.0-second", "hash-second");
+  // Simulate two activations: current = second, previous = first.
+  writeFileSync(path.join(fixture, "releases/LKG.json"), JSON.stringify(second));
+  writeFileSync(path.join(fixture, "releases/LKG.previous.json"), JSON.stringify(first));
+  const rolled = rollbackRelease(fixture);
+  expect(rolled.ok).toBe(true);
+  expect(readReleasePointer(fixture)?.releaseId).toBe("0.2.0-first");
+  // Bounded A/B swap: the pre-rollback pointer is retained as previous.
+  expect(rollbackRelease(fixture).pointer?.releaseId).toBe("0.2.0-second");
+  // A malformed previous pointer is refused, never activated.
+  writeFileSync(path.join(fixture, "releases/LKG.previous.json"), JSON.stringify({ schema: 1, releaseId: "../escape", entry: "dist/cli/index.js" }));
+  const refused = rollbackRelease(fixture);
+  expect(refused.ok).toBe(false);
+  expect(refused.error).toMatch(/refusing/);
+  // A missing previous file reports nothing to roll back to.
+  rmSync(path.join(fixture, "releases/LKG.previous.json"));
+  expect(rollbackRelease(fixture).ok).toBe(false);
+  // Rollback repoints the stable launcher within one invocation.
+  writeFileSync(path.join(fixture, "releases/LKG.previous.json"), JSON.stringify(first));
+  expect(rollbackRelease(fixture).ok).toBe(true);
+  mkdirSync(path.join(fixture, "bin"), { recursive: true });
+  writeFileSync(path.join(fixture, "bin/c2c.js"), readFileSync(path.join(repoRoot, "bin/c2c.js")));
+  const out = spawnSync(process.execPath, [path.join(fixture, "bin/c2c.js"), "supervisor", "run"], { encoding: "utf8" });
+  expect(out.stdout.trim()).toBe("0.2.0-first");
 });

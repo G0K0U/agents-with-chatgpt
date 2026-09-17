@@ -1,51 +1,80 @@
 # Agents with ChatGPT
 
-> ChatGPT thinks. Codex works.
-> ChatGPT 负责思考，Codex 负责干活。
+> ChatGPT thinks. Agents work — Codex, Gemini, and GLM.
+> ChatGPT 负责思考，Agent 负责干活——Codex、Gemini、GLM。
 
 > [!IMPORTANT]
 > **遇到问题？** 请先向 Codex 发送 **「更新 Codex with ChatGPT」** 并重试。更新到最新版本可以解决大多数已知问题。  
 > **Having trouble?** First ask Codex to **“Update Codex with ChatGPT”** and try again. Updating to the latest version resolves most known issues.
 
-## The problem · 解决什么问题
-
-**中文** — ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的
-API 额度做规划和 Review。本项目把"思考"交给你已付费的网页版 ChatGPT，
-Codex 继续负责本地执行。不用 API Key、不搞逆向代理——官方网页 + OAuth MCP
-桥接，并提供明确授权的本地任务提交路径。
-
-**EN** — ChatGPT Plus/Pro web quota sits idle while your coding agent burns
-scarce API/Codex tokens on planning and review. This project moves the
-thinking to the subscription you already pay for; Codex remains the local
-executor. No API keys, no reverse proxy — official web UI plus an OAuth MCP
-bridge with read/review tools and an explicitly authorized local task path.
-
 ## What it is · 这是什么
 
-**中文** — 把 ChatGPT 网页版变成 Codex 编码会话的"规划与审查大脑"，执行权
-仍由 Codex 的本地执行器掌握。你的仓库永远不会被上传：ChatGPT 通过 OAuth MCP
-连接按需读取代码，并可通过本地 Codex App Server 提交任务。当前 CLI 按已选择的
-full-access 模式运行执行器：Codex 可以使用 bridge 进程拥有的文件系统和进程权限；
-网络默认关闭，只有任务明确设置 `network: true` 且本地 full-access 部署允许时才开启。
-公开 MCP 接口仍保持固定的 28 个工具，其中外部写入仅限单独授权的审计镜像工具，
-不新增通用 Shell 工具。
+**中文** — 把 ChatGPT 网页版变成编码会话的"规划与审查大脑"。你的仓库永远不会
+被上传：ChatGPT 通过 OAuth MCP 连接按需读取代码，并通过本地执行通道提交任务。
+本项目提供三条相互独立的执行通道：
 
-**EN** — Use the ChatGPT web app as the planning and review brain for your
-Codex coding sessions, while Codex keeps ownership of local execution. Your
-repository is never uploaded: ChatGPT reads exactly the lines it needs through
-an OAuth-protected MCP connection and may submit work through the local Codex
-App Server. An explicitly opted-in CLI deployment runs that executor with full-access
-mode; network remains disabled by default and is enabled only for a task that
-explicitly sets `network: true` in this locally authorized deployment. The public
-surface remains a fixed 28-tool MCP contract with one separately scoped,
-exact-target audit-mirror writer.
+1. **Codex** — 官方 Codex App Server（本地执行器）。
+2. **Gemini** — Antigravity/AGY CLI + Google OAuth（按需就绪，无会话也是健康态）。
+3. **GLM（治理通道）** — Z2C 伴随组件 → ZCode Desktop → **GLM-5.3-Flash（仅 Flash）**，
+   会话级模型/推理强度原生证明，严格工作区绑定。
+
+**EN** — Use the ChatGPT web app as the planning and review brain for your coding
+sessions. Your repository is never uploaded: ChatGPT reads exactly the lines it
+needs through an OAuth-protected MCP connection and submits work through local,
+attested execution channels. Three independent provider lanes:
+
+1. **Codex** — the official Codex App Server (local executor).
+2. **Gemini** — the Antigravity/AGY CLI with Google OAuth (READY_ON_DEMAND; zero
+   active sessions is a healthy state).
+3. **GLM (governed lane)** — the Z2C companion → ZCode Desktop → **GLM-5.3-Flash
+   only**, with native same-session model/identity attestation and exact
+   workspace binding.
 
 Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
 
+## Provider lanes · 三条执行通道
+
+### Codex — native App Server
+
+- Uses the official **Codex App Server** locally. No shims, no reverse proxies.
+- Prerequisite: a Codex/OpenAI login on the machine (CLI or desktop app).
+
+### Gemini — Antigravity/AGY CLI + Google OAuth
+
+- Uses the **Antigravity (AGY) CLI** with Google OAuth. This is **not** the Gemini
+  website and **not** a generic Gemini API key.
+- **READY_ON_DEMAND**: zero active sessions is healthy; no idle polling, no quota burn.
+- Prerequisite: AGY installed at `%LOCALAPPDATA%\agy\bin\agy.exe` and signed in once.
+
+### GLM — ZCode Desktop + Z2C (governed, **Flash only**)
+
+- Uses your **Z.AI Coding Plan** subscription through the signed-in **ZCode Desktop**
+  app. The **Z2C companion** (shipped in [`z2c/`](z2c), MIT) bridges C2C to the
+  Desktop-spawned native agent over a loopback, token-authenticated control channel.
+  No API-key replacement; the Desktop owns all model credentials.
+- **Governed policy is FLASH-ONLY**: ChatGPT-controlled execution admits exactly
+  `builtin:zai-coding-plan / GLM-5.3-Flash`, observed from the exact native session
+  (`desktop-session-read`). The main GLM-5.3 model stays available for **manual**
+  ZCode use but is rejected for governed C2C execution — no automatic escalation.
+- Model/reasoning changes on a live session are supported natively
+  (`update_zcode_session`): same session id, re-attested binding, fail closed.
+- Prerequisite: ZCode Desktop signed into your Z.AI account; Z2C is built by the
+  installer.
+
+## Prerequisites · 前置条件
+
+| Component | Installed by the C2C installer | Notes |
+|---|---|---|
+| Node.js ≥ 20, Git, pnpm | yes (winget / corepack, user scope) | |
+| Codex CLI + login | no — install/sign in yourself | lane active once detected |
+| Antigravity (AGY) CLI | no — install/sign in yourself | `%LOCALAPPDATA%\agy\bin` |
+| ZCode Desktop + Z.AI plan | no — install/sign in yourself | GLM Flash lane |
+| cloudflared | no — only for a stable public hostname | quick tunnels work without it |
+
 ## One-line install · 一行命令安装（Windows 11 x64）
 
-**中文** — 在 PowerShell 里执行（需要可联网；依赖缺失时脚本会用 winget
-自动以用户级安装 git/Node.js）：
+**中文** — 在 PowerShell 里执行。该命令会安装并构建**本地可分发的全部组件**
+（C2C 与内置的 Z2C 伴随组件）；三个供应商的账号登录仍需各自完成一次：
 
 ```powershell
 irm https://raw.githubusercontent.com/G0K0U/agents-with-chatgpt/main/install/install.ps1 | iex
@@ -62,8 +91,9 @@ irm https://raw.githubusercontent.com/G0K0U/agents-with-chatgpt/main/install/ins
 `-EnableAutoStart` 显式注册开机自启；安装目录、状态目录、工作区相互独立。
 完整参数与失败码见 [install/install.ps1](install/install.ps1)。
 
-**EN** — Run this in PowerShell (dependencies are auto-installed user-level
-via winget when missing):
+**EN** — Run this in PowerShell. The command installs and builds **everything that
+is locally distributable** (C2C plus the bundled Z2C companion); each provider's
+account login is still a separate one-time step:
 
 ```powershell
 irm https://raw.githubusercontent.com/G0K0U/agents-with-chatgpt/main/install/install.ps1 | iex
@@ -187,91 +217,39 @@ Credentials stay in the OS app state directory, not in the project.
 ## How it works
 
 ```
-                ┌──────────────────────────┐
-                │       ChatGPT Web        │
-                │  Reason / Plan / Review  │
-                └───────────┬────────▲─────┘
-                            │        │
-                  MCP       │        │ Computer Use
-               Data Plane   │        │ Control Plane (<1 KB messages)
-                            ▼        │
-                ┌─────────────────────────────────┐
-                │            C2C Core             │  loopback-only bridge
-                │  MCP read/review + task tools   │  OAuth 2.1 + pairing
-                │  runtime identity + release     │  Cloudflare tunnel
-                │  bounded supervisor + doctor    │
-                └───────┬──────────┬─────────┬────┘
-                        │          │         │
-             ON_DEMAND  │          │ ON_DEMAND   MANAGED_PERSISTENT
-                        ▼          ▼             ▼
-              ┌────────────┐ ┌────────────┐ ┌──────────────────┐
-              │   Codex    │ │  Gemini /  │ │ ZCode / GLM      │
-              │  App Server│ │ Antigravity│ │ Z2C →            │
-              │            │ │    AGY     │ │ ZCode Desktop    │
-              └────────────┘ └────────────┘ └──────────────────┘
+              ┌───────────────────────────┐
+              │       ChatGPT Web         │
+              │    Reason / Plan/Review   │
+              └──────────┬────────▲───────┘
+                         │        │
+                MCP      │        │ Computer Use
+             Data Plane  │        │ Control Plane (<1 KB messages)
+                         ▼        │
+              ┌─────────────────────────────┐
+              │        C2C Bridge           │  loopback-only HTTP + OAuth 2.1
+              │   read/review + scoped      │  one-time pairing code
+              │   task adapters             │  Cloudflare tunnel manager
+              └───┬──────────┬──────────┬───┘
+                  │          │          │
+     ┌────────────▼───┐ ┌────▼─────────┐ ┌▼──────────────────────────────┐
+     │  Codex App     │ │  AGY CLI     │ │ Z2C → desktop-agent proxy →   │
+     │  Server        │ │  (Google     │ │ ZCode Desktop → GLM-5.3-Flash │
+     │  (native)      │ │  OAuth)      │ │ (Z.AI Coding Plan, Flash-only)│
+     └────────────────┘ └──────────────┘ └───────────────────────────────┘
 ```
 
 - **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
   `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
   no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: a fixed 28-tool contract. ChatGPT pulls what it needs
-  through the read/review tools (`workspace_info`, `list_directory`,
-  `read_file`, `search_workspace`, `git_status`, `git_diff`, `test_status`,
-  `execution_summary`, `execution_output`), drives the Codex task lifecycle
-  (`submit_codex_task`, `get_codex_task`, `cancel_codex_task`) and the scoped
-  `execution_queue` control tool when explicitly authorized, and reaches the
-  ZCode lane through the `zcode_*` queue/native tools plus the agent-routing
-  tools. The separately scoped `write_engineering_ai_audit_mirror` tool writes
-  only the operator-configured Engineering AI status target (disabled unless
-  `C2C_ENGINEERING_AI_WORKSPACE_ID` is set).
-- **Isolated provider lanes**: Codex and Gemini/Antigravity AGY run
-  on-demand; ZCode/GLM runs as a managed-persistent lane behind Z2C and
-  ZCode Desktop. Each lane has its own bootstrap strategy and failure domain —
-  one lane degrading never takes the others down.
+- **Data plane (MCP)**: ChatGPT pulls what it needs through the read/review
+  tools and uses the separately authorized task, queue, provider, and
+  audit-mirror tools. The MCP surface is code-defined (see `src/mcp/`) rather
+  than a fixed count; every write path is separately scoped.
 - **Independent review**: after an agent executes, ChatGPT inspects the actual
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
-
-## Runtime lifecycle & reliability (Stability R1 / R1.1)
-
-- **Immutable releases (LKG)**: `c2c release build` produces `dist/` plus a
-  build manifest and promotes an immutable copy under `releases/<id>/`;
-  `c2c release activate` runs the release gate before repointing `LKG.json`.
-  A failed gate leaves the previous last-known-good release untouched, so a
-  bad build can never destroy a working runtime. The daemon prefers the LKG
-  release when launching the bridge.
-- **Runtime identity**: each build records which source tree and dist tree it
-  was produced from; at runtime the trees are re-hashed, so drift
-  (`SOURCE_BUILD_MISMATCH`, `BUILD_RUNTIME_MISMATCH`) is detected instead of a
-  process silently serving stale output.
-- **Bounded supervisor**: one lightweight process observes the control plane
-  and performs targeted recovery — re-probe, reconcile, reconnect the affected
-  provider, restart the affected companion, and restart C2C only when C2C
-  itself is unhealthy. Restarts are backoff-bounded (immediate, 5s, 15s, 30s,
-  then FAILED and manual intervention), so restart storms are structurally
-  impossible. The supervisor never writes durable state (task records,
-  receipts, auth, workspace ownership stay read-only to it).
-- **Windows autostart**: `install/register-autostart.ps1` registers a logon
-  scheduled task that runs `c2c supervisor run`; the supervisor then owns boot
-  ordering (bridge → tunnel → provider lanes).
-- **Provider bootstrap strategies**:
-  - `codex` / `gemini` (Antigravity AGY) — **on-demand**: local, cost-free
-    readiness checks only (executable resolves, isolated state preparable).
-    No persistent process and no quota spend while idle. Requires the Codex
-    CLI, respectively Gemini/Antigravity access, to be installed and signed in.
-  - `zcode` (GLM) — **managed-persistent**: the ZCode Desktop GUI is the lane;
-    when absent it is launched with the desktop-agent proxy environment so the
-    registration → Z2C → workspace binding → native attestation chain can come
-    up on its own. Requires ZCode Desktop to be installed.
-- **Unified doctor**: `c2c doctor`/status assembles one operational view from
-  durable local surfaces (runtime pointer, release pointer, supervisor status,
-  bounded liveness probes), strips admin tokens, and reports per-section
-  failures instead of failing wholesale.
-
-These mechanisms bound and detect failure; they do not make providers
-always-online or failures impossible. External prerequisites still apply per
-lane, and platform support is Windows 11 x64 first — see the
-[support matrix](docs/support-matrix.md).
+- **Provider isolation**: one provider's failure never silently substitutes
+  another. The GLM governed lane only executes on the attested Flash identity.
 
 ## Permission model (short version)
 
@@ -280,39 +258,51 @@ lane, and platform support is Windows 11 x64 first — see the
   execution mode. Network is off by default; a submitted task can edit any host
   path available to the bridge process, and only an explicit `network: true`
   request can opt into the locally authorized network capability.
-- **Fixed public contract**: ChatGPT still reaches execution through the three
-  task lifecycle tools and the separately scoped queue-control tool; it cannot
-  call an arbitrary MCP shell or App Server method directly. The only external
-  write is the separately scoped exact-target audit mirror; the bridge retains
-  OAuth scope, workspace identity, owner, and session checks.
+- **Scoped public contract**: ChatGPT reaches execution through the task
+  lifecycle, queue-control, provider, and audit-mirror tools; it cannot call an
+  arbitrary MCP shell or App Server method directly. The bridge retains OAuth
+  scope, workspace identity, owner, and session checks on every path.
 - **Multiple authorized workspaces**: one connector can select only registry
   entries bootstrapped by the local bridge; every entry has a stable id and a
   canonical root. Public read/review tools remain workspace-relative.
 - **Output protection remains**: OAuth tokens, pairing codes, credentials, and
   host paths are still redacted from logs, task metadata, session checkpoints,
-  and released command output where those filters apply. Full executor access
-  does not make raw credentials part of the MCP response contract.
+  and released command output where those filters apply.
 - **Knowing the URL grants nothing**: the public MCP endpoint requires OAuth 2.1
   (PKCE S256, dynamic client registration, rotating refresh tokens). Without a
   token: 401. Wrong workspace: 403.
 - **The model never sees long-lived credentials**: the only secret that ever
   touches a browser is a one-time pairing code (5-minute TTL, 5 attempts,
   rate-limited, destroyed on use).
+- **GLM attestation**: a governed GLM task is admitted only after the exact
+  native session reports `zcode-desktop / builtin:zai-coding-plan / GLM-5.3-Flash`
+  through the Desktop's own session read. Unobserved or main-model identity
+  fails closed.
 
 Full threat model: [docs/security.md](docs/security.md)
+
+## Verification
+
+- `c2c status --json` — bridge/tunnel/provider state for a workspace.
+- `c2c supervisor status` — control-plane self-check (all lanes).
+- `c2c doctor --fix` — auto-repair the connection.
+- Provider smoke: one tiny read-only task per lane through ChatGPT. A governed
+  GLM task must produce START and COMPLETED receipts both showing
+  `GLM-5.3-Flash`.
 
 ## For developers
 
 ```bash
 pnpm install
-pnpm build          # -> dist/ + build manifest, exposes the `c2c` bin
+pnpm build          # -> dist/, exposes the `c2c` bin
 pnpm test           # vitest: full unit + integration + full-access bridge suite
+
+# Z2C companion (GLM lane)
+cd z2c && npm install && npm run build
 
 c2c setup           # bridge + tunnel + pairing code, all in one
 c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
 c2c status / doctor / pair / unpair / logs / stop
-c2c release build / c2c release activate   # immutable LKG release lifecycle
-c2c supervisor run                          # bounded recovery loop (autostart entry)
 ```
 
 Requirements: Node.js >= 20, git. `cloudflared` for the public connection
@@ -325,20 +315,15 @@ Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
 ## Project layout
 
 ```
-src/
-  bridge/       loopback HTTP server, port recovery, admin API, runtime identity
-  mcp/          fixed 28-tool MCP contract (see "How it works")
-  auth/         OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
-  pairing/      one-time pairing codes (CSPRNG, TTL, rate limits)
-  workspace/    stable registry ids, path containment, sensitive-file policy, search, git
-  tunnel/       TunnelProvider abstraction + Cloudflare Quick/Named Tunnel
-  execution/    App Server adapter, task records, review-loop records, ZCode lanes
-  supervisor/   bounded supervisor + provider bootstrap strategies
-  process/      daemon lifecycle, immutable release/LKG lifecycle, unified reporting
-  cli/          the c2c CLI
-skill/          the Codex Skill (the real UX layer)
-tests/          unit + integration tests
-docs/           architecture / protocol / security / troubleshooting
+src/          C2C bridge, MCP surface, OAuth, pairing, workspace policy,
+              tunnel, provider lanes, release/LKG lifecycle, supervisor
+z2c/          Z2C companion (MIT): governed GLM control plane + desktop-agent
+              proxy + native ZCode protocol client
+skill/        the Codex Skill (the real UX layer)
+tests/        unit + integration tests
+docs/         architecture / protocol / security / troubleshooting
+install/      Windows installer + autostart registration
+bin/          stable LKG-resolving launcher (bin/c2c.js)
 ```
 
 ## Public infrastructure boundary
@@ -347,27 +332,20 @@ This repository includes source code, architecture, and generic tunnel integrati
 
 ## Attribution
 
-This public repository derives from and upstreams [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) under the MIT License, while this repository contains current multi-agent extensions. Upstream copyright remains with original contributors under the terms of the MIT License.
+This public repository derives from and upstreams [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) under the MIT License, while this repository contains current multi-agent extensions. Upstream copyright remains with original contributors under the terms of the MIT License. The `z2c/` companion is distributed under the same MIT License.
 
 ## Status & disclaimer
 
-Verified for the v0.2.0 release: the source/regression suite green on the
-release tree, the installer exercised end-to-end on Windows 11 x64, the live
-OAuth control loop with real cooperating agent sessions, and the Antigravity
-direct provider adapter. Stability R1/R1.1 (immutable LKG releases, runtime
-identity, bounded supervisor, provider bootstrap) ships in this source with
-release/regression tests. Windows 11 x64 is the only verified platform — see
-the [support matrix](docs/support-matrix.md) and the
-[v0.2.0 acceptance summary](docs/release-acceptance-v0.2.0.md) for what is and
-is not verified. The full-access choice is intentional: anyone holding the
-connector's execution scopes can direct local agent actions within the OS
-permissions of the bridge.
+Bootstrap upgrade verified end-to-end: one authorized connector can select the
+registered engineering workspace and the bridge workspace, persist sessions,
+resume task metadata after restart, and run the CLI executor in full-access mode.
+The full-access choice is intentional: anyone holding the connector's execution
+scopes can direct local Codex actions within the OS permissions of the bridge.
 
-**Unofficial community project. Not affiliated with or endorsed by OpenAI.**
+**Unofficial community project. Not affiliated with or endorsed by OpenAI, Google, or Z.AI.**
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — applies to C2C and the `z2c/` companion.
 
-Full-access development is opt-in via `C2C_FULL_ACCESS_DEVELOPMENT=true`;
-otherwise the CLI uses restricted execution.
+Full-access development is opt-in via `C2C_FULL_ACCESS_DEVELOPMENT=true`; otherwise the CLI uses restricted execution. See [deployment policy](docs/full-access-development.md).

@@ -153,6 +153,13 @@ export function currentRuntimeDir(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 }
 
+/** Installation root is stable across src, dist, and immutable releases. */
+export function installationRoot(runtimeDir = currentRuntimeDir()): string {
+  const tree = path.resolve(runtimeDir);
+  const parent = path.dirname(tree);
+  return path.basename(parent) === "releases" ? path.dirname(parent) : parent;
+}
+
 export interface ReleasePointer {
   schema: 1;
   releaseId: string;
