@@ -13,7 +13,7 @@ import type {
 } from "../src/execution/app-server.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { getStateDir } from "../src/config/paths.js";
-import { cleanup, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { cleanup, fakeCodexCatalog, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 class FullAccessFakeAppServer implements AppServerClient {
   private notificationHandler: ((notification: AppServerNotification) => void | Promise<void>) | null = null;
@@ -114,8 +114,8 @@ describe("full-access bridge MCP lifecycle", () => {
     write(root, "package.json", JSON.stringify({ name: "full-access-e2e", scripts: { test: "node --version" } }));
     authFile = path.join(makeTmpDir("full-access-auth"), "store.json");
     const factory = (_options: AppServerFactoryOptions): AppServerClient => new FullAccessFakeAppServer();
-    bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false, authStoreFile: authFile, fullAccess: true, appServerFactory: factory });
-    bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => entry.name === "c2c-bridge")!.id;
+    bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false, authStoreFile: authFile, fullAccess: true, appServerFactory: factory, modelCatalog: fakeCodexCatalog(root) });
+    bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => ["a2c-bridge", "c2c-bridge"].includes(entry.name))!.id;
     token = bridge.authStore.issueTokens({
       clientId: "full-access-owner",
       scopes: ["workspace.read", "execution.read", "execution.submit", "execution.cancel"],
@@ -294,7 +294,7 @@ describe("full-access bridge MCP lifecycle", () => {
     await bridge.close();
 
     const factory = (_options: AppServerFactoryOptions): AppServerClient => new FullAccessFakeAppServer();
-    bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false, authStoreFile: authFile, fullAccess: true, appServerFactory: factory });
+    bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false, authStoreFile: authFile, fullAccess: true, appServerFactory: factory, modelCatalog: fakeCodexCatalog(root) });
     client = await connect(token);
 
     const after = jsonOf<{ latestActiveSession: { id: string; workspaceId: string } | null }>(await client.callTool({

@@ -13,6 +13,7 @@ describe("Quanta Usage Telemetry Client & Normalization", () => {
 
   const baselinePayload = {
     observed_at: new Date().toISOString(),
+    observed_at_scope: "all_providers",
     machine: "DESKTOP-TEST",
     generated_at: 1788597000,
     codex: {
@@ -50,7 +51,7 @@ describe("Quanta Usage Telemetry Client & Normalization", () => {
       label: "Antigravity",
       available: true,
       plan: "Ultra Pro",
-      email: "personal-google@gmail.com",
+      email: "sample@example.invalid",
       windows: [
         {
           label: "Gemini 5h窗口",
@@ -118,7 +119,8 @@ describe("Quanta Usage Telemetry Client & Normalization", () => {
 
     await new Promise<void>((resolve, reject) => {
       mockServer = http.createServer((req, res) => {
-        if (req.url === "/api/usage" && req.headers["x-token"] === "valid-secret-token") {
+        const pathname = req.url?.split("?")[0];
+        if (pathname === "/api/usage" && req.headers["x-token"] === "valid-secret-token") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(samplePayload));
         } else if (req.headers["x-token"] !== "valid-secret-token") {
@@ -200,7 +202,7 @@ describe("Quanta Usage Telemetry Client & Normalization", () => {
 
     expect(serialized).not.toContain("user-secret@example.com");
     expect(serialized).not.toContain("stale-account@example.com");
-    expect(serialized).not.toContain("personal-google@gmail.com");
+    expect(serialized).not.toContain("sample@example.invalid");
     expect(serialized).not.toContain("valid-secret-token");
   });
 
@@ -532,6 +534,247 @@ describe("Quanta Usage Telemetry Client & Normalization", () => {
       // Verify that no percentage value is > 100
       expect(glm.five_hour_window.remaining_percent).toBeLessThanOrEqual(100);
       expect(glm.weekly_window.remaining_percent).toBeLessThanOrEqual(100);
+    });
+  });
+
+  describe("Section VII: Targeted Freshness & Timestamp Semantics (Scenarios A-H)", () => {
+    it("does not borrow Codex's sample time for Gemini or GLM", async () => {
+      delete (samplePayload as any).observed_at;
+      delete (samplePayload as any).observed_at_scope;
+      (samplePayload.codex.accounts[0] as any).snapshot_at = new Date(Date.now() - 5000).toISOString();
+      const report = await new QuantaClient({ configPath }).getTelemetry({ forceRefresh: true });
+      expect(report.providers.codex.current_account?.five_hour_window.remaining_percent).toBe(15);
+      expect(report.providers.antigravity.pools.gemini.five_hour_window.remaining_percent).toBeNull();
+      expect(report.providers.glm.five_hour_window.remaining_percent).toBeNull();
+    });
+
+    it("does not override an explicitly stale provider with fresh global evidence", async () => {
+      samplePayload.observed_at = new Date(Date.now() - 5000).toISOString();
+      (samplePayload.glm as any).observed_at = new Date(Date.now() - 61000).toISOString();
+      const report = await new QuantaClient({ configPath }).getTelemetry({ forceRefresh: true });
+      expect(report.providers.codex.current_account?.five_hour_window.status).toBe("known");
+      expect(report.providers.glm.five_hour_window.status).toBe("unknown");
+    });
+
+    it("uses the current Codex account's time even when it is not accounts[0]", async () => {
+      delete (samplePayload as any).observed_at;
+      delete (samplePayload as any).observed_at_scope;
+      samplePayload.codex.accounts[0].is_current = false;
+      (samplePayload.codex.accounts[0] as any).snapshot_at = new Date(Date.now() - 61000).toISOString();
+      samplePayload.codex.accounts[1].is_current = true;
+      (samplePayload.codex.accounts[1] as any).snapshot_at = new Date(Date.now() - 5000).toISOString();
+      const report = await new QuantaClient({ configPath }).getTelemetry({ forceRefresh: true });
+      expect(report.providers.codex.current_account?.account_index).toBe(1);
+      expect(report.providers.codex.current_account?.five_hour_window.status).toBe("known");
+      expect(report.observed_at).toBe((samplePayload.codex.accounts[1] as any).snapshot_at);
+    });
+
+    it.each([59_000, 61_000])("applies the 60-second boundary independently at age %i", async (age) => {
+      delete (samplePayload as any).observed_at;
+      delete (samplePayload as any).observed_at_scope;
+      (samplePayload.codex.accounts[0] as any).snapshot_at = new Date(Date.now() - age).toISOString();
+      const report = await new QuantaClient({ configPath }).getTelemetry({ forceRefresh: true });
+      expect(report.providers.codex.current_account?.five_hour_window.status).toBe(age < 60_000 ? "known" : "unknown");
+      expect(report.providers.antigravity.pools.gemini.five_hour_window.status).toBe("unknown");
+    });
+
+    it.each(["not-a-time", new Date(Date.now() + 60_000).toISOString()])("rejects invalid or future provider time %s", async (value) => {
+      delete (samplePayload as any).observed_at;
+      delete (samplePayload as any).observed_at_scope;
+      (samplePayload.glm as any).observed_at = value;
+      const report = await new QuantaClient({ configPath }).getTelemetry({ forceRefresh: true });
+      expect(report.providers.glm.five_hour_window.status).toBe("unknown");
+      expect(report.providers.glm.observed_at).toBe(value === "not-a-time" ? null : value);
+    });
+
+    it("rejects an impossible calendar date even if Date.parse normalizes it to now", async () => {
+      delete (samplePayload as any).observed_at;
+      delete (samplePayload as any).observed_at_scope;
+      (samplePayload.glm as any).observed_at = "2026-02-30T12:00:00Z";
+      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-03-02T12:00:05Z"));
+      try {
+        const report = await new QuantaClient({ configPath }).getTelemetry({ forceRefresh: true });
+        expect(report.providers.glm.observed_at).toBeNull();
+        expect(report.providers.glm.five_hour_window.status).toBe("unknown");
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it("does not use updated_at as a quota sample timestamp", async () => {
+      delete (samplePayload as any).observed_at;
+      delete (samplePayload as any).observed_at_scope;
+      (samplePayload.glm as any).updated_at = new Date().toISOString();
+      const report = await new QuantaClient({ configPath }).getTelemetry({ forceRefresh: true });
+      expect(report.providers.glm.five_hour_window.status).toBe("unknown");
+    });
+
+    it("rechecks cached sample age and never refreshes it after a failed forced request", async () => {
+      samplePayload.observed_at = new Date(Date.now() - 5_000).toISOString();
+      const client = new QuantaClient({ configPath, cacheTtlMs: 120_000 });
+      const first = await client.getTelemetry();
+      expect(first.providers.codex.current_account?.five_hour_window.status).toBe("known");
+      fs.writeFileSync(configPath, JSON.stringify({ server: { host: "127.0.0.1", port: mockPort, token: "wrong-token" } }));
+      const future = Date.now() + 61_000;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(future);
+      try {
+        const failed = await client.getTelemetry({ forceRefresh: true });
+        expect(failed.error).toBe("QUANTA_AUTH_FAILED");
+        const cached = await client.getTelemetry();
+        expect(cached.providers.codex.current_account?.five_hour_window.status).toBe("unknown");
+        expect(cached.fetched_at).toBe(first.fetched_at);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it("Scenario A: fresh snapshot (observed_at = now - 5s, used_percent = 35) -> freshness=fresh, status=known, remaining=65", async () => {
+      samplePayload.observed_at = new Date(Date.now() - 5000).toISOString();
+      samplePayload.codex.accounts[0].primary_used_percent = 35;
+      samplePayload.codex.accounts[0].effective_primary_used_percent = 35;
+
+      const client = new QuantaClient({ configPath });
+      const report = await client.getTelemetry({ forceRefresh: true });
+
+      expect(report.freshness).toBe("fresh");
+      const win = report.providers.codex.current_account?.five_hour_window;
+      expect(win?.status).toBe("known");
+      expect(win?.used_percent).toBe(35);
+      expect(win?.remaining_percent).toBe(65);
+    });
+
+    it("Scenario B: stale snapshot (observed_at = now - 10m) -> freshness=unknown, status=unknown, percent=null", async () => {
+      samplePayload.observed_at = new Date(Date.now() - 600000).toISOString();
+      samplePayload.codex.accounts[0].primary_used_percent = 35;
+      samplePayload.codex.accounts[0].effective_primary_used_percent = 35;
+
+      const client = new QuantaClient({ configPath });
+      const report = await client.getTelemetry({ forceRefresh: true });
+
+      expect(report.freshness).toBe("unknown");
+      const win = report.providers.codex.current_account?.five_hour_window;
+      expect(win?.status).toBe("unknown");
+      expect(win?.used_percent).toBeNull();
+      expect(win?.remaining_percent).toBeNull();
+    });
+
+    it("Scenario C: missing timestamp -> freshness=unknown, percent=null", async () => {
+      delete (samplePayload as any).observed_at;
+      delete (samplePayload as any).sampled_at;
+      delete (samplePayload as any).generated_at;
+
+      const client = new QuantaClient({ configPath });
+      const report = await client.getTelemetry({ forceRefresh: true });
+
+      expect(report.freshness).toBe("unknown");
+      expect(report.observed_at).toBeNull();
+      const win = report.providers.codex.current_account?.five_hour_window;
+      expect(win?.status).toBe("unknown");
+      expect(win?.used_percent).toBeNull();
+      expect(win?.remaining_percent).toBeNull();
+    });
+
+    it("Scenario D: future timestamp / clock error -> freshness=unknown, status=unknown, percent=null", async () => {
+      samplePayload.observed_at = new Date(Date.now() + 600000).toISOString();
+      samplePayload.codex.accounts[0].primary_used_percent = 35;
+      samplePayload.codex.accounts[0].effective_primary_used_percent = 35;
+
+      const client = new QuantaClient({ configPath });
+      const report = await client.getTelemetry({ forceRefresh: true });
+
+      expect(report.freshness).toBe("unknown");
+      const win = report.providers.codex.current_account?.five_hour_window;
+      expect(win?.status).toBe("unknown");
+      expect(win?.used_percent).toBeNull();
+      expect(win?.remaining_percent).toBeNull();
+    });
+
+    it("Scenario E: reset time only does not make snapshot fresh -> freshness=unknown, percent=null", async () => {
+      delete (samplePayload as any).observed_at;
+      delete (samplePayload as any).sampled_at;
+      delete (samplePayload as any).generated_at;
+      samplePayload.codex.accounts[0].primary_resets_at = Math.floor(Date.now() / 1000) + 3600;
+      samplePayload.codex.accounts[0].primary_used_percent = 35;
+      samplePayload.codex.accounts[0].effective_primary_used_percent = 35;
+
+      const client = new QuantaClient({ configPath });
+      const report = await client.getTelemetry({ forceRefresh: true });
+
+      expect(report.freshness).toBe("unknown");
+      const win = report.providers.codex.current_account?.five_hour_window;
+      expect(win?.status).toBe("unknown");
+      expect(win?.used_percent).toBeNull();
+      expect(win?.remaining_percent).toBeNull();
+      expect(win?.reset_at).toBeDefined();
+    });
+
+    it("Scenario F: provider no percent on fresh snapshot -> status=unknown, remaining_percent=null (never fabricated)", async () => {
+      samplePayload.observed_at = new Date(Date.now() - 5000).toISOString();
+      delete (samplePayload.codex.accounts[0] as any).primary_used_percent;
+      delete (samplePayload.codex.accounts[0] as any).effective_primary_used_percent;
+
+      const client = new QuantaClient({ configPath });
+      const report = await client.getTelemetry({ forceRefresh: true });
+
+      expect(report.freshness).toBe("fresh");
+      const win = report.providers.codex.current_account?.five_hour_window;
+      expect(win?.status).toBe("unknown");
+      expect(win?.used_percent).toBeNull();
+      expect(win?.remaining_percent).toBeNull();
+    });
+
+    it("Scenario G: GLM CREDIT_LIMIT units without percentage -> remaining_units=val, remaining_percent=null", async () => {
+      samplePayload.observed_at = new Date(Date.now() - 5000).toISOString();
+      samplePayload.glm = {
+        level: "lite",
+        windows: [
+          {
+            label: "5h窗口",
+            type: "CREDIT_LIMIT",
+            percent: null,
+            used: 120,
+            quota: 2000,
+            remaining: 1880,
+            reset_at: 1788599000,
+          },
+        ],
+      } as any;
+
+      const client = new QuantaClient({ configPath });
+      const report = await client.getTelemetry({ forceRefresh: true });
+
+      expect(report.freshness).toBe("fresh");
+      const win = report.providers.glm.five_hour_window;
+      expect(win.status).toBe("known");
+      expect(win.used_percent).toBeNull();
+      expect(win.remaining_percent).toBeNull();
+      expect(win.remaining_units).toBe(1880);
+      expect(win.unit_type).toBe("CREDIT_LIMIT");
+    });
+
+    it("Scenario H: mixed provider age -> stale provider invalidated as unknown, fresh provider preserved", async () => {
+      delete (samplePayload as any).observed_at;
+      const now = Date.now();
+      (samplePayload.codex.accounts[0] as any).snapshot_at = new Date(now - 5000).toISOString();
+      samplePayload.codex.accounts[0].primary_used_percent = 35;
+      samplePayload.codex.accounts[0].effective_primary_used_percent = 35;
+
+      (samplePayload.glm as any).observed_at = new Date(now - 600000).toISOString();
+
+      const client = new QuantaClient({ configPath });
+      const report = await client.getTelemetry({ forceRefresh: true });
+
+      expect(report.freshness).toBe("fresh");
+
+      const codexWin = report.providers.codex.current_account?.five_hour_window;
+      expect(codexWin?.status).toBe("known");
+      expect(codexWin?.used_percent).toBe(35);
+      expect(codexWin?.remaining_percent).toBe(65);
+
+      const glmWin = report.providers.glm.five_hour_window;
+      expect(glmWin.status).toBe("unknown");
+      expect(glmWin.used_percent).toBeNull();
+      expect(glmWin.remaining_percent).toBeNull();
     });
   });
 });

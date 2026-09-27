@@ -20,6 +20,8 @@ import {
   type WriteEngineeringAiAuditMirrorOptions,
 } from "./audit-mirror.js";
 import { Logger, nullLogger } from "../logger/index.js";
+import { sharedEnv } from "../config/env.js";
+import { readWorkspaceQueuePauseState } from "./queue-state.js";
 
 export const AUDIT_MAINTENANCE_TASK_PREFIX = "c2c_audit_maint_";
 export const DEFAULT_AUDIT_DEBOUNCE_MS = 1000;
@@ -159,7 +161,7 @@ export class EngineeringAiAuditMaintainer {
     // 3. Resolve Engineering AI workspace from supplied workspace, registry, or env.
     // Fail closed / disabled if unavailable or unauthorized (NO hard-coded machine paths/IDs).
     this.engineeringAiWorkspace = this.resolveWorkspace(options);
-    const userDisabled = options.disabled === true || process.env.C2C_DISABLE_AUDIT_MAINTENANCE === "true";
+    const userDisabled = options.disabled === true || sharedEnv("DISABLE_AUDIT_MAINTENANCE") === "true";
     this.disabled = userDisabled || !this.engineeringAiWorkspace || !this.authorized;
 
     if (!this.authorized) {
@@ -181,8 +183,8 @@ export class EngineeringAiAuditMaintainer {
 
     // 5. Resolve mirror root (without mutating process.env)
     this.oneDriveRoot = options.oneDriveRoot ??
-      process.env.C2C_ONEDRIVE_ROOT ??
-      process.env.C2C_ONEDRIVE_AUDIT_ROOT ??
+      sharedEnv("ONEDRIVE_ROOT") ??
+      sharedEnv("ONEDRIVE_AUDIT_ROOT") ??
       process.env.ENGINEERING_AI_AUDIT_MIRROR_ROOT;
 
     this.loadState();
@@ -206,7 +208,9 @@ export class EngineeringAiAuditMaintainer {
   }
 
   get isEnabled(): boolean {
-    return this.authorized && !this.disabled && !this.closed && Boolean(this.engineeringAiWorkspace);
+    const workspace = this.engineeringAiWorkspace;
+    return this.authorized && !this.disabled && !this.closed && workspace !== null &&
+      !readWorkspaceQueuePauseState(workspace.id, this.stateDir).paused;
   }
 
   get hasPendingMirror(): boolean {
@@ -219,7 +223,7 @@ export class EngineeringAiAuditMaintainer {
     }
 
     const targetId = options.workspaceId ??
-      process.env.C2C_ENGINEERING_AI_WORKSPACE_ID?.trim() ??
+      sharedEnv("ENGINEERING_AI_WORKSPACE_ID")?.trim() ??
       ENGINEERING_AI_WORKSPACE_ID;
 
     if (options.registry) {
@@ -238,7 +242,7 @@ export class EngineeringAiAuditMaintainer {
       }
     }
 
-    const configuredRoot = process.env.C2C_ENGINEERING_AI_WORKSPACE_ROOT?.trim();
+    const configuredRoot = sharedEnv("ENGINEERING_AI_WORKSPACE_ROOT")?.trim();
     if (configuredRoot && fs.existsSync(configuredRoot)) {
       try {
         return new Workspace(configuredRoot);
@@ -469,7 +473,8 @@ export class EngineeringAiAuditMaintainer {
 
   private async executeRefresh(): Promise<void> {
     if (this.pendingEvents.length === 0) return;
-    if (!this.authorized || this.disabled || !this.engineeringAiWorkspace || !this.canonicalStatusPath || !this.canonicalTimelinePath) return;
+    const workspace = this.engineeringAiWorkspace;
+    if (!this.isEnabled || !workspace || !this.canonicalStatusPath || !this.canonicalTimelinePath) return;
 
     // Drain accumulated events
     const batch = this.pendingEvents.splice(0);
@@ -483,22 +488,23 @@ export class EngineeringAiAuditMaintainer {
     // 1. Build prompt for Gemini
     const prompt = this.buildGeminiPrompt(validEvents, timestampUtc);
 
-    // 2. Execute via GEMINI ONLY — no silent fallback to Codex, GLM, Omnigent, etc.
+    // 2. Execute via GEMINI ONLY — no silent fallback to other providers.
     let executionResult: BackendExecutionResult;
     try {
       executionResult = await this.geminiBackend.execute({
         taskId: `${AUDIT_MAINTENANCE_TASK_PREFIX}${Date.now()}_${randomBytes(4).toString("hex")}`,
-        workspaceId: this.engineeringAiWorkspace.id,
-        workspaceRoot: this.engineeringAiWorkspace.root,
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.root,
         instruction: prompt,
-        writeScope: [this.engineeringAiWorkspace.root],
-        writableRoots: [this.engineeringAiWorkspace.root],
+        writeScope: [workspace.root],
+        writableRoots: [workspace.root],
         networkRequested: true,
         networkEffective: true,
         fullAccess: true,
         runTests: false,
         model: DEFAULT_GEMINI_MODEL,
         timeoutMs: 60_000,
+        evidence: false,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -881,7 +887,7 @@ export class EngineeringAiAuditMaintainer {
       }
 
       // 2. Flush and await already pending events before marking closed, so final events are not silently lost
-      if (this.authorized && !this.disabled && Boolean(this.engineeringAiWorkspace)) {
+      if (this.isEnabled) {
         this.refreshChain = this.refreshChain
           .catch(() => {})
           .then(async () => {

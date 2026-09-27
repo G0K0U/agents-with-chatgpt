@@ -14,8 +14,13 @@ import { machineReviewSchema, reviewFingerprint, reviewIdentity, reviewPrompt, p
 
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const id = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+// Model/effort are bounded protocol identifiers, not a single hardcoded pair:
+// the live catalog re-confirms each node before dispatch, and nodes whose pin
+// is no longer listed stay paused with an explicit reason.
+const protocolModel = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/);
+const protocolEffort = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,19}$/);
 const nodeSchema = z.object({
-  id, provider: z.literal("codex"), model: z.literal("gpt-6-astra"), effort: z.literal("high"),
+  id, provider: z.literal("codex"), model: protocolModel, effort: protocolEffort,
   instruction: z.string().min(1).max(8000), writeScope: z.array(z.string().min(1).max(300)).min(1).max(16),
   network: z.boolean(), networkBoundary: z.enum(["offline", "existing-loopback-only"]),
   dependencies: z.array(id).max(12), idempotencyKey: id,
@@ -150,10 +155,58 @@ export class ContinuationController {
             }
           }
         }
-        // Legacy deterministic-only STABLE cannot grandfather a review receipt.
-        if (ns.state === "STABLE" && ns.machineReview?.attempts.at(-1)?.state !== "PASS") ns.state = "WAITING_REVIEW";
+      // Legacy deterministic-only STABLE cannot grandfather a review receipt.
+      if (ns.state === "STABLE" && ns.machineReview?.attempts.at(-1)?.state !== "PASS") ns.state = "WAITING_REVIEW";
       }
-    } catch { this.loadError = "Protected continuation approval/state invalid; explicit repair required"; }
+    } catch (strictError) {
+      // S1: expired/cancelled continuations are reconciled to a stable
+      // terminal state instead of latching BROKEN_CONTINUATION forever.
+      if (!this.reconcileTerminalLoad(strictError)) {
+        this.loadError = "Protected continuation approval/state invalid; explicit repair required";
+      }
+    }
+  }
+  /**
+   * S1 terminal reconciliation: a continuation whose lease has expired or
+   * that was explicitly cancelled can never dispatch again; when its strict
+   * load fails (e.g. the approved manifest was rewritten after activation),
+   * reconcile it to a stable terminal state instead of latching
+   * BROKEN_CONTINUATION forever. Valid history (taskIds, events, receipts) is
+   * preserved; dispatch stays impossible (cancelled=true gates
+   * authorizesTask/canReview). Returns true when reconciliation succeeded.
+   * Genuine corruption on a NON-terminal plan still fails closed.
+   */
+  private reconcileTerminalLoad(strictError: unknown): boolean {
+    try {
+      const file = path.join(this.dir, "approved-manifest.json");
+      if (!fs.existsSync(file)) return false;
+      const manifest = validateManifest(readRegular(file));
+      if (manifest.workspaceId !== this.manager.workspace.id) return false;
+      const approval = readRegular(path.join(this.dir, "approval.json")) as { manifestHash?: unknown; ownerId?: unknown };
+      if (typeof approval.ownerId !== "string" || approval.ownerId.length === 0) return false;
+      const stateFile = path.join(this.dir, "state.json");
+      if (!fs.existsSync(stateFile)) return false;
+      const state = readRegular(stateFile) as ControllerState;
+      if (state.version !== 1 || typeof state.cancelled !== "boolean" || typeof state.paused !== "boolean" || !Array.isArray(state.events)) return false;
+      const terminal = state.cancelled === true ||
+        (typeof state.activatedAt === "number" && typeof manifest.leaseMs === "number" && this.now() >= state.activatedAt + manifest.leaseMs);
+      if (!terminal) return false; // live lease + integrity failure → fail closed
+      this.manifest = manifest;
+      this.state = state;
+      this.state.manifestHash = hash(this.manifest); // adopt the on-disk manifest (its integrity is now pinned here)
+      this.state.cancelled = true;
+      this.state.paused = false;
+      this.state.state = "RECONCILED_EXPIRED";
+      this.state.error = null;
+      this.state.readySince = null;
+      this.state.events.push({ id: `reconciled:${this.now()}`, type: "checkpoint",
+        detail: { reason: "terminal-reconciliation", priorError: strictError instanceof Error ? strictError.message.slice(0, 160) : "unknown" },
+        at: new Date(this.now()).toISOString() });
+      this.save();
+      return true;
+    } catch {
+      return false;
+    }
   }
   start(): void {
     if (!this.manifest || this.loadError) return;
@@ -390,6 +443,9 @@ export class ContinuationController {
   private async reconcile(reason: string): Promise<void> {
     const m = this.manifest, s = this.state;
     if (this.closed || !m || !s || this.loadError) return;
+    // Terminal reconciled plans are frozen: history stays readable, nothing
+    // dispatches, and the reconciled state is never overwritten.
+    if (s.state === "RECONCILED_EXPIRED") return;
     // Conserve quota for already admitted reviewers, even if paused, revoked or unfingerprintable.
     for (const ns of Object.values(s.nodes)) {
       const attempt = ns.machineReview?.attempts.at(-1);
@@ -416,7 +472,7 @@ export class ContinuationController {
       const terminal = s.events.find(e => e.id === `terminal:${observedTask.taskId}` && e.type === "terminal");
       const task = terminal ? terminal.detail as CodexTaskView : observedTask;
       const normalizedScope = task.writeScope.map(scope => path.isAbsolute(scope) ? path.relative(this.manager.workspace.root, scope).replaceAll("\\", "/") : scope);
-      if (task.workspaceId !== m.workspaceId || task.taskId !== observedTask.taskId || task.provider !== n.provider || task.orchestrator !== "legacy" || JSON.stringify(normalizedScope) !== JSON.stringify(n.writeScope) || task.network !== n.network) {
+      if (task.workspaceId !== m.workspaceId || task.taskId !== observedTask.taskId || task.provider !== n.provider || JSON.stringify(normalizedScope) !== JSON.stringify(n.writeScope) || task.network !== n.network) {
         ns.state = "BLOCKED_POLICY"; ns.evidence = { taskId: task.taskId, reason: "Imported task provider/scope/network mismatch" }; continue;
       }
       ns.evidence = task;
@@ -493,6 +549,23 @@ export class ContinuationController {
     if (s.submitted >= m.maxNewTasks) { s.state = "WAITING_REVIEW"; s.error = "TASK_BUDGET_EXHAUSTED"; this.save(); return; }
     const ns = s.nodes[eligible.id];
     const attempt = ns.taskIds.length;
+    // Catalog re-confirmation before any protected dispatch: a node pinned to
+    // a model the account no longer lists stays paused with an explicit
+    // reason. Historical approvals are never re-signed or silently re-routed.
+    const catalog = this.manager.modelCatalog;
+    if (catalog) {
+      const confirmation = await catalog.confirmCodexSelection(eligible.model, eligible.effort);
+      if (confirmation.problem) {
+        ns.state = "BLOCKED_CATALOG";
+        ns.evidence = { reason: confirmation.problem, model: eligible.model, effort: eligible.effort, observedAt: new Date(this.now()).toISOString() };
+        this.event("model-catalog-block", { node: eligible.id, problem: confirmation.problem }, `catalog-block:${eligible.id}`);
+        s.state = "WAITING_REVIEW";
+        s.error = confirmation.problem.startsWith("MODEL_NOT_LISTED") ? "MODEL_NOT_LISTED"
+          : confirmation.problem.startsWith("UNSUPPORTED_EFFORT") ? "UNSUPPORTED_EFFORT" : "MODEL_CATALOG_UNAVAILABLE";
+        this.save();
+        return;
+      }
+    }
     const key = `${m.planId}:${eligible.idempotencyKey}:${attempt}`;
     this.event("dispatch-intent", { node: eligible.id, key }, `intent:${key}`);
     this.save(); // Intent first; submit itself durably owns the idempotency key.

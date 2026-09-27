@@ -4,6 +4,7 @@ import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { SERVICE_NAME } from "../version.js";
 import { findBinary } from "./detect.js";
+import { resolveTunnelProtocol, tunnelProtocolArgs } from "./protocol.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
 
 const QUICK_TUNNEL_URL_RE = /https:\/\/[^\s|]+/gi;
@@ -14,7 +15,8 @@ const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 function isBridgeHealth(payload: unknown): boolean {
   if (!payload || typeof payload !== "object") return false;
   const health = payload as Record<string, unknown>;
-  return health.service === SERVICE_NAME && health.status === "ok";
+  // Accept the legacy c2c-bridge name during the A2C rename rollout.
+  return (health.service === SERVICE_NAME || health.service === "c2c-bridge") && health.status === "ok";
 }
 
 async function bridgeHealth(
@@ -59,6 +61,7 @@ export interface CloudflaredQuickTunnelOptions {
     options: { stdio: ["ignore", "pipe", "pipe"] }
   ) => ChildProcess;
   fetchImpl?: (input: string | URL, init?: RequestInit) => Promise<Response>;
+  env?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -75,6 +78,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
   private readonly startTimeoutMs: number;
   private readonly spawnImpl: NonNullable<CloudflaredQuickTunnelOptions["spawnImpl"]>;
   private readonly fetchImpl: NonNullable<CloudflaredQuickTunnelOptions["fetchImpl"]>;
+  private readonly env: NodeJS.ProcessEnv;
   private starting: Promise<string> | null = null;
   private cancelStart: (() => void) | null = null;
 
@@ -86,6 +90,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
     this.startTimeoutMs = options.startTimeoutMs ?? 45_000;
     this.spawnImpl = options.spawnImpl ?? ((command, args, spawnOptions) => spawn(command, args, spawnOptions));
     this.fetchImpl = options.fetchImpl ?? ((input, init) => fetch(input, init));
+    this.env = options.env ?? process.env;
   }
 
   private binary(): string | null {
@@ -117,9 +122,10 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
     return new Promise<string>((resolve, reject) => {
       let child: ChildProcess;
       try {
+        const protocol = resolveTunnelProtocol(this.env);
         child = this.spawnImpl(
           bin,
-          ["tunnel", "--url", `http://127.0.0.1:${localPort}`, "--no-autoupdate"],
+          ["tunnel", "--url", `http://127.0.0.1:${localPort}`, "--no-autoupdate", ...tunnelProtocolArgs(protocol)],
           { stdio: ["ignore", "pipe", "pipe"] }
         );
       } catch (error) {

@@ -15,7 +15,6 @@ export interface ExecutionRecord {
   ownerId?: string;
   sessionId?: string;
   provider?: string;
-  orchestrator?: "legacy" | "omnigent";
   providerRuntime?: string;
   providerModel?: string;
   providerSessionId?: string;

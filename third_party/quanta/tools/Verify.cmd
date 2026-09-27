@@ -1,0 +1,7 @@
+@echo off
+setlocal
+set "QUANTA_PACKAGE_DIR=%~dp0"
+powershell.exe -NoProfile -Command "$ErrorActionPreference='Stop'; try { $root=[IO.Path]::GetFullPath($env:QUANTA_PACKAGE_DIR); $seen=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase); $lines=Get-Content -LiteralPath (Join-Path $root 'SHA256SUMS') -Encoding UTF8; foreach($line in $lines) { if($line -notmatch '^([a-fA-F0-9]{64})  (.+)$') { throw 'Invalid manifest' }; $hash=$Matches[1]; $name=$Matches[2]; if([IO.Path]::IsPathRooted($name) -or $name -match '(^|[\/])\.\.([\/]|$)' -or -not $seen.Add($name)) { throw 'Invalid path or duplicate entry' }; $file=Join-Path $root $name; $stream=[IO.File]::OpenRead($file); $algorithm=[Security.Cryptography.SHA256]::Create(); try { $actualHash=[BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-','') } finally { $stream.Dispose(); $algorithm.Dispose() }; if($actualHash -ne $hash) { throw ('Hash mismatch: '+$name) } }; if($seen.Count -lt 2 -or -not $seen.Contains('Quanta.exe')) { throw 'Incomplete manifest' }; $actual=@(Get-ChildItem -LiteralPath $root -File -Recurse | Where-Object { $_.FullName -ne (Join-Path $root 'SHA256SUMS') }); if($actual.Count -ne $seen.Count) { throw 'Unlisted files in package' }; Write-Host ('PASS: '+$seen.Count+' files verified. Unsigned package; use a trusted download source.'); exit 0 } catch { Write-Host ('FAIL: '+$_.Exception.Message); exit 1 }"
+set "QUANTA_VERIFY_RESULT=%ERRORLEVEL%"
+if not "%~1"=="--no-pause" pause
+exit /b %QUANTA_VERIFY_RESULT%

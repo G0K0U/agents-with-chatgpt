@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="125 130 780 780">
+  <title>Quanta menu bar logo</title>
+  <desc>The original Q silhouette with a transparent clearance for a separate coloured usage dot.</desc>
+  <defs>
+    <mask id="badge-clearance" maskUnits="userSpaceOnUse" x="125" y="130" width="780" height="780">
+      <rect x="125" y="130" width="780" height="780" fill="white"/>
+      <circle cx="800" cy="235" r="135" fill="black"/>
+    </mask>
+  </defs>
+  <path fill="white" mask="url(#badge-clearance)" d="M 785 726 A 350 350 0 1 0 644 835 L 682 873 H 855 L 648 663 A 202 202 0 1 1 681 621 Z"/>
+</svg>

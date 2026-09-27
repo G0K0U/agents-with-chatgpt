@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   computeTreeHash,
+  computeSourceTreeHash,
   readBuildManifest,
   readReleasePointer,
   releaseIdFor,
@@ -35,7 +36,7 @@ function makeManifest(sourceContent: string, buildContent: string): void {
     sourceCommit: "abc123",
     sourceDirty: false,
     sourceRoot: path.join(root, "src"),
-    sourceHash: computeTreeHash(path.join(root, "src")),
+    sourceHash: computeSourceTreeHash(path.join(root, "src")),
     buildHash: computeTreeHash(path.join(root, "dist")),
     builtAt: new Date().toISOString(),
     nodeVersion: process.version,
@@ -57,7 +58,7 @@ describe("runtime identity", () => {
     const id = resolveRuntimeIdentity({ runtimeDir: path.join(root, "dist") });
     expect(id.sourceParity).toBe("ok");
     expect(id.buildParity).toBe("ok");
-    expect(id.releaseId).toBe("0.2.0-" + id.manifest!.buildHash.slice(0, 8));
+    expect(id.releaseId).toBe("0.2.0-" + id.manifest!.buildHash.slice(0, 8) + "-" + id.manifest!.sourceHash.slice(0, 8));
   });
 
   it("detects SOURCE_BUILD_MISMATCH when source changed after the build", () => {
@@ -101,6 +102,16 @@ describe("runtime identity", () => {
     expect(computeTreeHash(root)).toBe(h1);
     writeFile("a.ts", "changed");
     expect(computeTreeHash(root)).not.toBe(h1);
+  });
+
+  it("source identity ignores local backups while detecting deployable source edits", () => {
+    writeFile("src/entry.ts", "export const value = 1;\n");
+    const initial = computeSourceTreeHash(path.join(root, "src"));
+    writeFile("src/entry.ts.pre-local-repair.bak", "private local backup\n");
+    writeFile("src/entry.ts.error-protocol-backup-20260903", "private local backup\n");
+    expect(computeSourceTreeHash(path.join(root, "src"))).toBe(initial);
+    writeFile("src/entry.ts", "export const value = 2;\n");
+    expect(computeSourceTreeHash(path.join(root, "src"))).not.toBe(initial);
   });
 
   it("release pointer round-trips and rejects malformed or escaping entries", () => {

@@ -5,7 +5,33 @@ repository's public docs and scripts. Steps the agent can complete on its own
 are marked; steps that need the human (browser logins, pairing codes) are
 called out one at a time.
 
+Agents operating this checkout should also read **[AGENTS.md](../AGENTS.md)** —
+the canonical handoff contract (deploy/health/restart/update/rollback
+commands, and the boundary between local automation and human-only steps).
+
 ## 1. Deploy prompt (paste to your coding agent)
+
+Fastest path (0.3.0+): from a fresh clone, the agent runs one command and the
+flow itself enforces the tunnel boundary — it only *reads* tunnel state and
+prints `HUMAN ACTION REQUIRED` with exact commands when no public connection
+exists:
+
+```text
+Deploy "Agents with ChatGPT" from this clone: run `node scripts\deploy.mjs`
+(POSIX: `node scripts/deploy.mjs`) with --workspace pointing at my current
+project directory. It checks prerequisites, installs dependencies, builds,
+starts the local bridge, and verifies local health. Do NOT create Cloudflare
+tunnels, DNS records, or hostnames, and do NOT touch any existing tunnel
+configuration — if the output has a HUMAN ACTION REQUIRED section, print its
+exact commands to me and wait for me to run them myself. Then verify with the
+same workspace values: `node bin\a2c.js status --json` and
+`node bin\a2c.js doctor`, fix any local issue yourself, and only interrupt me
+for actions that require a human: the tunnel/domain choice above, the ChatGPT
+browser login, and the one-time pairing code — one action at a time.
+```
+
+Classic variant (installs from GitHub into a separate directory rather than
+deploying this clone):
 
 ```text
 Install "Agents with ChatGPT" (C2C) on this Windows 11 machine, following the

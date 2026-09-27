@@ -3,8 +3,27 @@ import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { ModelCatalogService } from "../src/execution/model-catalog.js";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/** Synthetic catalog for bridge tests that use a fake App Server. */
+export function fakeCodexCatalog(workspaceRoot: string): ModelCatalogService {
+  return new ModelCatalogService({
+    workspaceRoot,
+    env: { CODEX_HOME: path.join(workspaceRoot, ".codex-test") },
+    codexExecutableResolver: () => path.join(workspaceRoot, "fake-codex.exe"),
+    codexClientFactory: () => ({
+      initializeResult: { userAgent: "codex-test/0.0.0" },
+      initialize: async () => undefined,
+      request: async (method: string) => method === "model/list"
+        ? { data: [{ id: "gpt-6-sol", isDefault: true, defaultReasoningEffort: "max",
+            supportedReasoningEfforts: [{ reasoningEffort: "max" }] }], nextCursor: null }
+        : {},
+      close: async () => undefined,
+    } as never),
+  });
+}
 
 function testTmpRoot(): string {
   const configured = process.env.C2C_TEST_TMP_ROOT;
@@ -82,6 +101,9 @@ export function makeGitRepo(dir: string): void {
 /** Point the persistent state dir at an isolated temp location. */
 export function isolateStateDir(): string {
   const dir = makeTmpDir("state");
+  // Dual-namespace: A2C_* is canonical, C2C_* the legacy alias — writers must
+  // set both so A2C-first readers always see the isolated directory.
+  process.env.A2C_STATE_DIR = dir;
   process.env.C2C_STATE_DIR = dir;
   return dir;
 }

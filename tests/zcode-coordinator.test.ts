@@ -24,6 +24,10 @@ import {
   withinCoordinatorWindows,
   type ZcodeCoordinatorNative,
 } from "../src/execution/zcode-coordinator.js";
+import {
+  writeWorkspaceQueuePauseState,
+  workspaceQueueStateFile,
+} from "../src/execution/queue-state.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
@@ -651,6 +655,15 @@ describe("control plane status layers", () => {
       updated_at: new Date().toISOString(),
     });
     expect(describeControlPlane({ root }).level).toBe("AUTH_NOT_ATTESTED");
+
+    store.writeWorkerState({
+      status: "idle",
+      owner: { pid: process.pid, started_at: new Date().toISOString() },
+      within_window: true,
+      native: { available: true, provider: "zcode-official", model: "UNKNOWN", attested: false, observed_at: new Date().toISOString() },
+      updated_at: new Date().toISOString(),
+    });
+    expect(describeControlPlane({ root }).level).toBe("AUTH_NOT_ATTESTED");
   });
 
   it("reports WORKSPACE_BINDING_FAILED on a recorded namespace mismatch", () => {
@@ -675,5 +688,233 @@ describe("control plane status layers", () => {
     const listing = control.listTasks(50);
     expect(listing.worker_state).not.toBeNull();
     expect(JSON.stringify(listing)).not.toMatch(/[A-Za-z]:\\\\?[Uu]sers/);
+  });
+});
+
+describe("zcode coordinator queue pause guard", () => {
+  it("provider recovers + paused => no submit, no START receipt", async () => {
+    const stateDir = makeTmpDir("zcode-coord-paused-state");
+    createdDirs.push(stateDir);
+    const workspaceId = "wskyc039abcd";
+    writeWorkspaceQueuePauseState(workspaceId, true, stateDir);
+
+    const native = makeFakeNative(workspaceId, { available: false });
+    const task = (await enqueue()) as { task_id: string };
+    const coordinator = makeCoordinator(native, { stateDir, pollMs: 1000 });
+
+    // Tick while native lane is unavailable
+    await coordinator.runTick();
+    expect(native.submitKeys).toEqual([]);
+
+    // Provider recovers (available and attested)
+    native.status = async () => ({
+      available: true,
+      provider: { name: "zcode-desktop" },
+      start_plan: {
+        attested: true,
+        provider_id: "builtin:zai-start-plan",
+        model_id: "GLM-5.3-Flash",
+        mismatches: [],
+      },
+    });
+
+    // Run ticks after provider recovers while queue is paused
+    await coordinator.runTick();
+    await coordinator.runTick();
+
+    // Must NOT submit task and must NOT write START receipt
+    expect(native.submitKeys).toEqual([]);
+    const view = new ZcodeControl(root).getTask(task.task_id);
+    expect(view?.status).toBe("queued");
+    expect(view?.receipts).toEqual([]);
+    expect(coordinator.getStatus().paused).toBe(true);
+  });
+
+  it("unpause => exact one submit and START receipt", async () => {
+    const stateDir = makeTmpDir("zcode-coord-unpause-state");
+    createdDirs.push(stateDir);
+    const workspaceId = "wskyc039abcd";
+    writeWorkspaceQueuePauseState(workspaceId, true, stateDir);
+
+    const native = makeFakeNative(workspaceId);
+    const task = (await enqueue()) as { task_id: string };
+    const coordinator = makeCoordinator(native, { stateDir, pollMs: 1000 });
+
+    // Paused tick: no dispatch
+    await coordinator.runTick();
+    expect(native.submitKeys).toEqual([]);
+
+    // Unpause queue
+    writeWorkspaceQueuePauseState(workspaceId, false, stateDir);
+    expect(coordinator.getStatus().paused).toBe(false);
+
+    // Tick after unpause
+    await coordinator.runTick();
+
+    // Exact one submission and exact one START receipt
+    expect(native.submitKeys).toEqual([task.task_id]);
+    const view = new ZcodeControl(root).getTask(task.task_id);
+    expect(view?.status).toBe("running");
+    expect(view?.receipts.map((r) => r.event)).toEqual(["START"]);
+
+    // Subsequent tick does not duplicate submission
+    await coordinator.runTick();
+    expect(native.submitKeys).toEqual([task.task_id]);
+  });
+
+  it("unreadable control => fails closed with no submit", async () => {
+    const stateDir = makeTmpDir("zcode-coord-unreadable-state");
+    createdDirs.push(stateDir);
+    const workspaceId = "wskyc039abcd";
+    const queueFile = workspaceQueueStateFile(workspaceId, stateDir);
+    // Write corrupted/unreadable control content
+    fs.writeFileSync(queueFile, "{ corrupt: not valid json", "utf8");
+
+    const native = makeFakeNative(workspaceId);
+    const task = (await enqueue()) as { task_id: string };
+    const coordinator = makeCoordinator(native, { stateDir, pollMs: 1000 });
+
+    expect(coordinator.getStatus().paused).toBe(true);
+    await coordinator.runTick();
+    await coordinator.runTick();
+
+    // Fails closed: no submit, no START receipt
+    expect(native.submitKeys).toEqual([]);
+    const view = new ZcodeControl(root).getTask(task.task_id);
+    expect(view?.status).toBe("queued");
+    expect(view?.receipts).toEqual([]);
+  });
+
+  it("pause between claim & dispatch => denied", async () => {
+    const stateDir = makeTmpDir("zcode-coord-race-state");
+    createdDirs.push(stateDir);
+    const workspaceId = "wskyc039abcd";
+    // Initially unpaused
+    writeWorkspaceQueuePauseState(workspaceId, false, stateDir);
+
+    const native = makeFakeNative(workspaceId);
+    let submitAttempted = false;
+    const originalSubmit = native.submitTask.bind(native);
+    native.submitTask = async (input) => {
+      submitAttempted = true;
+      return originalSubmit(input);
+    };
+
+    const task = (await enqueue()) as { task_id: string };
+    const coordinator = makeCoordinator(native, { stateDir, pollMs: 1000 });
+
+    // Simulate pause race between claim loop and dispatch
+    const origRawInstruction = (coordinator as unknown as { control: ZcodeControl }).control.rawInstructionFor.bind(
+      (coordinator as unknown as { control: ZcodeControl }).control
+    );
+    (coordinator as unknown as { control: ZcodeControl }).control.rawInstructionFor = (id: string) => {
+      writeWorkspaceQueuePauseState(workspaceId, true, stateDir);
+      return origRawInstruction(id);
+    };
+
+    await coordinator.runTick();
+
+    // Submission was denied immediately before native submission
+    expect(submitAttempted).toBe(false);
+    expect(native.submitKeys).toEqual([]);
+    const view = new ZcodeControl(root).getTask(task.task_id);
+    expect(view?.status).toBe("queued");
+    expect(view?.receipts).toEqual([]);
+  });
+
+  it("pause during asynchronous native preparation blocks the final network mutation", async () => {
+    const stateDir = makeTmpDir("zcode-coord-async-pause");
+    createdDirs.push(stateDir);
+    const workspaceId = "wskyc039abcd";
+    writeWorkspaceQueuePauseState(workspaceId, false, stateDir);
+    const native = makeFakeNative(workspaceId);
+    const originalSubmit = native.submitTask.bind(native);
+    native.submitTask = async (input, beforeDispatch) => {
+      await Promise.resolve(); // provider probe / handshake completes after claim
+      writeWorkspaceQueuePauseState(workspaceId, true, stateDir);
+      beforeDispatch?.();
+      return originalSubmit(input);
+    };
+    const task = (await enqueue()) as { task_id: string };
+    const coordinator = makeCoordinator(native, { stateDir, pollMs: 1000 });
+    await coordinator.runTick();
+    expect(native.submitKeys).toEqual([]);
+    expect(new ZcodeControl(root).getTask(task.task_id)?.status).toBe("queued");
+    expect(receipts(root)).toEqual([]);
+    const pending = new ZcodeCoordinatorStore(root).readRawWorkerState()?.pending;
+    expect(pending ?? []).toEqual([]);
+  });
+
+  it("active observation and cancellation resolution are unaffected while paused", async () => {
+    const stateDir = makeTmpDir("zcode-coord-active-unaffected");
+    createdDirs.push(stateDir);
+    const workspaceId = "wskyc039abcd";
+
+    const native = makeFakeNative(workspaceId);
+    const activeTask = (await enqueue({ task_id: "task_running_before_pause" })) as { task_id: string };
+    const coordinator = makeCoordinator(native, { stateDir, pollMs: 1000 });
+
+    // Tick while unpaused to start the active task
+    await coordinator.runTick();
+    expect(native.submitKeys).toEqual(["task_running_before_pause"]);
+    expect(new ZcodeControl(root).getTask("task_running_before_pause")?.status).toBe("running");
+
+    // Enqueue a task to cancel and a task to stay held
+    await enqueue({ task_id: "task_queued_for_cancel" });
+    await enqueue({ task_id: "task_queued_held" });
+
+    // PAUSE the workspace queue
+    writeWorkspaceQueuePauseState(workspaceId, true, stateDir);
+
+    // Request cancellation of the queued task while paused
+    await requestCancel("task_queued_for_cancel");
+
+    // Complete the running task in native lane
+    for (const entry of native.tasks.values()) entry.status = "completed";
+
+    // Run tick while paused
+    await coordinator.runTick();
+
+    // 1. Active task observation: COMPLETED receipt written and finalized
+    const completedView = new ZcodeControl(root).getTask("task_running_before_pause");
+    expect(completedView?.status).toBe("completed");
+    expect(completedView?.receipts.map((r) => r.event)).toEqual(["START", "COMPLETED"]);
+
+    // 2. Cancellation resolution: queued cancel resolved to CANCELLED receipt
+    const cancelView = new ZcodeControl(root).getTask("task_queued_for_cancel");
+    expect(cancelView?.status).toBe("cancelled");
+    expect(cancelView?.receipts.map((r) => r.event)).toEqual(["CANCELLED"]);
+
+    // 3. Held task was NOT submitted
+    expect(native.submitKeys).toEqual(["task_running_before_pause"]);
+    const heldView = new ZcodeControl(root).getTask("task_queued_held");
+    expect(heldView?.status).toBe("queued");
+    expect(heldView?.receipts).toEqual([]);
+  });
+
+  it("denies recovery redispatch of interrupted task while paused and allows once unpaused", async () => {
+    const stateDir = makeTmpDir("zcode-coord-recovery-paused");
+    createdDirs.push(stateDir);
+    const workspaceId = "wskyc039abcd";
+
+    const native = makeFakeNative(workspaceId);
+    const task = (await enqueue({ task_id: "task_interrupted_recovery" })) as { task_id: string };
+    const first = makeCoordinator(native, { stateDir, pollMs: 1000 });
+    await first.runTick(); // Dispatches -> START receipt written
+    await first.stop();
+
+    // Pause before recovery coordinator starts
+    writeWorkspaceQueuePauseState(workspaceId, true, stateDir);
+
+    const second = makeCoordinator(native, { stateDir, pollMs: 1000 });
+    await second.runTick();
+
+    // Interrupted recovery redispatch is denied while paused (still 1 submitKey from first)
+    expect(native.submitKeys.filter((k) => k === task.task_id)).toHaveLength(1);
+
+    // Unpause -> recovery redispatch is permitted
+    writeWorkspaceQueuePauseState(workspaceId, false, stateDir);
+    await second.runTick();
+    expect(native.submitKeys.filter((k) => k === task.task_id)).toHaveLength(2);
   });
 });

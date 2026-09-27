@@ -26,7 +26,7 @@ import {
   type RuntimeState,
 } from "../bridge/runtime.js";
 import { readStateDomainOwnerStatus, stateDomainOwnerFile, type StateDomainOwnerRecord } from "../bridge/state-owner.js";
-import { readBuildManifest, readReleasePointer } from "../bridge/runtime-identity.js";
+import { installationRoot, readBuildManifest, readReleasePointer } from "../bridge/runtime-identity.js";
 import type { TunnelStatus } from "../tunnel/provider.js";
 import type { PublicProbeResult } from "../tunnel/probe.js";
 import { Workspace } from "../workspace/manager.js";
@@ -38,7 +38,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 function cliEntry(): { cmd: string; args: string[] } {
   // A verified last-known-good release outranks mutable dev output: a source
   // edit can never put unverified code into production until it is activated.
-  const projectRoot = path.resolve(__dirname, "..", "..");
+  const projectRoot = installationRoot();
   const pointer = readReleasePointer(projectRoot);
   if (pointer) {
     const releaseRoot = path.join(projectRoot, "releases");
@@ -126,6 +126,7 @@ export type SharedBridgeObservation =
         | "runtime_unreadable"
         | "runtime_changed"
         | "active_owner_conflict"
+        | "owner_runtime_unhealthy"
         | "admin_proof_unavailable"
         | "unauthorized_workspace";
       conflictOwner?: StateDomainOwnerRecord;
@@ -199,7 +200,11 @@ async function waitForBridgeStop(runtime: RuntimeState, timeoutMs: number, probe
     );
     const health = await safeProbe(probe, runtime.port);
     const oldBridgeStillServes = health?.workspaceId === runtime.workspaceId;
-    const alive = inspector ? (inspector.list()?.some(row => row.pid === runtime.pid) ?? true) : isProcessAlive(runtime.pid);
+    // On Windows, kill(pid, 0) may report death before the process inventory
+    // stops showing the old serve generation. A restart must wait for both
+    // observations to converge or its replacement sees runtime_initializing.
+    const processes = (inspector ?? getSystemProcessInspector()).list();
+    const alive = processes === null || processes.some(row => row.pid === runtime.pid) || isProcessAlive(runtime.pid);
     if (!alive && !currentIsReplacement && !oldBridgeStillServes) return true;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -228,7 +233,7 @@ export async function findSharedBridgeObservation(
   const inspector = opts.processInspector ?? getSystemProcessInspector();
   const status = readStateDomainOwnerStatus(stateDir, inspector);
   if (status.state === "absent" || status.state === "stale") return observation;
-  const fail = (reason: "active_owner_conflict" | "admin_proof_unavailable" | "unauthorized_workspace" | "runtime_changed"): SharedBridgeObservation =>
+  const fail = (reason: "active_owner_conflict" | "owner_runtime_unhealthy" | "admin_proof_unavailable" | "unauthorized_workspace" | "runtime_changed"): SharedBridgeObservation =>
     ({ state: "unknown", runtime: null, reason });
   if (status.state !== "active") return fail("active_owner_conflict");
   const owner = status.owner;
@@ -247,7 +252,12 @@ export async function findSharedBridgeObservation(
     const ownerObservation = await findBridgeObservation(owner.workspaceId, owner.workspaceRoot, {
       ...opts, stateDir, repairRuntime: false,
     });
-    if (ownerObservation.state !== "healthy") return fail("active_owner_conflict");
+    // An active owner whose own runtime observation is unhealthy is a
+    // DIFFERENT fault from an ownership conflict: reporting the owner's
+    // actual degradation (e.g. stale_runtime) here is what makes a shared
+    // workspace's failure diagnosable instead of a misleading
+    // active_owner_conflict.
+    if (ownerObservation.state !== "healthy") return fail("owner_runtime_unhealthy");
     const runtime = ownerObservation.runtime;
     const matches = () => {
       const currentOwner = readStateDomainOwnerStatus(stateDir, inspector);
@@ -329,7 +339,7 @@ export async function ensureBridge(workspaceRoot: string, opts: EnsureBridgeOpti
   const ownerStatus = readStateDomainOwnerStatus(stateDir, opts.processInspector);
   if (ownerStatus.state === "active") {
     throw new Error(
-      `C2C state domain is already owned by workspace ${ownerStatus.owner.workspaceId}; refusing to share OAuth/runtime state. Set an explicit isolated C2C_STATE_DIR for an independent bridge.`
+      `C2C state domain is already owned by workspace ${ownerStatus.owner.workspaceId}; refusing to share OAuth/runtime state. Set an explicit isolated A2C_STATE_DIR for an independent bridge.`
     );
   }
   if (ownerStatus.state === "unknown") {
@@ -356,7 +366,7 @@ export async function ensureBridge(workspaceRoot: string, opts: EnsureBridgeOpti
       detached: true,
       windowsHide: true,
       stdio: ["ignore", out, out],
-      env: { ...process.env, C2C_STATE_DIR: stateDir, C2C_RESTART_HELPER: undefined },
+      env: { ...process.env, A2C_STATE_DIR: stateDir, C2C_STATE_DIR: stateDir, A2C_RESTART_HELPER: undefined, C2C_RESTART_HELPER: undefined },
     }
   );
   child.unref();

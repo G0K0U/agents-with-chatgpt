@@ -1,0 +1,9 @@
+# 供应链：锁定到实测可用版本（升级请先跑全套测试）
+pillow==12.3.0
+pywebview==6.2.1
+customtkinter==6.0.0 ; sys_platform == "win32"
+pywinstyles==1.8 ; sys_platform == "win32"
+pystray==0.19.5 ; sys_platform == "win32"
+rumps>=0.4 ; sys_platform == "darwin"
+
+pyobjc-framework-Security==12.2.2 ; sys_platform == "darwin"

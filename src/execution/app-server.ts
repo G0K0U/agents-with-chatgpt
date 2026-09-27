@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 import type { Logger } from "../logger/index.js";
+import { getDefaultStateDir } from "../config/paths.js";
 import { VERSION } from "../version.js";
 
 /**
@@ -32,8 +33,24 @@ export interface CodexExecutableResolutionOptions {
   arch?: string;
   execPath?: string;
   modulePath?: string;
+  stateDir?: string;
   /** Test seam for checking exact, bounded candidates without scanning. */
   isFile?: (candidate: string) => boolean;
+}
+
+export function readPersistedCodexExecutable(stateDir?: string): string | null {
+  try {
+    const dir = stateDir ?? getDefaultStateDir();
+    const file = path.join(dir, "codex-runtime.json");
+    if (!fs.existsSync(file)) return null;
+    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (typeof data?.executable === "string" && data.executable.trim()) {
+      return data.executable.trim();
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function isRegularFile(candidate: string): boolean {
@@ -75,9 +92,15 @@ export function resolveCodexExecutable(options: CodexExecutableResolutionOptions
   const modulePath = options.modulePath ?? fileURLToPath(import.meta.url);
   const isFile = options.isFile ?? isRegularFile;
   const pathApi = platform === "win32" ? path.win32 : path.posix;
-  const override = env.C2C_CODEX_EXECUTABLE;
+  const envOverride = env.C2C_CODEX_EXECUTABLE ?? env.A2C_CODEX_EXECUTABLE;
+  const persisted = options.stateDir
+    ? readPersistedCodexExecutable(options.stateDir)
+    : options.env
+      ? (options.env.C2C_STATE_DIR || options.env.A2C_STATE_DIR ? readPersistedCodexExecutable(options.env.C2C_STATE_DIR ?? options.env.A2C_STATE_DIR) : null)
+      : readPersistedCodexExecutable();
+  const override = envOverride !== undefined ? envOverride : persisted;
 
-  if (override !== undefined) {
+  if (override !== undefined && override !== null) {
     if (!override || !pathApi.isAbsolute(override) || !isFile(override)) {
       throw new CodexExecutableResolutionError(
         "CODEX_EXECUTABLE_OVERRIDE_INVALID",
@@ -221,6 +244,8 @@ export interface AppServerClient {
 export interface AppServerFactoryOptions {
   workspaceRoot: string;
   logger: Logger;
+  /** Bridge state that owns the persistent Codex runtime selection. */
+  stateDir?: string;
   /** Bridge-owned child-process environment; never populated from task input. */
   env?: NodeJS.ProcessEnv;
   /** Explicit local filesystem/process deployment mode selected by the local bridge supervisor. */
@@ -256,6 +281,10 @@ function asError(value: unknown): Error {
 
 /** Build the fixed C2C App Server argv without accepting caller-supplied CLI text. */
 export function codexAppServerArgs(opts: AppServerFactoryOptions): string[] {
+  // Bridge-owned defaults are fixed for every launch, independent of caller
+  // options. Model/effort are never pinned here: every task passes its
+  // catalog-confirmed selection explicitly on thread/start and turn/start, so
+  // the user's global ~/.codex/config.toml default cannot leak into a task.
   const args: string[] = [...CODEX_ARGS];
   // Full filesystem/process access does not implicitly enable network access.
   // Keep the fixed MCP surface offline unless the task explicitly opted in
@@ -281,6 +310,8 @@ export class CodexAppServerClient implements AppServerClient {
   private nextId = 1;
   private closed = false;
   private terminalError: Error | null = null;
+  /** Raw `initialize` response (userAgent etc.), kept for catalog provenance. */
+  initializeResult: Record<string, unknown> | null = null;
   private notificationHandler: ((notification: AppServerNotification) => void | Promise<void>) | null = null;
   private requestHandler: ((request: AppServerRequest) => void | Promise<void>) | null = null;
 
@@ -298,7 +329,7 @@ export class CodexAppServerClient implements AppServerClient {
     if (this.opts.fullAccess === true && this.opts.networkAccess !== true) {
       throw new Error("NETWORK_POLICY_UNSUPPORTED: Codex full-access execution cannot enforce network=false; no provider was launched");
     }
-    const executable = (this.launcher.resolveExecutable ?? resolveCodexExecutable)();
+    const executable = (this.launcher.resolveExecutable ?? (() => resolveCodexExecutable({ env: this.opts.env, stateDir: this.opts.stateDir })))();
     let child: ChildProcessWithoutNullStreams;
     try {
       child = (this.launcher.spawn ?? spawn)(executable, codexAppServerArgs(this.opts), {
@@ -325,7 +356,7 @@ export class CodexAppServerClient implements AppServerClient {
     });
 
     try {
-      await this.request(
+      this.initializeResult = await this.request<Record<string, unknown>>(
         "initialize",
         {
           clientInfo: {

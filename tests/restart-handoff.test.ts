@@ -143,7 +143,7 @@ describe("detached restart handoff (offline)", () => {
     await abandoned(stage === "requested" ? { state: stage, helper: null } : {});
     const fixture = path.join(base, "reclaim-contender.mjs"), starts = path.join(base, "launches");
     const ready = [path.join(base, "ready-0"), path.join(base, "ready-1")];
-    const moduleUrl = pathToFileURL(path.resolve("dist/process/restart.js")).href;
+    const moduleUrl = pathToFileURL(path.resolve("src/process/restart.ts")).href;
     fs.writeFileSync(fixture, `import fs from 'node:fs'; import { requestRestart } from ${JSON.stringify(moduleUrl)};
       const ready = ${JSON.stringify(ready)}, old = ${JSON.stringify(old)};
       let first = true;
@@ -160,7 +160,7 @@ describe("detached restart handoff (offline)", () => {
         processIdentity: pid => pid === old.pid ? 'same' : 'gone', processStart: () => 'fixture',
         launch: async id => fs.appendFileSync(${JSON.stringify(starts)}, id + '\\n')
       }); } catch (error) { fs.writeFileSync(ready[Number(process.argv[2])] + '.error', String(error.message)); process.exitCode = 2; }`);
-    const children = [0, 1].map(index => spawn(process.execPath, [fixture, String(index)], { windowsHide: true, stdio: "ignore" }));
+    const children = [0, 1].map(index => spawn(process.execPath, ["--import", "tsx", fixture, String(index)], { windowsHide: true, stdio: "ignore" }));
     const results = await Promise.all(children.map(child => new Promise<number | null>((resolve, reject) => {
       child.once("exit", resolve); child.once("error", reject);
     })));
@@ -340,6 +340,14 @@ describe("detached restart handoff (offline)", () => {
     await expect(waitRestartHandoff(record.id, state, 100)).rejects.toThrow(/helper failed/);
     expect(JSON.stringify(readRestartHandoff(state))).not.toMatch(/Bearer|SECRET|raw upstream/);
   });
+  it("records a classified start failure without persisting exception content", async () => {
+    deps.ensure = vi.fn(async () => { throw new Error("Bridge state is uncertain (owner_runtime_unhealthy); Bearer SECRET-ADMIN"); }) as never;
+    const record = await request();
+    const failed = await runRestartHelper(record.id, state, deps);
+    expect(failed).toMatchObject({ state: "failed", error: "START_FAILED", failureDetail: "bridge_state_uncertain:owner_runtime_unhealthy" });
+    await expect(waitRestartHandoff(record.id, state, 100)).rejects.toThrow(/bridge_state_uncertain:owner_runtime_unhealthy/);
+    expect(JSON.stringify(readRestartHandoff(state))).not.toMatch(/Bearer|SECRET/);
+  });
   it("rejects ambiguous state and tunnel selection before shutdown", async () => {
     await expect(request(true)).rejects.toThrow();
     deps.observe = vi.fn(async () => { throw new Error("ambiguous owner"); });
@@ -435,4 +443,46 @@ describe("detached restart handoff (offline)", () => {
     await vi.waitFor(() => expect(readRestartHandoff(state).state).toBe("complete"), { timeout: 10_000 });
     expect(fs.readFileSync(countFile, "utf8")).toBe("start\n");
   }, 15_000);
+
+  it("safely rejects task-descendant self-restart before stopping bridge (env-fenced)", async () => {
+    vi.stubEnv("C2C_TASK_ID", "c2c_abcdef1234");
+    await expect(request()).rejects.toThrow(/Task-descendant self-restart forbidden/);
+    expect(deps.launch).not.toHaveBeenCalled();
+    expect(deps.stop).not.toHaveBeenCalled();
+    expect(fs.existsSync(lockDir())).toBe(false);
+    expect(fs.existsSync(handoffFile())).toBe(false);
+  });
+
+  it("safely rejects task-descendant self-restart before stopping bridge (ancestry-fenced)", async () => {
+    deps.isTaskDescendant = vi.fn(() => true);
+    await expect(request()).rejects.toThrow(/Task-descendant self-restart forbidden/);
+    expect(deps.launch).not.toHaveBeenCalled();
+    expect(deps.stop).not.toHaveBeenCalled();
+    expect(fs.existsSync(lockDir())).toBe(false);
+    expect(fs.existsSync(handoffFile())).toBe(false);
+  });
+
+  it("isTaskDescendant fails closed on null process inventory (inspection unavailable)", async () => {
+    const { isTaskDescendant } = await import("../src/process/restart.js");
+    const nullInspector = { list: () => null };
+    // Null inventory must return true (fail closed), not false (fail open)
+    expect(isTaskDescendant(1234, 5678, nullInspector)).toBe(true);
+  });
+
+  it("isTaskDescendant fails closed when inspection throws", async () => {
+    const { isTaskDescendant } = await import("../src/process/restart.js");
+    const throwingInspector = { list: () => { throw new Error("inspection failed"); } };
+    // Exception must return true (fail closed), not false (fail open)
+    expect(isTaskDescendant(1234, 5678, throwingInspector)).toBe(true);
+  });
+
+  it("isTaskDescendant returns false only with a successful inventory proving non-ancestry", async () => {
+    const { isTaskDescendant } = await import("../src/process/restart.js");
+    // An inventory that positively shows no ancestry chain should return false
+    const safeInspector = { list: () => [
+      { pid: 1234, parentPid: 9999 },
+      { pid: 9999, parentPid: 1 },
+    ] as ReadonlyArray<{ pid: number; parentPid?: number }> };
+    expect(isTaskDescendant(1234, 5678, safeInspector)).toBe(false);
+  });
 });

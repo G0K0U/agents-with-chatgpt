@@ -25,10 +25,30 @@ const recordSchema = z.object({ version: z.literal(1), id: uuid, workspaceId: z.
   tunnel: z.boolean(), tunnelFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   state: z.enum(["requested", "stopping", "starting", "tunnel", "complete", "failed"]),
   error: z.enum(["LAUNCH_FAILED", "VALIDATION_FAILED", "STOP_FAILED", "START_FAILED", "TUNNEL_FAILED"]).nullable(),
+  failureDetail: z.string().max(100).nullable().default(null),
   replacement: identity.nullable(), tunnelReady: z.boolean(),
 }).strict();
 export type RestartHandoff = z.infer<typeof recordSchema>;
 type Identity = z.infer<typeof identity>;
+
+/** Persist only known control-plane error classes, never raw exception text. */
+function failureDetail(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  const uncertain = /^Bridge state is uncertain \(([a-z_]+)\)/.exec(message);
+  if (uncertain) return `bridge_state_uncertain:${uncertain[1]}`;
+  const owner = /^C2C state-domain ownership is uncertain \(([a-z_]+)\)/.exec(message);
+  if (owner) return `state_domain_uncertain:${owner[1]}`;
+  if (message.startsWith("C2C state domain is already owned")) return "state_domain_active";
+  if (message.startsWith("A bridge for workspace") && message.includes("already listening")) return "old_listener_present";
+  if (message.startsWith("Bridge did not become healthy within 20s")) return "bridge_start_timeout";
+  const exit = /^Bridge process exited with code (\d+)/.exec(message);
+  if (exit) return `bridge_process_exit:${exit[1]}`;
+  if (message.startsWith("Ambiguous restart runtime ownership")) return "ambiguous_restart_owner";
+  if (message.startsWith("Replacement identity changed")) return "replacement_identity_changed";
+  if (message.startsWith("Old runtime did not stop")) return "old_runtime_did_not_stop";
+  if (message.startsWith("Restart handoff changed or expired")) return "handoff_changed_or_expired";
+  return "unclassified_control_error";
+}
 
 function equalPath(a: string, b: string): boolean {
   return process.platform === "win32" || process.platform === "darwin" ? a.toLowerCase() === b.toLowerCase() : a === b;
@@ -239,7 +259,7 @@ export function restartLaunchSpec(id: string, stateDir: string) {
   const entry = fs.existsSync(sibling) ? sibling : fileURLToPath(new URL("../../dist/process/restart-helper.js", import.meta.url));
   const stat = fs.lstatSync(entry);
   if (!stat.isFile() || stat.isSymbolicLink() || !equalPath(fs.realpathSync.native(entry), entry)) throw new Error("Build the trusted restart helper before restarting");
-  const env = { ...process.env, C2C_STATE_DIR: stateDir, C2C_RESTART_HELPER: "1" };
+  const env = { ...process.env, A2C_STATE_DIR: stateDir, C2C_STATE_DIR: stateDir, A2C_RESTART_HELPER: "1", C2C_RESTART_HELPER: "1" };
   // Loader hooks and shell startup settings cannot select a different helper implementation.
   delete (env as NodeJS.ProcessEnv).NODE_OPTIONS;
   delete (env as NodeJS.ProcessEnv).NODE_PATH;
@@ -265,12 +285,41 @@ async function tunnel(runtime: RuntimeState): Promise<boolean> {
       (state.preference === "quick" && !/^[a-z0-9-]+\.trycloudflare\.com$/.test(url.hostname))) return false;
   return (await probePublicMcp(result.url)).ok;
 }
+export function isTaskDescendant(
+  currentPid: number,
+  bridgePid: number,
+  inspector: { list: () => ReadonlyArray<{ pid: number; parentPid?: number }> | null } = getSystemProcessInspector()
+): boolean {
+  if (currentPid === bridgePid) return true;
+  try {
+    const rows = inspector.list();
+    // Null inventory means inspection failed — fail closed: unknown ancestry
+    // must refuse restart, never authorize it. Only a successful inventory
+    // that positively proves non-ancestry may return false.
+    if (!rows) return true;
+    let curr = currentPid;
+    const visited = new Set<number>();
+    while (curr && !visited.has(curr)) {
+      visited.add(curr);
+      const row = rows.find((r) => r.pid === curr);
+      if (!row || !row.parentPid) break;
+      if (row.parentPid === bridgePid) return true;
+      curr = row.parentPid;
+    }
+  } catch {
+    // Inspection failures must not authorize recovery — fail closed
+    return true;
+  }
+  return false;
+}
+
 /** Dependency seam only for local tests; hidden entry exposes no dependency arguments. */
 export interface RestartDeps {
   observe: typeof observe; processStart: typeof processStart; launch: typeof launch;
   stop: typeof stopBridge; ensure: typeof ensureBridge; tunnel: typeof tunnel;
   resolveTarget?: typeof resolveRestartTarget;
   processIdentity?: typeof inspectRestartProcessIdentity;
+  isTaskDescendant?: (currentPid: number, bridgePid: number) => boolean;
 }
 /** Shared restart affects all authorized workspaces and relaunches the actual
  * owner root. The requesting workspace is authorization context, never owner. */
@@ -279,10 +328,18 @@ export async function resolveRestartTarget(root: string, stateDir: string, opts:
   if (observation.state !== "healthy") throw new Error("Ambiguous restart runtime ownership");
   return observation;
 }
-const production: RestartDeps = { observe, processStart, processIdentity: inspectRestartProcessIdentity, launch, stop: stopBridge, ensure: ensureBridge, tunnel, resolveTarget: resolveRestartTarget };
+const production: RestartDeps = { observe, processStart, processIdentity: inspectRestartProcessIdentity, launch, stop: stopBridge, ensure: ensureBridge, tunnel, resolveTarget: resolveRestartTarget, isTaskDescendant };
 
 export async function requestRestart(workspaceRoot: string, opts: { stateDir?: string; tunnel: boolean }, deps: RestartDeps = production): Promise<RestartHandoff> {
-  if (process.env.C2C_RESTART_HELPER === "1") throw new Error("Recursive restart forbidden");
+  if (process.env.A2C_RESTART_HELPER === "1" || process.env.C2C_RESTART_HELPER === "1") throw new Error("Recursive restart forbidden");
+  if (
+    process.env.A2C_TASK_ID ||
+    process.env.C2C_TASK_ID ||
+    process.env.A2C_TASK_EXECUTION ||
+    process.env.C2C_TASK_EXECUTION
+  ) {
+    throw new Error("Task-descendant self-restart forbidden; bridge was not stopped");
+  }
   const requestedRoot = canonicalizeWorkspaceRoot(workspaceRoot);
   const stateDir = getStateDir(opts.stateDir);
   const target = await deps.resolveTarget?.(requestedRoot, stateDir);
@@ -311,6 +368,10 @@ export async function requestRestart(workspaceRoot: string, opts: { stateDir?: s
   let record: RestartHandoff | undefined;
   try {
     const old = await deps.observe(root, stateDir);
+    const descendantCheck = deps.isTaskDescendant ?? isTaskDescendant;
+    if (descendantCheck(process.pid, old.pid)) {
+      throw new Error("Task-descendant self-restart forbidden; bridge was not stopped");
+    }
     if (target && (old.pid !== target.runtime.pid || old.port !== target.runtime.port ||
         old.startedAt !== target.runtime.startedAt || old.stateDomainGeneration !== target.runtime.stateDomainGeneration ||
         (target.shared && old.processStartIdentity !== target.owner?.processStartIdentity))) throw new Error("Restart owner changed");
@@ -319,19 +380,20 @@ export async function requestRestart(workspaceRoot: string, opts: { stateDir?: s
       ...(target?.shared ? { requestedWorkspace: { id: stableWorkspaceId(requestedRoot), root: requestedRoot } } : {}),
       createdAt, expiresAt: createdAt + TTL, old, helper: null, tunnel: opts.tunnel,
       tunnelFingerprint: tunnelFingerprint(stableWorkspaceId(root), stateDir, opts.tunnel),
-      state: "requested", error: null, replacement: null, tunnelReady: false };
+      state: "requested", error: null, failureDetail: null, replacement: null, tunnelReady: false };
     validateLock(record);
     save(record);
     // Nothing after launch is required for correctness. The helper claims and updates its own record.
     await deps.launch(record.id, stateDir);
     return record;
-  } catch {
-    if (record) { record.state = "failed"; record.error = "LAUNCH_FAILED"; save(record); }
-    if (fs.readFileSync(path.join(lock, "handoff-id"), "utf8") === id) {
+  } catch (error) {
+    if (record) { record.state = "failed"; record.error = "LAUNCH_FAILED"; record.failureDetail = failureDetail(error); save(record); }
+    if (fs.existsSync(path.join(lock, "handoff-id")) && fs.readFileSync(path.join(lock, "handoff-id"), "utf8") === id) {
       // Before publication there is no record to validate against.
       fs.unlinkSync(path.join(lock, "handoff-id"));
       fs.rmdirSync(lock);
     }
+    if ((error as Error)?.message?.includes("Task-descendant")) throw error;
     throw new Error("Restart handoff validation or launch failed; bridge was not stopped");
   }
 }
@@ -396,8 +458,8 @@ export async function runRestartHelper(id: string, stateDir: string, deps: Resta
     assertFresh();
     if (JSON.stringify(await deps.observe(record.workspaceRoot, stateDir)) !== JSON.stringify(record.replacement)) throw new Error("Replacement changed before completion");
     record.state = "complete"; save(record);
-  } catch {
-    record.state = "failed"; record.error = stage; save(record);
+  } catch (error) {
+    record.state = "failed"; record.error = stage; record.failureDetail = failureDetail(error); save(record);
   } finally {
     // Recovery cannot replace a lock while this helper's identity remains live.
     releaseLock(record);
@@ -411,7 +473,7 @@ export async function waitRestartHandoff(id: string, stateDir: string, timeoutMs
   do {
     const record = readRestartHandoff(stateDir);
     if (record.id !== id) throw new Error("Restart handoff superseded");
-    if (record.state === "failed") throw new Error(`Restart helper failed: ${record.error}`);
+    if (record.state === "failed") throw new Error(`Restart helper failed: ${record.error} (${record.failureDetail})`);
     if (record.state === "complete") return record;
     if (Date.now() > record.expiresAt) throw new Error("Restart handoff expired");
     await new Promise(resolve => setTimeout(resolve, 100));

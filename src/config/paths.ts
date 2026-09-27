@@ -95,7 +95,10 @@ export function packagedStateDirCandidates(
 
 /** Resolve an explicit state directory, the process environment, or the OS default. */
 export function resolveStateDir(explicit?: string): string {
-  const supplied = explicit?.trim() || process.env.C2C_STATE_DIR?.trim();
+  // Legacy compatibility identifier: C2C_STATE_DIR remains the single state-dir
+// variable (renaming it would orphan live deployments and split writer/reader
+// namespaces). Documented in docs/architecture.md; NOT dual-named.
+const supplied = explicit?.trim() || process.env.C2C_STATE_DIR?.trim();
   return path.resolve(supplied || getDefaultStateDir());
 }
 

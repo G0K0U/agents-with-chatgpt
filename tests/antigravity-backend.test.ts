@@ -425,8 +425,8 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
     expect(result.error?.code).toBe("INVALID_MODEL");
   });
 
-  // 18. total MCP tools remain exactly 14
-  it("18. existing MCP tool count remains exactly 14 tools", () => {
+  // The complete public inventory is asserted by mcp-integration.test.ts.
+  it("18. creates the MCP server with restricted execution", () => {
     const server = createMcpServer({
       workspace,
       workspaces: [workspace],
@@ -473,15 +473,26 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
     })).toThrowError(/is not in the Antigravity allowlist/);
   });
 
-  // 22. model parameter rejected when provider=codex
-  it("22. model parameter rejected when provider=codex", () => {
+  // 22. codex model accepts bounded protocol ids and rejects unbounded ones
+  it("22. codex model accepts a bounded protocol id; unbounded shapes are rejected", () => {
+    // With dynamic model routing, codex tasks take a bounded model id that is
+    // validated against the live account catalog before dispatch (model-catalog
+    // tests); admission only enforces the identifier grammar now.
+    const accepted = validateCodexTask(workspace, {
+      workspace_id: workspace.id,
+      instruction: "Model on codex test",
+      write_scope: ["src"],
+      provider: "codex",
+      model: "gpt-6-astra",
+    });
+    expect(accepted.model).toBe("gpt-6-astra");
     expect(() => validateCodexTask(workspace, {
       workspace_id: workspace.id,
       instruction: "Model on codex test",
       write_scope: ["src"],
       provider: "codex",
-      model: "claude-sonnet-4-6",
-    })).toThrowError(/model parameter is only supported for provider 'gemini'/);
+      model: "claude-sonnet-4-6; rm -rf /",
+    })).toThrowError(/model must match/);
   });
 
   // 23. session continuation inherits pinned model when omitted

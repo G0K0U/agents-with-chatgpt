@@ -1,0 +1,232 @@
+{
+  "format": "Quanta dependency inventory v1",
+  "python": "3.12.14",
+  "scope": "Installed runtime and build packages; pip/setuptools excluded as build installers",
+  "components": [
+    {
+      "name": "altgraph",
+      "version": "0.17.5",
+      "package_url": "pkg:pypi/altgraph@0.17.5",
+      "homepage": "https://altgraph.readthedocs.io",
+      "license_files": [
+        "docs/licenses/altgraph-0.17.5/altgraph-0.17.5.dist-info/LICENSE"
+      ]
+    },
+    {
+      "name": "bottle",
+      "version": "0.13.4",
+      "package_url": "pkg:pypi/bottle@0.13.4",
+      "homepage": "http://bottlepy.org/",
+      "license_files": [
+        "docs/licenses/bottle-0.13.4/bottle-0.13.4.dist-info/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "cffi",
+      "version": "2.1.1",
+      "package_url": "pkg:pypi/cffi@2.1.1",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/cffi-2.1.1/cffi-2.1.1.dist-info/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "clr_loader",
+      "version": "0.3.1",
+      "package_url": "pkg:pypi/clr-loader@0.3.1",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/clr_loader-0.3.1/clr_loader-0.3.1.dist-info/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "customtkinter",
+      "version": "6.0.0",
+      "package_url": "pkg:pypi/customtkinter@6.0.0",
+      "homepage": "https://customtkinter.tomschimansky.com",
+      "license_files": [
+        "docs/licenses/customtkinter-6.0.0/customtkinter-6.0.0.dist-info/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "darkdetect",
+      "version": "0.8.0",
+      "package_url": "pkg:pypi/darkdetect@0.8.0",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/darkdetect-0.8.0/darkdetect-0.8.0.dist-info/LICENSE"
+      ]
+    },
+    {
+      "name": "packaging",
+      "version": "26.3",
+      "package_url": "pkg:pypi/packaging@26.3",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/packaging-26.3/packaging-26.3.dist-info/licenses/LICENSE",
+        "docs/licenses/packaging-26.3/packaging-26.3.dist-info/licenses/LICENSE.APACHE",
+        "docs/licenses/packaging-26.3/packaging-26.3.dist-info/licenses/LICENSE.BSD"
+      ]
+    },
+    {
+      "name": "pefile",
+      "version": "2024.8.26",
+      "package_url": "pkg:pypi/pefile@2024.8.26",
+      "homepage": "https://github.com/erocarrera/pefile",
+      "license_files": [
+        "docs/licenses/pefile-2024.8.26/pefile-2024.8.26.dist-info/LICENSE"
+      ]
+    },
+    {
+      "name": "pillow",
+      "version": "12.3.0",
+      "package_url": "pkg:pypi/pillow@12.3.0",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/pillow-12.3.0/pillow-12.3.0.dist-info/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "proxy_tools",
+      "version": "0.1.0",
+      "package_url": "pkg:pypi/proxy-tools@0.1.0",
+      "homepage": "http://github.com/jtushman/proxy_tools",
+      "license_files": [
+        "docs/licenses/proxy_tools-0.1.0/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "pycparser",
+      "version": "3.0",
+      "package_url": "pkg:pypi/pycparser@3.0",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/pycparser-3.0/pycparser-3.0.dist-info/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "pyinstaller",
+      "version": "6.22.2",
+      "package_url": "pkg:pypi/pyinstaller@6.22.2",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/pyinstaller-6.22.2/pyinstaller-6.22.2.dist-info/licenses/COPYING.txt"
+      ]
+    },
+    {
+      "name": "pyinstaller-hooks-contrib",
+      "version": "2026.7",
+      "package_url": "pkg:pypi/pyinstaller-hooks-contrib@2026.7",
+      "homepage": "https://github.com/pyinstaller/pyinstaller-hooks-contrib",
+      "license_files": [
+        "docs/licenses/pyinstaller-hooks-contrib-2026.7/pyinstaller_hooks_contrib-2026.7.dist-info/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "pystray",
+      "version": "0.19.5",
+      "package_url": "pkg:pypi/pystray@0.19.5",
+      "homepage": "https://github.com/moses-palmer/pystray",
+      "license_files": [
+        "docs/licenses/pystray-0.19.5/pystray-0.19.5.dist-info/COPYING",
+        "docs/licenses/pystray-0.19.5/pystray-0.19.5.dist-info/COPYING.LGPL"
+      ]
+    },
+    {
+      "name": "pythonnet",
+      "version": "3.1.0",
+      "package_url": "pkg:pypi/pythonnet@3.1.0",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/pythonnet-3.1.0/pythonnet-3.1.0.dist-info/licenses/AUTHORS.md",
+        "docs/licenses/pythonnet-3.1.0/pythonnet-3.1.0.dist-info/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "pywebview",
+      "version": "6.2.1",
+      "package_url": "pkg:pypi/pywebview@6.2.1",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/pywebview-6.2.1/pywebview-6.2.1.dist-info/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "pywin32-ctypes",
+      "version": "0.2.3",
+      "package_url": "pkg:pypi/pywin32-ctypes@0.2.3",
+      "homepage": "https://github.com/enthought/pywin32-ctypes",
+      "license_files": [
+        "docs/licenses/pywin32-ctypes-0.2.3/pywin32_ctypes-0.2.3.dist-info/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "pywinstyles",
+      "version": "1.8",
+      "package_url": "pkg:pypi/pywinstyles@1.8",
+      "homepage": "https://github.com/Akascape/py-window-styles",
+      "license_files": [
+        "docs/licenses/pywinstyles-1.8/pywinstyles-1.8.dist-info/LICENSE"
+      ]
+    },
+    {
+      "name": "six",
+      "version": "1.17.0",
+      "package_url": "pkg:pypi/six@1.17.0",
+      "homepage": "https://github.com/benjaminp/six",
+      "license_files": [
+        "docs/licenses/six-1.17.0/six-1.17.0.dist-info/LICENSE"
+      ]
+    },
+    {
+      "name": "typing_extensions",
+      "version": "4.16.0",
+      "package_url": "pkg:pypi/typing-extensions@4.16.0",
+      "homepage": "",
+      "license_files": [
+        "docs/licenses/typing_extensions-4.16.0/typing_extensions-4.16.0.dist-info/licenses/LICENSE"
+      ]
+    }
+  ],
+  "license_file_hashes": {
+    "docs/licenses/altgraph-0.17.5/altgraph-0.17.5.dist-info/LICENSE": "6c194d6db0c64d45535d10c95142b9b0cda7b7dcc7f1ddee302b3d536f3dbe46",
+    "docs/licenses/bottle-0.13.4/bottle-0.13.4.dist-info/licenses/LICENSE": "af150257b1f7cce92b6207854f2e8f90ea9ae52d7cac758d13a47bd12e2a2443",
+    "docs/licenses/cffi-2.1.1/cffi-2.1.1.dist-info/licenses/LICENSE": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63",
+    "docs/licenses/clr_loader-0.3.1/clr_loader-0.3.1.dist-info/licenses/LICENSE": "dd6bdca10cdc3b24c6b0b6cef5fd611b7feb6917f127833283ddcdb310d3b453",
+    "docs/licenses/customtkinter-6.0.0/customtkinter-6.0.0.dist-info/licenses/LICENSE": "c973b8600e620159cb0473eb9b08783143e0d9ed5333f350fc933368d94d9e0d",
+    "docs/licenses/darkdetect-0.8.0/darkdetect-0.8.0.dist-info/LICENSE": "69bb84664eff933addcb271c866d67622d9c2c53a5bda31b1a7523569c250afe",
+    "docs/licenses/packaging-26.3/packaging-26.3.dist-info/licenses/LICENSE": "cad1ef5bd340d73e074ba614d26f7deaca5c7940c3d8c34852e65c4909686c48",
+    "docs/licenses/packaging-26.3/packaging-26.3.dist-info/licenses/LICENSE.APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+    "docs/licenses/packaging-26.3/packaging-26.3.dist-info/licenses/LICENSE.BSD": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5",
+    "docs/licenses/pefile-2024.8.26/pefile-2024.8.26.dist-info/LICENSE": "b44409c067c6da52bfb54bb6624fb11a7b52157c3a13ae1400232f8196e86ad3",
+    "docs/licenses/pillow-12.3.0/pillow-12.3.0.dist-info/licenses/LICENSE": "4f7866a74802c6326f81faff59a56546b6aec2b10b91973e0e9308de95e79857",
+    "docs/licenses/proxy_tools-0.1.0/LICENSE.txt": "00f04c2eee4110a22f9dc4315343022c8f9b7e014c441d3bf9199df23bf049ee",
+    "docs/licenses/pycparser-3.0/pycparser-3.0.dist-info/licenses/LICENSE": "0c846399369ea76ddd7b5c44fe6d16497415fcf015f5cbb508c24bf98b81c5b1",
+    "docs/licenses/pyinstaller-6.22.2/pyinstaller-6.22.2.dist-info/licenses/COPYING.txt": "dcf75fdb959db1e3b41c0f8505069d2ece781b5ec6b3d0a4d30975cfc6580245",
+    "docs/licenses/pyinstaller-hooks-contrib-2026.7/pyinstaller_hooks_contrib-2026.7.dist-info/licenses/LICENSE": "91d0baaff00773038e72c0a1fc9d5d2d38706b7a2b9c04f34296608f931b9cd0",
+    "docs/licenses/pystray-0.19.5/pystray-0.19.5.dist-info/COPYING": "1e4d0c2eb111b851de12d7b2737195b950fae3620d2a23a474ce8d46e1d2e4b6",
+    "docs/licenses/pystray-0.19.5/pystray-0.19.5.dist-info/COPYING.LGPL": "e583ee8a64cd2ae744422bf76a1295838acae3698347f3a2af07462ddfaf0d2d",
+    "docs/licenses/pystray-source/__init__.py": "c8e2b76aef6862992334eca1cc88b319b70db64dc9a391ea41c55a675c1fc20d",
+    "docs/licenses/pystray-source/_appindicator.py": "538439ba1f43967845690a6d50941407a9d19bee3915664a5e552fbcab755f36",
+    "docs/licenses/pystray-source/_base.py": "d964e3ae1f62238cdc96411491ad8b2844690523f1ac9ef68bfa2d3376f22b7e",
+    "docs/licenses/pystray-source/_darwin.py": "fdc51dfe2bbdce148dc4d111644f3b7c0a437f5ffcfb77fb5acadc36b86bea3a",
+    "docs/licenses/pystray-source/_dummy.py": "61cf5fc0f443692d9e29a6368d4b320757fb4a6a0601be5f46bcb9d06ca20f0c",
+    "docs/licenses/pystray-source/_gtk.py": "a38d619ad380bfd0dfe35ed4dcf946e2de2fe09264617fddca8088f2c5426060",
+    "docs/licenses/pystray-source/_info.py": "c7974beafe3d59822362f2b71f18d336d4a580826936e6382f2997198de32200",
+    "docs/licenses/pystray-source/_util/__init__.py": "441f5b187d0ce1a6fc1f25f26cf384835688c3763f4dfa2e1753d65737ff84c6",
+    "docs/licenses/pystray-source/_util/gtk.py": "eeaba1b86131fe48a10f1ac1af8fcf29fb57fd49ab65fb1f42ac1c8e45e359b2",
+    "docs/licenses/pystray-source/_util/notify_dbus.py": "7df75ffbc11ba85c372670501154f98c9a8a1c207d938009e3654553982f4835",
+    "docs/licenses/pystray-source/_util/win32.py": "4a3c2d0c81040632f2fb1777644ba8214d58eec1861343a8ce2ca205366d3dff",
+    "docs/licenses/pystray-source/_win32.py": "de4a968ac1cd519291fde5b13716446a8e5bd8805ab4d9e428ea2e3d66f37fb5",
+    "docs/licenses/pystray-source/_xorg.py": "01d5a1e99a9611986aa91add5dce60a30adddd01210d7bbdc4741764a1b74dda",
+    "docs/licenses/Python-LICENSE.txt": "886a0ead2d89030ee62dbff52b04e47ab91998341295bb9c56fb952b4e081c7a",
+    "docs/licenses/pythonnet-3.1.0/pythonnet-3.1.0.dist-info/licenses/AUTHORS.md": "65a13631f078bed51e9a4033dea257e57a7f23097f3003b1ce1ba1c8a9136c93",
+    "docs/licenses/pythonnet-3.1.0/pythonnet-3.1.0.dist-info/licenses/LICENSE": "e1dc3a6ff017a6800dc27a7220500f512b95fbcd996d38ebbbff85c693245369",
+    "docs/licenses/pywebview-6.2.1/pywebview-6.2.1.dist-info/licenses/LICENSE": "4a988dd3598832cd3653de20dc33cb677d0fb53ab5551c879ca31280ae653675",
+    "docs/licenses/pywin32-ctypes-0.2.3/pywin32_ctypes-0.2.3.dist-info/LICENSE.txt": "dfa83b3e2709adfcdb838d9ad55823ca674abb780e60563d9dd9544ccbf785e9",
+    "docs/licenses/pywinstyles-1.8/pywinstyles-1.8.dist-info/LICENSE": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+    "docs/licenses/six-1.17.0/six-1.17.0.dist-info/LICENSE": "4375ba20e2b9c6c4e7cad2940a628fd90e95cc3d50ee92aae755715d8ba1fbd0",
+    "docs/licenses/Tk-license.terms": "0d1e4405f6273f091732764ed89b57066be63ce64869be6c71ea337dc4f2f9b5",
+    "docs/licenses/typing_extensions-4.16.0/typing_extensions-4.16.0.dist-info/licenses/LICENSE": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf"
+  }
+}

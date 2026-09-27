@@ -8,6 +8,8 @@ export interface TunnelState {
   preference: TunnelPreference;
   askedAt?: string;
   provider?: "cloudflare-quick" | "cloudflare-named";
+  /** Explicit bridge-owned launch authorization; old named states are observe-only. */
+  management?: "managed" | "external";
   tunnelName?: string;
   tunnelId?: string;
   hostname?: string;
@@ -64,9 +66,10 @@ export function isNamedTunnelReady(state: TunnelState): boolean {
 
 export function namedTunnelBinding(
   state: TunnelState
-): { tunnelName: string; tunnelId: string; hostname: string } | null {
+): { tunnelName: string; tunnelId: string; hostname: string; management: "managed" | "external" } | null {
   if (!isNamedTunnelReady(state) || !state.tunnelName || !state.tunnelId || !state.hostname) return null;
-  return { tunnelName: state.tunnelName, tunnelId: state.tunnelId, hostname: state.hostname };
+  return { tunnelName: state.tunnelName, tunnelId: state.tunnelId, hostname: state.hostname,
+    management: state.management === "managed" ? "managed" : "external" };
 }
 
 export const TUNNEL_CHOICE_PROMPT = `连 ChatGPT 之前，有一条可选的。

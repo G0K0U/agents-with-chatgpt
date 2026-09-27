@@ -1,37 +1,29 @@
-# Platform & provider support matrix (honest state)
+# Platform and provider support matrix
 
-Verified = executed on a real machine with recorded evidence in this repo's
-test suite or acceptance notes. Anything not listed as verified is NOT_TESTED
-or PENDING, never assumed.
+This matrix describes v0.3.0 at the tested A2C source and emitted build hashes
+in the [acceptance record](release-acceptance-v0.3.0.md). Model availability can
+differ across accounts and runtimes. The current ChatGPT connector still needs
+its own read-only recheck.
 
-## Platforms
-
-| Platform | State | Evidence |
-|---|---|---|
-| Windows 11 x64 | VERIFIED (development machine: unit/integration suite green; bridge, tunnel, CLI lifecycle exercised live) | `vitest` suite 52 files / 839 tests; live acceptance notes |
+| Platform | State | Scope |
+| --- | --- | --- |
+| Windows 11 x64 | PASS locally | Clean same-machine install and deployment; Windows CI passed on Node 22 and 24. Independent Windows Sandbox/VM install is NOT_TESTED. |
 | Windows Server / LTSC | NOT_TESTED | — |
-| macOS | NOT_TESTED (code paths exist; no first-release verification) | — |
-| Linux | NOT_TESTED (CI covers typecheck/build/tests only) | — |
+| macOS | NOT_TESTED | Code paths exist. |
+| Linux | NOT_TESTED for native providers | This release's CI gate runs on Windows. |
 | Windows on ARM | NOT_TESTED | — |
 
-First release officially targets **Windows 11 x64**. Other platforms may work
-but are unclaimed until verified.
+| Provider or feature | State | Limit |
+| --- | --- | --- |
+| Codex App Server | GPT-6 Sol/max local A2C task `c2c_0358389fdaaa` completed on the tested emitted build | Requested, resolved and dispatched model/effort matched native context; final nonce was captured, and no files changed. No silent fallback. This does not certify every account or the current ChatGPT connector. |
+| Antigravity / Gemini | Source-tested | Requires installed, signed-in AGY. Earlier local Gemini results are historical; no new Gemini turn is claimed for this build. |
+| ZCode / Z2C official semantic service | Clean source build and 196/196 contract tests passed | Governed lane requires observed `builtin:zai-coding-plan / GLM-5.3-Flash / max`; earlier live native results are historical. No new GLM turn is claimed. |
+| Quanta usage telemetry | Optional; patched source and local executable tested | The [Quanta 0.9.4+a2c.1 source](../third_party/quanta/PATCH-INFO.md) supplies provider-specific sample times. Older or absent Quanta yields unknown quota; manual execution remains available subject to provider checks. |
+| GLM quota routing | Source-tested | Quanta's GLM pool does not certify every Start Plan, Coding Plan, and Desktop route as the same pool. Weekly exhaustion blocks the reported pool. |
 
-## Agent providers
-
-| Provider | State | Notes |
-|---|---|---|
-| Codex App Server (official) | VERIFIED in hermetic tests + live use | primary executor; full-access mode is an explicit local choice |
-| Antigravity / Gemini | VERIFIED (adapter + live gemini-3.8-flash-high) | offline workspace contract, identity separation, and live G7C activation verified; other models unverified; workspace granularity |
-| ZCode native (Z2C Desktop, Desktop-managed plan route) | VERIFIED on Windows 11 x64 (2026-09-12 live chain: desktop-agent proxy → Z2C → Desktop GLM session; real task execution, output retrieval, same-session resume, cancellation, and wrong-workspace/unattested-access fail-closed negatives) | still fails closed unless the operator runs the Z2C desktop-agent proxy and enables the workspace via `ZCODE_NATIVE_ALLOWED_WORKSPACES`; binding gate requires observed `builtin:zai-start-plan / GLM-5.3-Flash` |
-| ZCode scheduled queue (`zcode_*` tools) | VERIFIED in hermetic tests | disabled until `C2C_ZCODE_QUEUE_ROOT` is configured |
-| Omnigent | DEPRECATED | legacy orchestrator, not recommended; see docs/omnigent.md |
-
-## Public surface
-
-| Item | State |
-|---|---|
-| OAuth 2.1 (PKCE, DCR, refresh rotation) + 401 without token | VERIFIED (tests + live 401 challenge) |
-| Named/Quick tunnel lifecycle | VERIFIED in tests; live Quick Tunnel startup fail-closed fix verified |
-| ChatGPT client end-to-end (authenticated connector run) | PENDING_MANUAL_ACCEPTANCE — requires the operator's ChatGPT session; never claimed by CI |
-| Clean-machine install | see install/install.ps1; Windows Sandbox/VM rerun NOT_TESTED at first release |
+| Public surface | State |
+| --- | --- |
+| OAuth scopes and unauthenticated MCP 401 | PASS with an ephemeral local read-scope OAuth client; this is **local authenticated MCP acceptance**. |
+| Current ChatGPT connector client | NOT_TESTED independently; requires a call from the actual ChatGPT client. |
+| Named/Quick tunnel | Named tunnel health and unauthenticated MCP 401 passed locally; each installer configures its own endpoint. |
+| Fresh-machine installation | NOT_TESTED until an independent machine or VM is used. |

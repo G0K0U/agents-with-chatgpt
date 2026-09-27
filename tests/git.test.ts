@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import fs from "node:fs";
 import path from "node:path";
 import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
@@ -52,9 +53,49 @@ describe("gitStatus", () => {
     expect(status.unstaged.map((entry) => entry.path)).toContain("hello.txt");
     expect(status.staged.map((entry) => entry.path)).toContain("staged.txt");
     expect(status.untracked).toContain("untracked.txt");
+    expect(status.hidden).toEqual({ changes: 0, conflicts: 0 });
 
     git(repo, "reset", "staged.txt");
     git(repo, "checkout", "--", "hello.txt");
+  });
+
+  it("withholds sensitive and ignored files while counting hidden changes", () => {
+    write(repo, ".env", "SECRET=test\n");
+    write(repo, "id_rsa", "PRIVATE KEY\n");
+    write(repo, "normal.txt", "normal content\n");
+    write(repo, ".c2cignore", "custom-secret.txt\n");
+    write(repo, "custom-secret.txt", "custom private\n");
+
+    const status = gitStatus(repo);
+    expect(status.untracked).toContain("normal.txt");
+    expect(status.untracked).not.toContain(".env");
+    expect(status.untracked).not.toContain("id_rsa");
+    expect(status.untracked).not.toContain("custom-secret.txt");
+    // .env, id_rsa, custom-secret.txt are withheld
+    expect(status.hidden.changes).toBeGreaterThanOrEqual(3);
+    expect(status.hidden.conflicts).toBe(0);
+
+    // Stage a sensitive file forcefully
+    git(repo, "add", "-f", ".env");
+    const statusAfterAdd = gitStatus(repo);
+    expect(statusAfterAdd.staged.map((e) => e.path)).not.toContain(".env");
+    expect(statusAfterAdd.hidden.changes).toBeGreaterThanOrEqual(3);
+
+    git(repo, "reset", "--", ".env");
+    // Cleanup
+    try { fs.unlinkSync(path.join(repo, ".env")); } catch {}
+    try { fs.unlinkSync(path.join(repo, "id_rsa")); } catch {}
+    try { fs.unlinkSync(path.join(repo, "normal.txt")); } catch {}
+    try { fs.unlinkSync(path.join(repo, ".c2cignore")); } catch {}
+    try { fs.unlinkSync(path.join(repo, "custom-secret.txt")); } catch {}
+  });
+
+  it("accepts a WorkspaceLike object with ignoreRules", () => {
+    write(repo, "secret.key", "KEY\n");
+    const statusObj = gitStatus({ root: repo });
+    expect(statusObj.untracked).not.toContain("secret.key");
+    expect(statusObj.hidden.changes).toBeGreaterThanOrEqual(1);
+    try { fs.unlinkSync(path.join(repo, "secret.key")); } catch {}
   });
 });
 

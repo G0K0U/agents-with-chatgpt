@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir } from "../config/paths.js";
+import { sharedEnv } from "../config/env.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 const LEVELS: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -12,7 +13,7 @@ const REDACT_PATTERNS: RegExp[] = [
   /c2c_(?:at|rt|ac|admin)_[A-Za-z0-9_-]+/g,
   /(authorization"?\s*[:=]\s*"?bearer\s+)[^\s"']+/gi,
   /((?:access_token|refresh_token|client_secret|code_verifier|code|token)"?\s*[:=]\s*"?)[A-Za-z0-9._~+/-]{16,}/gi,
-  /\b[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\b/g, // pairing-code shaped strings
+  /(?<!-)\b[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\b(?!-)/g, // pairing-code shaped strings
 ];
 
 export function redact(input: string): string {
@@ -39,7 +40,7 @@ export class Logger {
 
   constructor(opts: LoggerOptions = {}) {
     this.name = opts.name ?? "c2c";
-    this.level = LEVELS[opts.level ?? (process.env.C2C_LOG_LEVEL as LogLevel) ?? "info"] ?? LEVELS.info;
+    this.level = LEVELS[opts.level ?? (sharedEnv("LOG_LEVEL") as LogLevel) ?? "info"] ?? LEVELS.info;
     this.useConsole = opts.console ?? false;
     if (opts.file === undefined) {
       const dir = ensureDir(path.join(getStateDir(opts.stateDir), "logs"));

@@ -154,7 +154,11 @@ interface RouteCandidate {
   profileScore: number;
 }
 
-const ELIGIBILITY_ORDER: PoolHealth[] = ["healthy", "moderate", "low"];
+// R1: pools with UNKNOWN quota telemetry are ELIGIBLE (ranked last) when the
+// provider itself is available. Unknown telemetry ≠ exhausted: real lanes
+// (codex/gemini/glm) were proven executable while their percentages read
+// "unknown". Only KNOWN-bad health (critical/exhausted/unavailable) blocks.
+const ELIGIBILITY_ORDER: PoolHealth[] = ["healthy", "moderate", "low", "unknown"];
 const ELIGIBILITY_RANK: Record<string, number> = { healthy: 0, moderate: 1, low: 2, unknown: 3 };
 
 function isEligibleHealth(health: PoolHealth): boolean {
@@ -189,6 +193,28 @@ export function evaluateRoute(
   telemetry: QuantaTelemetryReport,
   req: AgentRouteRequest
 ): AgentRouteDecision {
+  if (!telemetry.quanta_available) {
+    return {
+      decision: "blocked",
+      recommended_provider: null,
+      recommended_model: null,
+      quota_pool_id: null,
+      estimated_pool_health: "unknown",
+      fallback: null,
+      reasoning: "Quanta telemetry is unavailable; quota unknown for every pool. Check provider availability separately before routing.",
+      blocked_reason: "quota_telemetry_unavailable",
+      quota_context: {
+        codex_5h_remaining_percent: null,
+        codex_weekly_remaining_percent: null,
+        antigravity_gemini_5h_remaining_percent: null,
+        antigravity_gemini_weekly_remaining_percent: null,
+        antigravity_claude_gpt_shared_5h_remaining_percent: null,
+        antigravity_claude_gpt_shared_weekly_remaining_percent: null,
+        glm_5h_remaining_percent: null,
+        glm_weekly_remaining_percent: null,
+      },
+    };
+  }
   const taskType = req.task_type;
   const riskLevel = req.risk_level ?? "low";
   const preferred = req.preferred_provider;
@@ -279,7 +305,7 @@ export function evaluateRoute(
       quota_pool_id: null,
       estimated_pool_health: candidates.every(c => c.health === "unavailable") ? "unavailable" : candidates.some(c => c.health === "critical" || c.health === "exhausted") ? "critical" : "unknown",
       fallback: null,
-      reasoning: "No quota pool is currently eligible. Pool states: " + poolStates + ". Defer the task or wait for a quota window reset; no forced recommendation is made.",
+      reasoning: "No pool is currently eligible (all critical/exhausted/unavailable, or no provider available). Pool states: " + poolStates + ".",
       blocked_reason: "all_pools_ineligible: " + poolStates,
       quota_context: quotaContext,
     };
@@ -333,16 +359,16 @@ export function evaluateRoute(
   const glmVerdict =
     glmRaw?.status === "unavailable"
       ? "unavailable; quota exhaustion is not established"
-      : glm5h && glm5h.status === "known" && glm5h.remaining_percent === 0
+      : glmInfo.health === "exhausted"
         ? "exhausted only for this observed unattributed route"
-        : glm5h && glm5h.status === "known" && typeof glm5h.remaining_percent === "number"
+        : glmInfo.health !== "unknown" && glmInfo.health !== "unavailable"
           ? "known headroom on the observed unattributed route"
           : "unknown";
   const glmNote =
     "[Note: Generic Quanta GLM route: " + glmVerdict + ". Observed window telemetry: " +
     "5h=" + fmtWindow(glm5h) + ", weekly=" + fmtWindow(glmRaw?.weekly_window) +
     "; connection_mode and quota_pool: UNATTRIBUTED. Outside that window, native ZCode " +
-    "Connection mode = Desktop-managed builtin:zai-start-plan with GLM-5.3-Flash " +
+    "Connection mode = Desktop-managed GLM (required identity per compatibility manifest) " +
     "(observed 2026-09-12 through the live desktop-agent chain; quota evidence for this route " +
     "remains separate). This observation covers only this route and " +
     "does not establish exhaustion of all GLM pipelines.]";
@@ -351,6 +377,9 @@ export function evaluateRoute(
     (preferred ? "Caller preferred " + preferred + ". " : "") +
     "Selected " + primary.provider + " (" + primary.model + ") on pool " + primary.poolId +
     " with health " + primary.health + " (limiting window " + describeRemaining(primary.effectiveRemaining) + " remaining). " +
+    (primary.health === "unknown"
+      ? "Quota telemetry for this pool is unverified/unknown; the provider is available and authenticated, so routing proceeds with unverified quota. "
+      : "") +
     "Pool states: " + poolStates + ". " + glmNote;
 
   return {

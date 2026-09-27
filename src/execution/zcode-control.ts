@@ -29,13 +29,15 @@ import { StringDecoder } from "node:string_decoder";
 import { sanitizeExecutionOutput } from "./sanitize.js";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
+import { sharedEnv } from "../config/env.js";
+import { isAdmissibleZcodeProvider } from "./zcode-native.js";
 
 /**
  * The only queue root this control plane may ever touch. Operator-configured
  * via C2C_ZCODE_QUEUE_ROOT; unset by default so the queue fails closed
  * instead of baking a machine-local path into the product.
  */
-export const FIXED_ZCODE_QUEUE_ROOT = process.env.C2C_ZCODE_QUEUE_ROOT?.trim() ?? "";
+export const FIXED_ZCODE_QUEUE_ROOT = sharedEnv("ZCODE_QUEUE_ROOT")?.trim() ?? "";
 
 const QUEUE_FILE = "queue.jsonl";
 const RECEIPTS_FILE = "receipts.jsonl";
@@ -226,14 +228,14 @@ export interface ZcodeQueueResolutionOptions {
   registry?: WorkspaceRegistry;
 }
 
-function resolveEngineeringAiWorkspaceRoot(
+export function resolveEngineeringAiWorkspaceRoot(
   options: ZcodeQueueResolutionOptions,
   env: NodeJS.ProcessEnv
 ): string | null {
   // No hardcoded workspace id in source: the stable Engineering AI workspace
   // id must come from the operator's environment (desktop-managed state).
-  const targetId = env.C2C_ENGINEERING_AI_WORKSPACE_ID?.trim() || null;
-  const targetName = env.C2C_ENGINEERING_AI_WORKSPACE_NAME?.trim().toLowerCase() || "engineering-ai";
+  const targetId = sharedEnv("ENGINEERING_AI_WORKSPACE_ID", env)?.trim() || null;
+  const targetName = sharedEnv("ENGINEERING_AI_WORKSPACE_NAME", env)?.trim().toLowerCase() || "engineering-ai";
   // An explicit workspace root anchors queue resolution only when it IS the
   // authorized Engineering AI workspace (stable id, registered name, or
   // logical name match). Any other absolute root (e.g. a bridge repository
@@ -251,7 +253,7 @@ function resolveEngineeringAiWorkspaceRoot(
     }
   }
 
-  const envWsRoot = env.C2C_ENGINEERING_AI_WORKSPACE_ROOT?.trim();
+  const envWsRoot = sharedEnv("ENGINEERING_AI_WORKSPACE_ROOT", env)?.trim();
   if (envWsRoot && path.isAbsolute(envWsRoot) && fs.existsSync(envWsRoot)) {
     return path.normalize(envWsRoot);
   }
@@ -279,7 +281,7 @@ function resolveEngineeringAiWorkspaceRoot(
 
   const stateDir =
     options.stateDir?.trim() ||
-    env.C2C_STATE_DIR?.trim() ||
+    sharedEnv("STATE_DIR", env)?.trim() ||
     (options.env !== undefined ? undefined : getStateDir(options.stateDir));
 
   if (stateDir) {
@@ -325,7 +327,7 @@ export function resolveFixedZcodeQueueRoot(options: ZcodeQueueResolutionOptions 
   }
 
   const env = options.env ?? process.env;
-  const configured = (options.root ?? env.C2C_ZCODE_QUEUE_ROOT)?.trim();
+  const configured = (options.root ?? sharedEnv("ZCODE_QUEUE_ROOT", env))?.trim();
 
   if (configured) {
     if (configured.split(/[\\/]/).includes("..")) {
@@ -1237,7 +1239,7 @@ export function describeControlPlane(options: ZcodeQueueResolutionOptions & { no
     return status;
   }
   if (native.attested !== true) {
-    const providerOk = native.provider === ZCODE_NATIVE_EXPECTED_PROVIDER;
+    const providerOk = isAdmissibleZcodeProvider(native.provider);
     status.level = providerOk ? "AUTH_NOT_ATTESTED" : "WRONG_PROVIDER";
     return status;
   }
@@ -1245,8 +1247,12 @@ export function describeControlPlane(options: ZcodeQueueResolutionOptions & { no
   return status;
 }
 
-/** The only desktop provider identity the coordinator may dispatch against. */
-export const ZCODE_NATIVE_EXPECTED_PROVIDER = "zcode-desktop";
+export {
+  ZCODE_NATIVE_EXPECTED_PROVIDER,
+  ZCODE_OFFICIAL_EXPECTED_PROVIDER,
+  ZCODE_ADMISSIBLE_PROVIDERS,
+  isAdmissibleZcodeProvider,
+} from "./zcode-native.js";
 
 function validateStringArray(value: unknown, field: string): string[] {
   if (!Array.isArray(value)) {

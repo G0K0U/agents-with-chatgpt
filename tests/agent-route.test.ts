@@ -185,6 +185,38 @@ describe("Policy-Governed Agent Router (agent_route)", () => {
     expect(route.reasoning).toContain("codex=critical");
   });
 
+  it("treats a known zero weekly window as exhausted despite full 5h headroom", () => {
+    const telemetry = createMockTelemetry({ codex5h: 100 });
+    telemetry.providers.codex.current_account!.weekly_window.used_percent = 100;
+    telemetry.providers.codex.current_account!.weekly_window.remaining_percent = 0;
+    const route = evaluateRoute(telemetry, { task_type: "coding", risk_level: "low", preferred_provider: "codex" });
+    expect(route.recommended_provider).not.toBe("codex");
+    expect(route.reasoning).toContain("codex=exhausted");
+    expect(route.quota_context.codex_weekly_remaining_percent).toBe(0);
+  });
+
+  it("reports unknown quota when Quanta is down without claiming models are unavailable", () => {
+    const telemetry = createMockTelemetry();
+    telemetry.quanta_available = false;
+    telemetry.error = "QUANTA_TIMEOUT";
+    const route = evaluateRoute(telemetry, { task_type: "coding" });
+    expect(route.decision).toBe("blocked");
+    expect(route.estimated_pool_health).toBe("unknown");
+    expect(route.reasoning).toContain("quota unknown");
+    expect(route.reasoning).not.toContain("provider unavailable");
+    expect(route.quota_context.codex_5h_remaining_percent).toBeNull();
+  });
+
+  it("uses the limiting GLM window in the unattributed-route note", () => {
+    const telemetry = createMockTelemetry({ glm5h: 100 });
+    telemetry.providers.glm.weekly_window.status = "known";
+    telemetry.providers.glm.weekly_window.used_percent = 100;
+    telemetry.providers.glm.weekly_window.remaining_percent = 0;
+    const route = evaluateRoute(telemetry, { task_type: "coding" });
+    expect(route.reasoning).toContain("exhausted only for this observed unattributed route");
+    expect(route.quota_context.glm_weekly_remaining_percent).toBe(0);
+  });
+
   it("P0-B: quota_context includes all 8 dual-window fields", () => {
     const telemetry = createMockTelemetry({ codex5h: 100, gemini5h: 29, claudeGpt5h: 69, glm5h: 100 });
     const route = evaluateRoute(telemetry, { task_type: "coding", risk_level: "low" });
@@ -236,7 +268,7 @@ describe("Policy-Governed Agent Router (agent_route)", () => {
     expect(note).toContain(`Generic Quanta GLM route: ${expected}`);
     expect(note).toContain("connection_mode and quota_pool: UNATTRIBUTED");
     expect(note).toContain("weekly=unknown");
-    expect(note).toContain("Outside that window, native ZCode Connection mode = Desktop-managed builtin:zai-start-plan with GLM-5.3-Flash");
+    expect(note).toContain("Outside that window, native ZCode Connection mode = Desktop-managed GLM (required identity per compatibility manifest)");
     expect(note).toContain("quota evidence for this route remains separate");
     expect(note).toContain("does not establish exhaustion of all GLM pipelines");
     expect(note).not.toMatch(/any GLM-dependent pipeline should be deferred|(?:all|any) GLM.*(?:defer|must wait)|free-window quota is currently exhausted/i);

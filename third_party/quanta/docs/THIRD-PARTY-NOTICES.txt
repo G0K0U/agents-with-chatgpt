@@ -1,0 +1,32 @@
+Quanta third-party notices
+
+Quanta's own source is licensed under the accompanying MIT LICENSE.
+Third-party components retain their own licenses; the app's MIT license does
+not replace those terms. Exact upstream notices are in licenses/ in the
+portable package and docs/licenses/ in the source archive. These notices
+are also embedded in the standalone executable.
+
+DEPENDENCIES.json records exact installed package versions, notice paths and
+SHA-256 hashes. It includes runtime packages and build utilities, and is an
+inventory, not a certification that every package is used at runtime.
+Python's LICENSE includes notices for bundled components; Pillow's LICENSE
+includes its bundled image/codec libraries. Tk's notice is included separately.
+
+pystray is LGPL-licensed. Its LGPL/GPL notices and unmodified installed Python
+source accompany this distribution. The complete Quanta source and pinned
+Windows build dependency list allow rebuilding the application with a modified
+pystray. Quanta imposes no additional restriction on modification or reverse
+engineering needed to debug modifications to that library.
+
+proxy_tools 0.1.0's installed metadata says MIT, but its source header and
+upstream LICENSE.txt use BSD terms. We include the actual upstream notice:
+https://raw.githubusercontent.com/jtushman/proxy_tools/master/LICENSE.txt
+
+Windows, Microsoft .NET and Microsoft Edge WebView2 are operating-system/runtime
+dependencies and retain their respective terms. No offline WebView2 installer
+is included. Quanta falls back to a text panel if its webview backend cannot start.
+
+To rebuild with a changed library, extract the matching source package, create
+a Python 3.12.14 x64 environment, install requirements-windows-build.txt, apply
+the library change in that environment, regenerate license inventory, run the
+tests, then run build_windows.py. Build locally; do not upload personal .aibar data.

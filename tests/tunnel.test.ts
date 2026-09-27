@@ -1,6 +1,8 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { findBinary } from "../src/tunnel/detect.js";
@@ -9,7 +11,9 @@ import {
   parseQuickTunnelUrl,
   type CloudflaredQuickTunnelOptions,
 } from "../src/tunnel/cloudflared.js";
+import { resolveTunnelProtocol, tunnelProtocolArgs } from "../src/tunnel/protocol.js";
 import {
+  CloudflaredNamedTunnel,
   namedTunnelLaunchArgs,
   normalizeNamedTunnelHostname,
   reconcileNamedTunnelRuntime,
@@ -73,6 +77,7 @@ function healthResponse(): Response {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   while (stateDirs.length) cleanup(stateDirs.pop()!);
   if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
   else process.env.C2C_STATE_DIR = previousStateDir;
@@ -271,13 +276,13 @@ describe("named tunnel runtime reconciliation", () => {
   it("renders the current origin port atomically and never uses the quick-tunnel --url shortcut", () => {
     const first = renderNamedTunnelConfig({
       tunnelId: "33333333-3333-3333-3333-333333333333",
-      credentialsFile: "C:\\Users\\Peter\\.cloudflared\\33333333-3333-3333-3333-333333333333.json",
+      credentialsFile: "C:\\Users\\<user>\\.cloudflared\\33333333-3333-3333-3333-333333333333.json",
       hostname: "c2c.example.com",
       localPort: 51092,
     });
     const second = renderNamedTunnelConfig({
       tunnelId: "33333333-3333-3333-3333-333333333333",
-      credentialsFile: "C:\\Users\\Peter\\.cloudflared\\33333333-3333-3333-3333-333333333333.json",
+      credentialsFile: "C:\\Users\\<user>\\.cloudflared\\33333333-3333-3333-3333-333333333333.json",
       hostname: "c2c.example.com",
       localPort: 51093,
     });
@@ -377,6 +382,7 @@ describe("tunnel preference state", () => {
     }).then((result) => {
       expect(result.fallback).toBe(false);
       expect(result.state.preference).toBe("named");
+      expect(result.state.management).toBe("managed");
       expect(result.state.hostname).toBe("c2c-demo.example.com");
       expect(result.state.tunnelName).toBe("c2c-abcdef123456");
       expect(isNamedTunnelReady(readTunnelState("abcdef123456"))).toBe(true);
@@ -404,5 +410,671 @@ describe("tunnel preference state", () => {
       expect(result.state.preference).toBe("quick");
       expect(result.userMessage).toMatch(/临时地址/);
     });
+  });
+});
+
+describe("CloudflaredNamedTunnel external observation without process control", () => {
+  const tunnelId = "55555555-5555-5555-5555-555555555555";
+  const hostname = "c2c.example.com";
+  const tunnelName = "c2c-ws-adopt";
+  const workspaceId = "ws-adopt";
+
+  function setupNamedEnvironment(stateDir: string, port = 48765) {
+    vi.spyOn(os, "homedir").mockReturnValue(stateDir);
+    const credsDir = path.join(stateDir, ".cloudflared");
+    fs.mkdirSync(credsDir, { recursive: true });
+    const credentialsFile = path.join(credsDir, `${tunnelId}.json`);
+    fs.writeFileSync(credentialsFile, JSON.stringify({ AccountTag: "tag", TunnelSecret: "sec" }));
+
+    const configContent = renderNamedTunnelConfig({
+      tunnelId,
+      credentialsFile,
+      hostname,
+      localPort: port,
+    });
+    const configFile = namedTunnelConfigFile(workspaceId, stateDir);
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    fs.writeFileSync(configFile, configContent);
+
+    return { credentialsFile, configFile };
+  }
+
+  function createMockFetch(opts: {
+    publicInstanceId?: string | null;
+    localInstanceId?: string | null;
+    publicStatus?: number;
+    localStatus?: number;
+    publicService?: string;
+    localService?: string;
+    publicWorkspaceId?: string;
+    localWorkspaceId?: string;
+    publicReleaseId?: string;
+    localReleaseId?: string;
+    mcpStatus?: number;
+    gate?: Promise<void>;
+  } = {}) {
+    const pubInst = opts.publicInstanceId !== undefined ? opts.publicInstanceId : "inst-match-123";
+    const locInst = opts.localInstanceId !== undefined ? opts.localInstanceId : "inst-match-123";
+    const pubStatus = opts.publicStatus ?? 200;
+    const locStatus = opts.localStatus ?? 200;
+    const pubService = opts.publicService ?? "c2c-bridge";
+    const locService = opts.localService ?? "c2c-bridge";
+    const pubWs = opts.publicWorkspaceId ?? workspaceId;
+    const locWs = opts.localWorkspaceId ?? workspaceId;
+    const mcpStat = opts.mcpStatus ?? 401;
+
+    return vi.fn(async (input: string | URL) => {
+      const urlStr = String(input);
+      if (opts.gate) {
+        await opts.gate;
+      }
+      if (urlStr.includes(`https://${hostname}/health`)) {
+        if (pubStatus !== 200) {
+          return new Response("Error", { status: pubStatus });
+        }
+        return new Response(
+          JSON.stringify({
+            status: "ok",
+            service: pubService,
+            workspaceId: pubWs,
+            instanceId: pubInst ?? undefined,
+            release: opts.publicReleaseId ? { releaseId: opts.publicReleaseId } : undefined,
+          }),
+          { status: 200 }
+        );
+      }
+      if (urlStr.includes("http://127.0.0.1:") && urlStr.endsWith("/health")) {
+        if (locStatus !== 200) {
+          return new Response("Error", { status: locStatus });
+        }
+        return new Response(
+          JSON.stringify({
+            status: "ok",
+            service: locService,
+            workspaceId: locWs,
+            instanceId: locInst ?? undefined,
+            release: opts.localReleaseId ? { releaseId: opts.localReleaseId } : undefined,
+          }),
+          { status: 200 }
+        );
+      }
+      if (urlStr.includes(`https://${hostname}/mcp`)) {
+        return new Response("Unauthorized", { status: mcpStat });
+      }
+      return new Response(null, { status: 404 });
+    });
+  }
+
+  it("externally observes existing verified public route without spawning, config rewrite, or runtime write", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    const mockFetch = createMockFetch();
+    const spawnImpl = vi.fn();
+    const configBefore = fs.readFileSync(configFile, "utf8");
+
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+      spawnImpl: spawnImpl as any,
+    });
+
+    const url = await tunnel.start(48765);
+    expect(url).toBe(`https://${hostname}`);
+    expect(spawnImpl).not.toHaveBeenCalled();
+    expect(fs.readFileSync(configFile, "utf8")).toBe(configBefore);
+    expect(fs.existsSync(namedTunnelRuntimeFile(workspaceId, stateDir))).toBe(false);
+
+    const status = tunnel.status();
+    expect(status.running).toBe(true);
+    expect(status.url).toBe(`https://${hostname}`);
+    expect(status.originPort).toBe(48765);
+    expect(status.management).toBe("external");
+    expect(status.ownsProcess).toBe(false);
+    expect(status.canControlProcess).toBe(false);
+    expect(typeof status.observedAt).toBe("string");
+    expect(status.executable).toBeNull();
+    expect(status.argv).toEqual([]);
+    expect(tunnel.getPublicUrl()).toBe(`https://${hostname}`);
+
+    const doctor = await tunnel.doctor();
+    expect(doctor.running).toBe(true);
+    expect(doctor.management).toBe("external");
+    expect(doctor.ownsProcess).toBe(false);
+    expect(doctor.canControlProcess).toBe(false);
+    expect(doctor.problems).toHaveLength(0);
+  });
+
+  it("read-only doctor observes the current bridge port when a new process has no prior tunnel observation", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+    const before = fs.readFileSync(configFile, "utf8");
+    const spawnImpl = vi.fn();
+    const tunnel = new CloudflaredNamedTunnel({ workspaceId, tunnelName, tunnelId,
+      hostname, stateDir, credentialsFile, fetchImpl: createMockFetch() as any,
+      spawnImpl: spawnImpl as any });
+    expect(tunnel.status().running).toBe(false);
+    const observed = await tunnel.doctor(48765);
+    expect(observed).toMatchObject({ management: "external", running: true, reachable: true,
+      originPort: 48765, ownsProcess: false, canControlProcess: false });
+    expect(tunnel.status().running).toBe(true);
+    expect(spawnImpl).not.toHaveBeenCalled();
+    expect(fs.readFileSync(configFile, "utf8")).toBe(before);
+    expect(fs.existsSync(namedTunnelRuntimeFile(workspaceId, stateDir))).toBe(false);
+  });
+
+  it("fails observation when instanceId mismatches between public and local", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    const mockFetch = createMockFetch({
+      publicInstanceId: "boot-inst-AAA",
+      localInstanceId: "boot-inst-BBB",
+    });
+    const spawnImpl = vi.fn();
+
+    // With a live unknown process in runtime file, falling back to spawn must fail closed
+    writeSecureJson(namedTunnelRuntimeFile(workspaceId, stateDir), {
+      pid: process.pid,
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      originPort: 48765,
+      configFile,
+      startedAt: new Date().toISOString(),
+    });
+
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+      spawnImpl: spawnImpl as any,
+    });
+
+    await expect(tunnel.start(48765)).rejects.toThrow(/A previous named tunnel process is still alive.*refusing to overwrite its origin config/i);
+    expect(spawnImpl).not.toHaveBeenCalled();
+    expect(tunnel.status().running).toBe(false);
+  });
+
+  it("fails observation when instanceId is missing or empty (missing proof)", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    const mockFetch = createMockFetch({
+      publicInstanceId: "",
+      localInstanceId: "boot-inst-BBB",
+    });
+    const spawnImpl = vi.fn();
+
+    writeSecureJson(namedTunnelRuntimeFile(workspaceId, stateDir), {
+      pid: process.pid,
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      originPort: 48765,
+      configFile,
+      startedAt: new Date().toISOString(),
+    });
+
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+      spawnImpl: spawnImpl as any,
+    });
+
+    await expect(tunnel.start(48765)).rejects.toThrow(/A previous named tunnel process is still alive.*refusing to overwrite its origin config/i);
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
+
+  it("fails observation when public /health returns HTTP 502", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    const mockFetch = createMockFetch({
+      publicStatus: 502,
+    });
+    const spawnImpl = vi.fn();
+
+    writeSecureJson(namedTunnelRuntimeFile(workspaceId, stateDir), {
+      pid: process.pid,
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      originPort: 48765,
+      configFile,
+      startedAt: new Date().toISOString(),
+    });
+
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+      spawnImpl: spawnImpl as any,
+    });
+
+    await expect(tunnel.start(48765)).rejects.toThrow(/A previous named tunnel process is still alive.*refusing to overwrite its origin config/i);
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
+
+  it("does not launch a second tunnel when an external route is unverified and no runtime PID is recorded", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+    const before = fs.readFileSync(configFile, "utf8");
+    const spawnImpl = vi.fn();
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId, tunnelName, tunnelId, hostname, stateDir, credentialsFile,
+      fetchImpl: createMockFetch({ publicStatus: 502 }) as any,
+      spawnImpl: spawnImpl as any,
+    });
+    await expect(tunnel.start(48765)).rejects.toThrow(/External named tunnel route unverified/);
+    expect(spawnImpl).not.toHaveBeenCalled();
+    expect(fs.readFileSync(configFile, "utf8")).toBe(before);
+    expect(fs.existsSync(namedTunnelRuntimeFile(workspaceId, stateDir))).toBe(false);
+    expect(tunnel.status()).toMatchObject({ management: "external", running: false, reachable: false,
+      ownsProcess: false, canControlProcess: false });
+  });
+
+  it("rejects an oversized public health response before trusting route identity", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+    const spawnImpl = vi.fn();
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId, tunnelName, tunnelId, hostname, stateDir, credentialsFile,
+      fetchImpl: vi.fn(async (input: string | URL) => String(input).startsWith(`https://${hostname}/health`)
+        ? new Response("x".repeat(9_000), { status: 200 })
+        : new Response("Unauthorized", { status: 401 })) as any,
+      spawnImpl: spawnImpl as any,
+    });
+    await expect(tunnel.start(48765)).rejects.toThrow(/invalid JSON/);
+    expect(spawnImpl).not.toHaveBeenCalled();
+  });
+
+  it("expires observation when age exceeds bounded freshness (stale observation)", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    const mockFetch = createMockFetch();
+    let nowMs = Date.now();
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+      observationTtlMs: 50,
+      nowMs: () => nowMs,
+    });
+
+    await tunnel.start(48765);
+    expect(tunnel.status().running).toBe(true);
+
+    nowMs += 51;
+
+    const staleStatus = tunnel.status();
+    expect(staleStatus.running).toBe(false);
+    expect(staleStatus.url).toBeNull();
+    expect(staleStatus.detail).toContain("External tunnel observation expired");
+    expect(staleStatus.management).toBe("external");
+    expect(staleStatus.reachable).toBeNull();
+    expect(staleStatus.originPort).toBe(48765);
+    expect(staleStatus.ownsProcess).toBe(false);
+    expect(tunnel.getPublicUrl()).toBeNull();
+
+    const refreshed = await tunnel.doctor();
+    expect(refreshed).toMatchObject({ management: "external", running: true, reachable: true,
+      originPort: 48765, ownsProcess: false, canControlProcess: false });
+    expect(tunnel.status().running).toBe(true);
+  });
+
+  it("stop() clears observation in memory without killing external process", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    const mockFetch = createMockFetch();
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+    });
+
+    await tunnel.start(48765);
+    expect(tunnel.status().running).toBe(true);
+
+    const killSpy = vi.spyOn(process, "kill");
+    await tunnel.stop();
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(tunnel.status().running).toBe(false);
+    expect(tunnel.getPublicUrl()).toBeNull();
+  });
+
+  it("stop() during awaited probe cannot resurrect observation (generation fence)", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((r) => { releaseGate = r; });
+
+    const mockFetch = createMockFetch({ gate });
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+    });
+
+    const startPromise = tunnel.start(48765);
+    await tunnel.stop();
+    releaseGate();
+
+    await expect(startPromise).rejects.toThrow(/interrupted by stop/i);
+    expect(tunnel.status().running).toBe(false);
+    expect(tunnel.getPublicUrl()).toBeNull();
+  });
+
+  it("stop() during a read-only doctor probe cannot restore an external observation", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+    const standardFetch = createMockFetch();
+    let releaseProbe!: () => void;
+    const probeGate = new Promise<void>((resolve) => { releaseProbe = resolve; });
+    let observeStarted!: () => void;
+    const started = new Promise<void>((resolve) => { observeStarted = resolve; });
+    let holdNextHealth = false;
+    const mockFetch = vi.fn(async (input: string | URL) => {
+      if (holdNextHealth && String(input).endsWith("/health")) {
+        holdNextHealth = false;
+        observeStarted();
+        await probeGate;
+      }
+      return standardFetch(input);
+    });
+    const tunnel = new CloudflaredNamedTunnel({ workspaceId, tunnelName, tunnelId,
+      hostname, stateDir, credentialsFile, fetchImpl: mockFetch as any });
+    await tunnel.start(48765);
+    holdNextHealth = true;
+    const observing = tunnel.doctor();
+    await started;
+    await tunnel.stop();
+    releaseProbe();
+    await observing;
+    expect(tunnel.status().running).toBe(false);
+    expect(tunnel.getPublicUrl()).toBeNull();
+  });
+
+  it("concurrent different-port starts cannot share wrong result", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    let releaseGate48765!: () => void;
+    const gate48765 = new Promise<void>((r) => { releaseGate48765 = r; });
+
+    const mockFetch = vi.fn(async (input: string | URL) => {
+      const urlStr = String(input);
+      if (urlStr.includes("127.0.0.1:48765")) {
+        await gate48765;
+      }
+      if (urlStr.endsWith("/mcp")) return new Response("Unauthorized", { status: 401 });
+      const portMatch = urlStr.match(/127\.0\.0\.1:(\d+)/);
+      const port = portMatch ? parseInt(portMatch[1], 10) : 48766;
+      return new Response(JSON.stringify({
+        status: "ok",
+        service: "c2c-bridge",
+        workspaceId,
+        instanceId: `inst-${port}`,
+      }), { status: 200 });
+    });
+
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+    });
+
+    const start1 = tunnel.start(48765);
+    const start2 = tunnel.start(48766);
+    releaseGate48765();
+
+    const [res1, res2] = await Promise.allSettled([start1, start2]);
+    if (res1.status === "rejected") {
+      expect((res1.reason as Error).message).toMatch(/interrupted/i);
+    }
+    expect(res2.status).toBe("fulfilled");
+    expect(tunnel.status().originPort).toBe(48766);
+  });
+
+  it("fails closed for CONTROL without erasing ambiguous malformed runtime state", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    const runtimePath = namedTunnelRuntimeFile(workspaceId, stateDir);
+    fs.writeFileSync(runtimePath, "{ corrupted invalid json syntax ... ");
+
+    const mockFetch = createMockFetch({ publicStatus: 502 });
+    const spawnImpl = vi.fn();
+
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+      spawnImpl: spawnImpl as any,
+    });
+
+    await expect(tunnel.start(48765)).rejects.toThrow(/ambiguous or malformed/i);
+    expect(spawnImpl).not.toHaveBeenCalled();
+    // Must NOT erase the malformed file
+    expect(fs.existsSync(runtimePath)).toBe(true);
+  });
+
+  it("doctor() reprobes external connection and detects failed observation", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    let healthy = true;
+    const mockFetch = vi.fn(async (input: string | URL) => {
+      const urlStr = String(input);
+      if (urlStr.endsWith("/mcp")) return new Response("Unauthorized", { status: 401 });
+      if (!healthy && urlStr.includes(`https://${hostname}`)) {
+        return new Response("Bad Gateway", { status: 502 });
+      }
+      return new Response(JSON.stringify({
+        status: "ok",
+        service: "c2c-bridge",
+        workspaceId,
+        instanceId: "inst-doctor-probe",
+      }), { status: 200 });
+    });
+
+    const tunnel = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetch as any,
+    });
+
+    await tunnel.start(48765);
+    expect(tunnel.status().running).toBe(true);
+
+    const doc1 = await tunnel.doctor();
+    expect(doc1.running).toBe(true);
+    expect(doc1.management).toBe("external");
+
+    healthy = false;
+    const doc2 = await tunnel.doctor();
+    expect(doc2.running).toBe(false);
+    expect(doc2.problems.some((p) => p.includes("external tunnel probe failed"))).toBe(true);
+    expect(tunnel.status().running).toBe(false);
+
+    healthy = true;
+    const doc3 = await tunnel.doctor();
+    expect(doc3).toMatchObject({ management: "external", running: true, reachable: true,
+      originPort: 48765 });
+  });
+
+  it("release binding check: verifies release binding when provided", async () => {
+    const stateDir = isolateStateDir();
+    stateDirs.push(stateDir);
+    const { configFile, credentialsFile } = setupNamedEnvironment(stateDir, 48765);
+
+    // Mismatch release
+    const mockFetchMismatch = createMockFetch({
+      publicReleaseId: "v0.3.0",
+      localReleaseId: "v0.4.0",
+    });
+    const tunnelMismatch = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetchMismatch as any,
+      spawnImpl: vi.fn() as any,
+      expectedReleaseId: "v0.3.0",
+    });
+    // With live unknown process blocking spawn, fails closed
+    writeSecureJson(namedTunnelRuntimeFile(workspaceId, stateDir), {
+      pid: process.pid,
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      originPort: 48765,
+      configFile,
+      startedAt: new Date().toISOString(),
+    });
+    await expect(tunnelMismatch.start(48765)).rejects.toThrow(/refusing to overwrite its origin config/i);
+
+    // Match release
+    const mockFetchMatch = createMockFetch({
+      publicReleaseId: "v0.3.0",
+      localReleaseId: "v0.3.0",
+    });
+    const tunnelMatch = new CloudflaredNamedTunnel({
+      workspaceId,
+      tunnelName,
+      tunnelId,
+      hostname,
+      stateDir,
+      credentialsFile,
+      fetchImpl: mockFetchMatch as any,
+      expectedReleaseId: "v0.3.0",
+    });
+    const matchUrl = await tunnelMatch.start(48765);
+    expect(matchUrl).toBe(`https://${hostname}`);
+    expect(tunnelMatch.status().running).toBe(true);
+  });
+});
+
+describe("C2C_TUNNEL_PROTOCOL", () => {
+  it("defaults to auto and passes no protocol flags", () => {
+    expect(resolveTunnelProtocol({})).toBe("auto");
+    expect(tunnelProtocolArgs("auto")).toEqual([]);
+  });
+
+  it("resolves quic and passes --protocol quic", () => {
+    expect(resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "quic" })).toBe("quic");
+    expect(tunnelProtocolArgs("quic")).toEqual(["--protocol", "quic"]);
+  });
+
+  it("resolves http2 and passes --protocol http2", () => {
+    expect(resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "http2" })).toBe("http2");
+    expect(tunnelProtocolArgs("http2")).toEqual(["--protocol", "http2"]);
+  });
+
+  it("handles case-insensitivity and whitespace", () => {
+    expect(resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "  QUIC  " })).toBe("quic");
+    expect(resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "Http2" })).toBe("http2");
+    expect(resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "AUTO" })).toBe("auto");
+  });
+
+  it("falls back to A2C_TUNNEL_PROTOCOL", () => {
+    expect(resolveTunnelProtocol({ A2C_TUNNEL_PROTOCOL: "quic" })).toBe("quic");
+  });
+
+  it("fails closed on invalid protocol", () => {
+    expect(() => resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "invalid-proto" })).toThrow(
+      /Invalid tunnel protocol/i
+    );
+  });
+
+  it("passes --protocol in Quick Tunnel spawn when configured", async () => {
+    const fetchImpl = vi.fn(async () => healthResponse());
+    const child = new FakeCloudflaredProcess();
+    const spawnImpl = vi.fn(() => child as unknown as ChildProcess);
+    const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", {
+      spawnImpl,
+      fetchImpl,
+      startTimeoutMs: 1_000,
+      env: { C2C_TUNNEL_PROTOCOL: "quic" },
+    });
+    const starting = tunnel.start(4000);
+    announceUrl(child);
+    await expect(starting).resolves.toBe(QUICK_URL);
+    expect(spawnImpl).toHaveBeenCalledWith(
+      "cloudflared",
+      ["tunnel", "--url", "http://127.0.0.1:4000", "--no-autoupdate", "--protocol", "quic"],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+  });
+
+  it("passes --protocol in namedTunnelLaunchArgs when configured", () => {
+    const args = namedTunnelLaunchArgs("/path/to/config.yml", "11111111-2222-3333-4444-555555555555", "http2");
+    expect(args).toContain("--protocol");
+    expect(args).toContain("http2");
   });
 });

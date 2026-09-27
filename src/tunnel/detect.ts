@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { sharedEnv } from "../config/env.js";
 
 const COMMON_DIRS = [
   "/opt/homebrew/bin",
@@ -25,12 +26,12 @@ function accessibleFile(candidate: string): string | null {
 /** Locate a binary on PATH or in common install locations. */
 export function findBinary(name: string): string | null {
   const exe = process.platform === "win32" ? `${name}.exe` : name;
-  if (name === "cloudflared" && process.env.C2C_CLOUDFLARED_PATH?.trim()) {
-    const configured = accessibleFile(process.env.C2C_CLOUDFLARED_PATH.trim());
+  if (name === "cloudflared" && sharedEnv("CLOUDFLARED_PATH")?.trim()) {
+    const configured = accessibleFile(sharedEnv("CLOUDFLARED_PATH")!.trim());
     if (configured) return configured;
   }
   try {
-    const probe = spawnSync(exe, ["--version"], { stdio: "ignore", timeout: 5000 });
+    const probe = spawnSync(exe, ["--version"], { stdio: "ignore", timeout: 5000, windowsHide: true });
     if (probe.status === 0 || probe.status === 1) return exe; // on PATH
   } catch {
     // not on PATH

@@ -27,21 +27,20 @@ import {
   cleanupVerificationRuntime,
   materializeVerificationProfile,
   prepareVerificationRuntime,
-  resolveDefaultVerificationProfile,
   summarizeVerification,
   type MaterializedVerification,
   type VerificationAudit,
   type VerificationCommandResult,
   type VerificationProfile,
 } from "./verification.js";
+import { resolveVerificationProfile } from "./operator-verification.js";
 import type { CodexRuntimeEnvironment } from "./runtime.js";
+import type { ExecutionSelection, ModelCatalogService } from "./model-catalog.js";
+import { MODEL_ID_PATTERN, EFFORT_PATTERN } from "./model-catalog.js";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { Logger, nullLogger, redact } from "../logger/index.js";
 import { type ExecutionProvider, type ExecutionBackend, type TaskLifecyclePhase } from "./backend.js";
 import { AntigravityBackend, DEFAULT_GEMINI_MODEL, KNOWN_GEMINI_MODELS, type AntigravityProviderStatus } from "./antigravity.js";
-import { OmnigentBackend, sanitizeOmnigentOutput, type OmnigentBackendOptions } from "./omnigent.js";
-import { OmnigentError } from "./omnigent-client.js";
-import { executionOrchestrator, type ExecutionOrchestrator } from "./orchestrator.js";
 import type { TaskLifecycleEvent, TaskLifecycleEventType } from "./audit-maintenance.js";
 import type { C2CSessionRegistry } from "../session/registry.js";
 import {
@@ -86,6 +85,8 @@ export interface SubmitCodexTaskInput {
   approval_mode?: "workspace_write";
   provider?: ExecutionProvider;
   model?: string;
+  /** Codex-only reasoning effort; validated against the live catalog. */
+  effort?: string;
 }
 
 export interface ValidatedTaskInput {
@@ -104,6 +105,7 @@ export interface ValidatedTaskInput {
   approvalMode: "workspace_write";
   provider: ExecutionProvider;
   model?: string;
+  effort?: string;
 }
 
 export interface ApprovalAuditEvent {
@@ -119,7 +121,28 @@ interface TaskErrorInfo {
 }
 
 export interface PersistedTaskRecord {
-  continuation?: { idempotencyKey: string; model: "gpt-6-astra"; effort: "high"; timeoutMs: number };
+  continuation?: { idempotencyKey: string; model: string; effort: string; timeoutMs: number };
+  /** Resolved model selection for codex tasks (persisted; revalidated at dispatch). */
+  selection?: ExecutionSelection | null;
+  /** What the caller explicitly asked for (nulls when omitted). */
+  requestedSelection?: { model: string | null; effort: string | null } | null;
+  /**
+   * What was actually sent, split by RPC so no field is claimed as dispatched
+   * before its request goes out: thread/start carries only the model;
+   * `turn` stays null until the turn/start request is ISSUED, then carries
+   * outcome "accepted" (turn id returned) or "unknown" (request written but
+   * no confirmed response — the mutation is never automatically re-sent).
+   */
+  dispatchedSelection?: {
+    thread: { model: string | null };
+    turn: { model: string | null; effort: string | null; outcome: "accepted" | "unknown" } | null;
+  } | null;
+  /**
+   * What the upstream proved: thread/start echo and/or session readback.
+   * effort is null unless the upstream explicitly reported it — the
+   * dispatched effort is never copied here.
+   */
+  observedSelection?: { model: string | null; effort: string | null; source: string; mismatch?: boolean } | null;
   actualModel?: NativeModelEvidence | string | null;
   stableVerification?: { passed: boolean; sourceHash: string | null; commands: Array<{ command: string; exitCode: number | null; sourceHash?: string | null }> };
   taskId: string;
@@ -142,12 +165,12 @@ export interface PersistedTaskRecord {
   runTests: boolean;
   approvalMode: "workspace_write";
   provider?: ExecutionProvider;
-  /** Missing on legacy history. Never reinterpret queued work on a flag change. */
-  orchestrator?: ExecutionOrchestrator;
   providerRuntime?: string;
   providerModel?: string;
   providerSessionId?: string;
   providerMetadata?: Record<string, unknown>;
+  /** Set when a dead resumed AGY conversation was discarded and a fresh session carried the task (G2). */
+  sessionRecoveredAt?: string;
   tokenUsage?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -183,10 +206,24 @@ export interface PersistedTaskRecord {
   error?: TaskErrorInfo;
   approvalEvents: ApprovalAuditEvent[];
   executionRecorded: boolean;
+  /**
+   * C2 completion evidence: distinguishes "agent turn completed" from
+   * "requested action verified". changedFiles counts OBSERVED file changes;
+   * callers must verify against real filesystem state for hard guarantees.
+   */
+  actionEvidence?: {
+    turnCompleted: boolean;
+    changedFiles: number;
+    finalOutputCaptured: boolean;
+  };
 }
 
 export interface CodexTaskView {
   actualModel?: NativeModelEvidence | string | null;
+  selection?: PersistedTaskRecord["selection"];
+  requestedSelection?: PersistedTaskRecord["requestedSelection"];
+  dispatchedSelection?: PersistedTaskRecord["dispatchedSelection"];
+  observedSelection?: PersistedTaskRecord["observedSelection"];
   stableVerification?: PersistedTaskRecord["stableVerification"];
   taskId: string;
   workspaceId: string;
@@ -214,7 +251,6 @@ export interface CodexTaskView {
   runTests: boolean;
   approvalMode: "workspace_write";
   provider?: ExecutionProvider;
-  orchestrator?: ExecutionOrchestrator;
   providerSessionId?: string | null;
   providerModel?: string | null;
   tokenUsage?: {
@@ -238,6 +274,7 @@ export interface CodexTaskView {
   verification: VerificationAudit | null;
   approvalEvents: ApprovalAuditEvent[];
   executionSummaryAvailable: boolean;
+  actionEvidence: PersistedTaskRecord["actionEvidence"] | null;
   error: TaskErrorInfo | null;
 }
 
@@ -261,6 +298,7 @@ export type TaskErrorCode =
   | "CODEX_EXECUTABLE_NOT_FOUND"
   | "CODEX_UNAVAILABLE"
   | "CODEX_EXECUTION_FAILED"
+  | "CODEX_MODEL_UNAVAILABLE"
   | "BRIDGE_RESTARTED"
   | "CANCEL_FAILED"
   | "NO_VERIFICATION_PROFILE"
@@ -324,6 +362,10 @@ interface RuntimeTask {
   completion: Promise<TurnCompletion>;
   resolveCompletion: (completion: TurnCompletion) => void;
   completionSettled: boolean;
+  /** Settled turn completion (mirrored for sync readers). */
+  turnCompletionResult: TurnCompletion | null;
+  /** Final assistant message captured from the turn (bounded, redacted). */
+  finalAgentMessage: string | null;
 }
 
 interface PreparedQueuedTask {
@@ -361,9 +403,6 @@ export interface TaskManagerOptions {
   logger?: Logger;
   appServerFactory?: AppServerFactory;
   antigravityBackend?: ExecutionBackend;
-  orchestrator?: ExecutionOrchestrator;
-  omnigentBackend?: ExecutionBackend;
-  omnigent?: Omit<OmnigentBackendOptions, "stateDir">;
   /** Local-only registry hook; never populated from MCP input. */
   verificationProfileResolver?: (workspace: Workspace) => VerificationProfile | null;
   /** Local-only policy seam; production uses the synchronous built-in policy. */
@@ -392,6 +431,8 @@ export interface TaskManagerOptions {
   queueLimit?: number;
   /** Optional lifecycle event listener for audit maintenance or external observation. */
   onTaskLifecycleEvent?: (event: TaskLifecycleEvent) => void;
+  /** Live model catalog; production wires it, unit tests may omit it. */
+  modelCatalog?: ModelCatalogService;
 }
 
 const TERMINAL_STATUSES = new Set<TaskStatus>(["completed", "failed", "cancelled", "interrupted", "timed_out"]);
@@ -452,6 +493,51 @@ function stringValue(value: unknown): string | null {
 function safeMessage(error: unknown, fallback: string): string {
   const message = error instanceof Error ? error.message : String(error);
   return redact(message).replace(/[\r\n]+/g, " ").slice(0, 500) || fallback;
+}
+
+/** Extract a bounded, redacted error message supporting various shapes. */
+function extractErrorMessage(params: Record<string, unknown>): string {
+  // Prefer nested turn.error.message
+  const turn = asObject(params.turn);
+  const turnErrorMsg = stringValue(asObject(turn.error).message);
+  if (turnErrorMsg) return turnErrorMsg;
+
+  // Then params.error.message or params.error.codexErrorInfo.message
+  const errObj = asObject(params.error);
+  const errMsg = stringValue(errObj.message);
+  if (errMsg) return errMsg;
+  const codexInfoMsg = stringValue(asObject(errObj.codexErrorInfo).message);
+  if (codexInfoMsg) return codexInfoMsg;
+
+  // Legacy string error
+  const legacyError = stringValue(params.error);
+  if (legacyError) return legacyError;
+
+  // Top-level message field
+  const topMsg = stringValue(params.message);
+  if (topMsg) return topMsg;
+
+  return "Codex reported an execution error";
+}
+
+function normalizedCodexErrorMessage(params: Record<string, unknown>): string {
+  const raw = extractErrorMessage(params);
+  let message = raw;
+  // The provider can place its HTTP error JSON inside TurnError.message.
+  // Extract only its public message, never echo the entire response body.
+  if (raw.length <= 16_384 && raw.trimStart().startsWith("{")) {
+    try {
+      const envelope = asObject(JSON.parse(raw));
+      message = stringValue(asObject(envelope.error).message) ?? stringValue(envelope.message) ?? raw;
+    } catch { /* legacy plain-text error */ }
+  }
+  return redact(message).replace(/[\r\n]+/g, " ").slice(0, 500) || "Codex reported an execution error";
+}
+
+function codexExecutionFailure(message: string): TaskError {
+  const code = /\bmodel\b[^\r\n]{0,180}\b(?:not supported|not available|unavailable)\b/i.test(message)
+    ? "CODEX_MODEL_UNAVAILABLE" : "CODEX_EXECUTION_FAILED";
+  return new TaskError(code, message);
 }
 
 function isTaskStatus(value: unknown): value is TaskStatus {
@@ -566,7 +652,6 @@ function publicView(record: PersistedTaskRecord): CodexTaskView {
     runTests: record.runTests,
     approvalMode: record.approvalMode,
     provider: record.provider ?? "codex",
-    orchestrator: record.orchestrator ?? "legacy",
     lifecyclePhase: record.lifecyclePhase,
     requestedProvider: record.requestedProvider,
     requestedModel: record.requestedModel,
@@ -575,6 +660,10 @@ function publicView(record: PersistedTaskRecord): CodexTaskView {
     providerSessionId: (record.provider === "gemini" ? record.providerSessionId : (record.providerSessionId ?? record.threadId)) ?? null,
     providerModel: record.providerModel ?? null,
     tokenUsage: record.tokenUsage ? { ...record.tokenUsage } : null,
+    selection: record.selection ?? null,
+    requestedSelection: record.requestedSelection ?? null,
+    dispatchedSelection: record.dispatchedSelection ?? null,
+    observedSelection: record.observedSelection ?? null,
     submittedAt: record.submittedAt,
     startedAt: record.startedAt ?? null,
     completedAt: record.completedAt ?? null,
@@ -582,6 +671,7 @@ function publicView(record: PersistedTaskRecord): CodexTaskView {
     threadId: record.threadId ?? null,
     turnId: record.turnId ?? null,
     changedFiles: [...record.changedFiles],
+    actionEvidence: record.actionEvidence ?? null,
     tests: record.tests,
     exitStatus: record.exitStatus ?? null,
     outputIds: [...record.outputIds],
@@ -595,7 +685,9 @@ function publicView(record: PersistedTaskRecord): CodexTaskView {
 
 export type TaskAccessContext = {
   /** Local controller only; never populated from untrusted MCP arguments. */
-  continuation?: { idempotencyKey: string; model: "gpt-6-astra"; effort: "high"; timeoutMs: number; authorize: () => boolean };
+  continuation?: { idempotencyKey: string; model: string; effort: string; timeoutMs: number; authorize: () => boolean };
+  /** Catalog-resolved selection computed by the async caller before submit. */
+  selection?: ExecutionSelection;
   ownerId?: string;
   workspaceId?: string;
   sessionId?: string;
@@ -930,7 +1022,7 @@ export function evaluateCodexApproval(
 }
 
 function validateObjectKeys(input: Record<string, unknown>): void {
-  const allowed = new Set(["workspace_id", "instruction", "write_scope", "network", "run_tests", "approval_mode", "provider", "model"]);
+  const allowed = new Set(["workspace_id", "instruction", "write_scope", "network", "run_tests", "approval_mode", "provider", "model", "effort"]);
   for (const key of Object.keys(input)) {
     if (allowed.has(key)) continue;
     const escalationKeys = new Set([
@@ -1005,9 +1097,23 @@ export function validateCodexTask(
         );
       }
       model = trimmedModel;
+    } else if (!MODEL_ID_PATTERN.test(trimmedModel)) {
+      // Bounded protocol identifier; catalog confirmation happens against the
+      // live account catalog before dispatch, never an open config override.
+      throw new TaskError("INVALID_MODEL", `model must match ${MODEL_ID_PATTERN.source}`);
     } else {
-      throw new TaskError("INVALID_TASK", "model parameter is only supported for provider 'gemini'");
+      model = trimmedModel;
     }
+  }
+  let effort: string | undefined;
+  if (rawInput.effort !== undefined) {
+    if (provider !== "codex") {
+      throw new TaskError("INVALID_TASK", "effort parameter is only supported for provider 'codex'");
+    }
+    if (typeof rawInput.effort !== "string" || !EFFORT_PATTERN.test(rawInput.effort.trim())) {
+      throw new TaskError("UNSUPPORTED_EFFORT", `effort must match ${EFFORT_PATTERN.source}`);
+    }
+    effort = rawInput.effort.trim();
   }
   const networkRequested = rawInput.network === true;
   // Network is an explicit per-task opt-in. Safe/API deployments reject it;
@@ -1084,6 +1190,7 @@ export function validateCodexTask(
     approvalMode: "workspace_write",
     provider,
     model,
+    effort,
   };
 }
 
@@ -1097,10 +1204,6 @@ export class CodexTaskManager {
   private readonly logger: Logger;
   private readonly appServerFactory: AppServerFactory;
   private readonly antigravityBackend: ExecutionBackend;
-  private readonly orchestrator: ExecutionOrchestrator;
-  private omnigentBackend: ExecutionBackend | undefined;
-  private readonly omnigentOptions: Omit<OmnigentBackendOptions, "stateDir">;
-  private readonly recoveringOmnigentTasks = new Set<string>();
   private readonly verificationProfileResolver: (workspace: Workspace) => VerificationProfile | null;
   private readonly approvalEvaluator: (
     method: string,
@@ -1131,6 +1234,8 @@ export class CodexTaskManager {
   private closed = false;
   private closePromise: Promise<void> | null = null;
   private readonly onTaskLifecycleEvent?: (event: TaskLifecycleEvent) => void;
+  /** Read-only catalog access for the continuation controller's dispatch gate. */
+  readonly modelCatalog: ModelCatalogService | null;
 
   constructor(
     readonly workspace: Workspace,
@@ -1139,13 +1244,15 @@ export class CodexTaskManager {
     this.stateDir = getStateDir(opts.stateDir);
     this.nativeClient = opts.nativeClient;
     this.continuationAuthorize = opts.continuationAuthorize;
+    this.modelCatalog = opts.modelCatalog ?? null;
     this.logger = opts.logger ?? nullLogger;
     this.appServerFactory = opts.appServerFactory ?? defaultAppServerFactory;
     this.antigravityBackend = opts.antigravityBackend ?? new AntigravityBackend({ stateDir: this.stateDir });
-    this.orchestrator = executionOrchestrator(opts.orchestrator);
-    this.omnigentBackend = opts.omnigentBackend;
-    this.omnigentOptions = opts.omnigent ?? {};
-    this.verificationProfileResolver = opts.verificationProfileResolver ?? resolveDefaultVerificationProfile;
+    // Default resolution: the trusted local operator registration for this
+    // workspace first, then the bridge-owned built-ins. Explicit injection
+    // (tests) still wins.
+    this.verificationProfileResolver = opts.verificationProfileResolver ??
+      ((workspace) => resolveVerificationProfile(workspace, this.stateDir));
     this.approvalEvaluator = opts.approvalEvaluator ?? evaluateCodexApproval;
     this.taskTimeoutMs = boundedMilliseconds(opts.taskTimeoutMs, DEFAULT_TASK_TIMEOUT_MS, 100, 60 * 60_000);
     this.verificationTimeoutMs = boundedMilliseconds(
@@ -1285,11 +1392,17 @@ export class CodexTaskManager {
   /** Terminal status releases the exact task/session currently holding the slot. */
   private observeNativeTask(task: ZcodeNativeTaskView): boolean {
     const slot = readWorkspaceSlot(this.workspace.id, this.stateDir);
-    if (slot?.provider !== "z2c" || slot.workspaceId !== task.workspace_id ||
-        slot.taskId !== task.task_id || slot.sessionId !== task.session_id) return false;
+    if (slot?.provider !== "z2c" || slot.workspaceId !== task.workspace_id) return false;
+    // A-fix: match by the bound identity — the reservation id BEFORE the
+    // upstream bind rewrote it, the native id (or sessionId) AFTER. This
+    // keeps terminal observation working across the bind boundary and for
+    // sessions whose session id was not yet known at bind time.
+    const identityMatches = slot.taskId === task.task_id
+      || slot.nativeTaskId === task.task_id;
+    if (!identityMatches) return false;
     this.nativeSlotStatus = ["queued", "running", "cancelling"].includes(task.status) ? task.status : "unresolved";
     if (!TERMINAL_STATUSES.has(task.status as TaskStatus)) return false;
-    const released = releaseWorkspaceSlot(this.workspace.id, task.task_id, this.stateDir);
+    const released = releaseWorkspaceSlot(this.workspace.id, slot.taskId, this.stateDir);
     if (released) this.schedulePump();
     return released;
   }
@@ -1299,10 +1412,15 @@ export class CodexTaskManager {
     const slot = readWorkspaceSlot(this.workspace.id, this.stateDir);
     if (slot?.provider !== "z2c") return { status: "none", released: false };
     this.nativeSlotStatus = "unresolved";
-    if (!slot.sessionId) return { status: "unresolved", released: false };
+    if (!slot.sessionId && !slot.nativeTaskId) return { status: "unresolved", released: false };
     try {
-      const task = await this.native().getTask({ workspace_id: slot.workspaceId, task_id: slot.taskId });
-      if (task.workspace_id !== slot.workspaceId || task.task_id !== slot.taskId || task.session_id !== slot.sessionId) {
+      const queryTaskId = slot.nativeTaskId ?? slot.taskId;
+      const task = await this.native().getTask({ workspace_id: slot.workspaceId, task_id: queryTaskId });
+      const idMatches = task.task_id === slot.taskId || task.task_id === slot.nativeTaskId;
+      if (task.workspace_id !== slot.workspaceId || !idMatches) {
+        throw new ZcodeNativeError("ZCODE_NATIVE_NAMESPACE_MISMATCH", "Native status must match the workspace slot task/session");
+      }
+      if (slot.sessionId && task.session_id && task.session_id !== slot.sessionId) {
         throw new ZcodeNativeError("ZCODE_NATIVE_NAMESPACE_MISMATCH", "Native status must match the workspace slot task/session");
       }
       const released = this.observeNativeTask(task);
@@ -1338,7 +1456,13 @@ export class CodexTaskManager {
     if (access.continuation) {
       const pin = access.continuation;
       if (this.getQueueState().paused) throw new TaskError("TASK_NOT_AUTHORIZED", "Workspace queue is paused");
-      if (!access.ownerId || access.workspaceId !== this.workspace.id || !pin.authorize() || input.provider !== "codex" || this.orchestrator !== "legacy" || pin.model !== "gpt-6-astra" || pin.effort !== "high" || !Number.isInteger(pin.timeoutMs) || pin.timeoutMs < 100 || pin.timeoutMs > 30 * 60_000) throw new TaskError("INVALID_TASK", "Continuation owner/model/budget mismatch");
+      // Bounded protocol identifiers, not a single hardcoded model: old
+      // manifests keep their recorded pin, dispatch re-confirms it against
+      // the live catalog and leaves the node paused when it is no longer
+      // listed. Nothing here re-signs or rewrites an existing approval.
+      if (!access.ownerId || access.workspaceId !== this.workspace.id || !pin.authorize() || input.provider !== "codex"
+        || !MODEL_ID_PATTERN.test(pin.model) || !EFFORT_PATTERN.test(pin.effort)
+        || !Number.isInteger(pin.timeoutMs) || pin.timeoutMs < 100 || pin.timeoutMs > 30 * 60_000) throw new TaskError("INVALID_TASK", "Continuation owner/model/budget mismatch");
       // Read durable admissions while holding the same lock as binding checks and creation.
       const dir = path.dirname(taskFile(this.workspace.id, "c2c_00000000", this.stateDir));
       if (fs.existsSync(dir)) for (const name of fs.readdirSync(dir).filter(n => /^c2c_[a-f0-9]+\.json$/.test(n))) {
@@ -1349,13 +1473,6 @@ export class CodexTaskManager {
       if (previous) {
         if (previous.instructionHash !== input.instructionHash || JSON.stringify(previous.writeScope) !== JSON.stringify(input.writeScope) || previous.network !== input.network) throw new TaskError("INVALID_TASK", "Idempotency scope mismatch");
         return previous;
-      }
-    }
-    if (this.orchestrator === "omnigent") {
-      if (input.provider !== "codex") throw new TaskError("OMNIGENT_PROVIDER_UNSUPPORTED", "Omnigent G1 supports provider=codex only");
-      const safe = sanitizeOmnigentOutput(input.instruction);
-      if (!safe.allowed || safe.text.includes("[REDACTED]")) {
-        throw new TaskError("SENSITIVE_TASK_INPUT", "Remove credentials from the instruction before submitting an Omnigent task");
       }
     }
     if (!this.fullAccess && this.protectedWriteScopes.some((protectedScope) =>
@@ -1441,8 +1558,26 @@ export class CodexTaskManager {
     }
     const now = new Date().toISOString();
     const queuePosition = this.allocateQueuePosition();
+    // Codex selection: the async caller (MCP layer) resolves against the live
+    // catalog and passes it here; direct in-process callers with an explicit
+    // model get an unconfirmed explicit selection that dispatch re-confirms.
+    // Omitted selections resolve at dispatch (preference > account default).
+    const selection: ExecutionSelection | null = input.provider === "codex"
+      ? access.selection ?? (input.model
+          ? { model: input.model, effort: input.effort ?? null, binding_source: "explicit-task" as const, catalog_revision: null, catalog_confirmed: false }
+          : null)
+      : null;
+    const requestedSelection = input.provider === "codex"
+      ? access.continuation
+        ? { model: access.continuation.model as string | null, effort: access.continuation.effort as string | null }
+        : { model: input.model ?? null, effort: input.effort ?? null }
+      : null;
     const record: PersistedTaskRecord = {
       continuation: access.continuation ? { idempotencyKey: access.continuation.idempotencyKey, model: access.continuation.model, effort: access.continuation.effort, timeoutMs: access.continuation.timeoutMs } : undefined,
+      selection,
+      requestedSelection,
+      dispatchedSelection: null,
+      observedSelection: null,
       taskId,
       workspaceId: this.workspace.id,
       ownerId,
@@ -1459,7 +1594,6 @@ export class CodexTaskManager {
       runTests: input.runTests,
       approvalMode: "workspace_write",
       provider: input.provider,
-      orchestrator: this.orchestrator,
       providerSessionId: previousProviderSessionId,
       providerModel: effectiveModel,
       status: "queued",
@@ -1597,24 +1731,6 @@ export class CodexTaskManager {
     if (TERMINAL_STATUSES.has(record.status)) return access.remote ? remoteView(record) : publicView(record);
     const now = new Date().toISOString();
     record.cancelRequestedAt ??= now;
-    if (record.orchestrator === "omnigent" && record.status !== "queued") {
-      record.status = "cancelling";
-      this.writeTask(record);
-      try {
-        await (await this.getOmnigentBackend()).cancel(taskId, record.providerSessionId ? { providerSessionId: record.providerSessionId } : undefined);
-        await this.closeAppServer(); // Also stop any C2C fixed verification command.
-      } catch {
-        record.error = { code: "OMNIGENT_CANCEL_UNCONFIRMED", message: "Omnigent may still be running; retry cancellation before dispatching more work" };
-        this.writeTask(record);
-        throw new TaskError(record.error.code, record.error.message);
-      }
-      this.recoveringOmnigentTasks.delete(taskId);
-      const runtime = this.active?.record.taskId === taskId ? this.active : null;
-      this.recordTerminal(record, runtime, { status: "cancelled", threadId: record.threadId ?? "", turnId: record.turnId ?? "" });
-      if (runtime) this.active = null;
-      this.schedulePump();
-      return access.remote ? remoteView(record) : publicView(record);
-    }
     if (record.provider === "gemini") {
       await this.antigravityBackend.cancel(taskId);
     }
@@ -1640,7 +1756,7 @@ export class CodexTaskManager {
         threadId: record.threadId ?? "",
         turnId: record.turnId ?? "",
       });
-      if (record.provider !== "gemini") {
+      if (record.provider !== "gemini" || this.appServerClient) {
         await this.closeAppServer();
       }
     } else {
@@ -1931,7 +2047,7 @@ export class CodexTaskManager {
 
   private pump(): void {
     this.queuePauseState = readWorkspaceQueuePauseState(this.workspace.id, this.stateDir);
-    if (this.closed || this.recovering || this.collectorBusy || this.recoveringOmnigentTasks.size > 0 || this.active || this.queuePauseState.paused) return;
+    if (this.closed || this.recovering || this.collectorBusy || this.active || this.queuePauseState.paused) return;
     // Native reservations share this writer domain, including after restart.
     // Queued work waits for terminal status to release the slot.
     const slot = readWorkspaceSlot(this.workspace.id, this.stateDir);
@@ -2046,9 +2162,7 @@ export class CodexTaskManager {
       ? `; verification_profile=${record.verification.profileId}; verification_status=${record.verification.status}; verification_argv_sha256=${record.verification.argvHash}; verification_network=false; verification_sandbox=${record.verification.sandbox}`
       : "";
     const isGemini = record.provider === "gemini";
-    const notesString = record.orchestrator === "omnigent"
-      ? `backend=omnigent; provider=codex; task_status=${record.status}; network=${networkEffective}${verificationNote}`
-      : isGemini
+    const notesString = isGemini
       ? `provider=gemini; providerRuntime=${record.providerRuntime ?? "antigravity-cli"}; providerModel=${record.providerModel ?? "gemini-3.8-flash-high"}; task_status=${record.status}; network=${networkEffective}${verificationNote}`
       : `backend=codex-app-server; protocol=v2; task_status=${record.status}; network=${networkEffective}; approvals_accepted=${accepted}; approvals_declined=${declined}${verificationNote}`;
     return {
@@ -2058,7 +2172,6 @@ export class CodexTaskManager {
       sessionId: record.sessionId,
       taskStatus: record.status,
       provider: record.provider ?? "codex",
-      orchestrator: record.orchestrator ?? "legacy",
       providerRuntime: record.providerRuntime ?? (isGemini ? "antigravity-cli" : "codex-app-server"),
       providerModel: record.providerModel ?? (isGemini ? "gemini-3.8-flash-high" : undefined),
       providerSessionId: record.providerSessionId ?? record.threadId ?? undefined,
@@ -2200,6 +2313,14 @@ export class CodexTaskManager {
     // intentionally left queued: their persisted instruction and policy are
     // replayed by prepareQueuedTask and the normal FIFO pump.
     for (const record of loaded) {
+      // Historical backend selections are migration metadata only. Never
+      // dispatch saved work from a retired backend through a native provider.
+      const savedBackend = (record as unknown as { orchestrator?: unknown }).orchestrator;
+      if (!TERMINAL_STATUSES.has(record.status) && savedBackend !== undefined && savedBackend !== "legacy") {
+        this.recordTerminal(record, null, { status: "interrupted", threadId: record.threadId ?? "", turnId: record.turnId ?? "" },
+          new TaskError("UNSUPPORTED_SAVED_BACKEND", "The saved task backend is no longer supported; submit a new task explicitly"));
+        continue;
+      }
       if (TERMINAL_STATUSES.has(record.status)) {
         // The task registry wins over every historical line. Repair the
         // reverse crash window only by appending an audit line that matches
@@ -2221,13 +2342,6 @@ export class CodexTaskManager {
         continue;
       }
       if (!RECOVERABLE_STATUSES.has(record.status) || TERMINAL_STATUSES.has(record.status)) continue;
-      if (record.orchestrator === "omnigent") {
-        this.recoveringOmnigentTasks.add(record.taskId);
-        record.status = "cancelling";
-        this.writeTask(record);
-        void this.recoverOmnigentTask(record);
-        continue;
-      }
       record.error ??= {
         code: "BRIDGE_RESTARTED",
         message: "The bridge restarted before this task finished.",
@@ -2250,12 +2364,6 @@ export class CodexTaskManager {
   private prepareQueuedTask(record: PersistedTaskRecord): PreparedQueuedTask | null {
     if (record.continuation && (!record.ownerId || !this.continuationAuthorize?.(record.ownerId, record.workspaceId, "execution.submit"))) {
       this.failQueuedTask(record, new TaskError("TASK_NOT_AUTHORIZED", "Continuation owner authorization revoked or unavailable"));
-      return null;
-    }
-    if ((record.orchestrator ?? "legacy") !== this.orchestrator ||
-        (record.orchestrator === "omnigent" && (record.provider ?? "codex") !== "codex")) {
-      this.failQueuedTask(record, new TaskError("ORCHESTRATOR_CHANGED", "The queued task's original orchestrator is no longer selected; submit a new task explicitly"));
-      this.schedulePump();
       return null;
     }
     const pending = this.pendingInputs.get(record.taskId);
@@ -2371,6 +2479,7 @@ export class CodexTaskManager {
         client = this.appServerFactory({
           workspaceRoot: this.workspace.root,
           logger: this.logger,
+          stateDir: this.stateDir,
           env: runtimeEnvironment.env,
           serenaRuntimeHome: runtimeEnvironment.serenaHome,
           fullAccess: this.fullAccess,
@@ -2438,12 +2547,9 @@ export class CodexTaskManager {
       await this.executeGeminiTask(record, input, runtime, verificationProfile);
       return;
     }
-    if (record.orchestrator === "omnigent") {
-      await this.executeOmnigentTask(record, input, runtime, verificationProfile);
-      return;
-    }
     this.active = runtime;
     record.status = "running";
+    record.lifecyclePhase = "SPAWNING_PROVIDER";
     record.startedAt = new Date().toISOString();
     this.writeTask(record);
     this.updateSession(record);
@@ -2454,6 +2560,7 @@ export class CodexTaskManager {
 
     try {
       const client = await this.getAppServer(input.network);
+      record.lifecyclePhase = "PROVIDER_STARTED";
       // This is the effective policy actually handed to the fixed App Server
       // factory for this task. Keep it separate from the caller request and
       // the bridge's public compatibility `network` alias.
@@ -2506,16 +2613,65 @@ export class CodexTaskManager {
         );
         return;
       }
+      record.lifecyclePhase = "SESSION_ESTABLISHING";
+      this.writeTask(record);
+      // Resolve the model/effort this task will actually run with. Priority:
+      // continuation pin > persisted selection > bridge preference > account
+      // default. Everything is re-confirmed against the live catalog here so a
+      // task queued before a catalog change fails loudly (MODEL_NOT_LISTED)
+      // instead of silently running on a different route; the user's global
+      // config.toml default is never inherited.
+      let selection: { model: string; effort: string | null; source: string } | null = null;
+      if (record.continuation) {
+        selection = { model: record.continuation.model, effort: record.continuation.effort, source: "continuation-pin" };
+      } else if (record.selection) {
+        selection = { model: record.selection.model, effort: record.selection.effort, source: record.selection.binding_source };
+      } else if (this.modelCatalog) {
+        const { resolveCodexExecutionSelection, bridgeCodexPreference } = await import("./model-catalog.js");
+        const resolved = await resolveCodexExecutionSelection(this.modelCatalog, {}, bridgeCodexPreference());
+        selection = { model: resolved.model, effort: resolved.effort, source: resolved.binding_source };
+        record.selection = resolved;
+        this.writeTask(record);
+      }
+      if (selection && this.modelCatalog) {
+        const confirmation = await this.modelCatalog.confirmCodexSelection(selection.model, selection.effort);
+        if (confirmation.problem) {
+          throw new TaskError(confirmation.problem.startsWith("MODEL_NOT_LISTED") ? "MODEL_NOT_LISTED"
+            : confirmation.problem.startsWith("UNSUPPORTED_EFFORT") ? "UNSUPPORTED_EFFORT"
+            : "MODEL_CATALOG_UNAVAILABLE", confirmation.problem);
+        }
+        record.selection = { ...(record.selection ?? { binding_source: "explicit-task" as const, catalog_confirmed: false }), model: selection.model, effort: selection.effort, binding_source: record.selection?.binding_source ?? "explicit-task", catalog_revision: confirmation.revision, catalog_confirmed: true };
+        this.writeTask(record);
+      }
       const threadResponse = await client.request<unknown>("thread/start", {
-        ...(record.continuation ? { model: record.continuation.model } : {}),
+        ...(selection ? { model: selection.model } : {}),
         cwd: this.workspace.root,
         approvalPolicy: input.fullAccess ? "never" : "on-request",
         sandbox: input.fullAccess ? "danger-full-access" : "workspace-write",
       });
       const threadId = this.extractId(threadResponse, "thread");
-      if (record.continuation && asObject(threadResponse).model !== record.continuation.model) throw new TaskError("INVALID_MODEL", "Native thread did not confirm the exact approved model");
+      if (selection) {
+        const reportedModel = asObject(threadResponse).model;
+        if (record.continuation) {
+          if (reportedModel !== record.continuation.model) throw new TaskError("INVALID_MODEL", "Native thread did not confirm the exact approved model");
+        } else if (typeof reportedModel === "string" && reportedModel !== selection.model) {
+          throw new TaskError("INVALID_MODEL", `Native thread started model "${reportedModel}" instead of the selected "${selection.model}"`);
+        }
+        // Evidence model: dispatched = what we sent (split per RPC); observed
+        // = ONLY what the upstream explicitly proved. thread/start echoes the
+        // model but does not echo effort, so observed effort stays null here —
+        // the dispatched effort is never copied into observed. A session
+        // readback at terminal may replace this with upstream-reported values.
+        record.dispatchedSelection = { thread: { model: selection.model }, turn: null };
+        record.observedSelection = {
+          model: typeof reportedModel === "string" ? reportedModel : null,
+          effort: null,
+          source: "thread/start",
+        };
+      }
       if (!threadId) throw new TaskError("CODEX_EXECUTION_FAILED", "Codex did not return a thread id");
       record.threadId = threadId;
+      record.lifecyclePhase = "SESSION_ESTABLISHED";
       this.writeTask(record);
       if (record.cancelRequestedAt || this.closed) {
         const shuttingDown = !record.cancelRequestedAt && (this.closed || runtime.shutdownRequested);
@@ -2533,8 +2689,19 @@ export class CodexTaskManager {
         return;
       }
 
+      if (selection) {
+        // The turn/start request is about to be issued: record the dispatch
+        // with outcome "unknown" so a lost response is distinguishable from a
+        // turn that was never sent. Mutations are never automatically re-sent.
+        record.dispatchedSelection = {
+          thread: { model: selection.model },
+          turn: { model: selection.model, effort: selection.effort, outcome: "unknown" },
+        };
+        this.writeTask(record);
+      }
       const turnResponse = await client.request<unknown>("turn/start", {
-        ...(record.continuation ? { model: record.continuation.model, effort: record.continuation.effort } : {}),
+        ...(selection ? { model: selection.model } : {}),
+        ...(selection?.effort ? { effort: selection.effort } : {}),
         threadId,
         input: [{ type: "text", text: this.buildInstruction(input) }],
         cwd: this.workspace.root,
@@ -2552,6 +2719,10 @@ export class CodexTaskManager {
       const turnId = this.extractId(turnResponse, "turn");
       if (!turnId) throw new TaskError("CODEX_EXECUTION_FAILED", "Codex did not return a turn id");
       record.turnId = turnId;
+      record.lifecyclePhase = "EXECUTING";
+      if (selection && record.dispatchedSelection?.turn) {
+        record.dispatchedSelection.turn.outcome = "accepted";
+      }
       this.writeTask(record);
       if (record.cancelRequestedAt || this.closed) {
         const shuttingDown = !record.cancelRequestedAt && (this.closed || runtime.shutdownRequested);
@@ -2640,13 +2811,11 @@ export class CodexTaskManager {
 
   private async stopRuntime(runtime: RuntimeTask, reason: "cancel" | "timeout" | "shutdown" | "policy"): Promise<void> {
     if (runtime.finalized) return;
-    if (runtime.record.orchestrator === "omnigent" && !runtime.verificationInFlight) {
-      await (await this.getOmnigentBackend()).cancel(runtime.record.taskId,
-        runtime.record.providerSessionId ? { providerSessionId: runtime.record.providerSessionId } : undefined);
-      return;
-    }
     if (runtime.record.provider === "gemini") {
       await this.antigravityBackend.cancel(runtime.record.taskId);
+      if (runtime.verificationInFlight || this.appServerClient) {
+        await this.closeAppServer();
+      }
       return;
     }
     const client = this.appServerClient ?? (await this.appServerPromise?.catch(() => null)) ?? null;
@@ -2848,139 +3017,6 @@ export class CodexTaskManager {
     runtime.approvalTimers.clear();
   }
 
-  private async getOmnigentBackend(): Promise<ExecutionBackend> {
-    this.omnigentBackend ??= new OmnigentBackend({ ...this.omnigentOptions, stateDir: this.stateDir });
-    if (this.omnigentBackend.provider !== "codex") throw new TaskError("OMNIGENT_PROVIDER_UNSUPPORTED", "Omnigent G1 requires the Codex provider");
-    await this.omnigentBackend.initialize(this.workspace.root);
-    if (this.omnigentBackend instanceof OmnigentBackend) this.omnigentBackend.bindWorkspaceId(this.workspace.id);
-    return this.omnigentBackend;
-  }
-
-  private async recoverOmnigentTask(record: PersistedTaskRecord): Promise<void> {
-    try {
-      await (await this.getOmnigentBackend()).cancel(record.taskId, record.providerSessionId ? { providerSessionId: record.providerSessionId } : undefined);
-      this.recoveringOmnigentTasks.delete(record.taskId);
-      this.recordTerminal(record, null, { status: "interrupted", threadId: record.threadId ?? "", turnId: record.turnId ?? "" },
-        new TaskError("BRIDGE_RESTARTED", "The bridge restarted; the previous Omnigent writer has been stopped"));
-      this.schedulePump();
-    } catch {
-      record.error = { code: "OMNIGENT_CANCEL_UNCONFIRMED", message: "The previous Omnigent writer could not be stopped; retry cancellation before dispatching more work" };
-      this.writeTask(record);
-    }
-  }
-
-  private async executeOmnigentTask(
-    record: PersistedTaskRecord,
-    input: ValidatedTaskInput,
-    runtime: RuntimeTask,
-    verificationProfile: VerificationProfile | null
-  ): Promise<void> {
-    this.active = runtime;
-    record.status = "running";
-    record.startedAt = new Date().toISOString();
-    record.providerRuntime = "omnigent:codex-native";
-    this.writeTask(record);
-    this.updateSession(record);
-    this.emitLifecycleEvent("start", record, record.startedAt);
-    let unconfirmed = false;
-    // Detect changes to files that were already dirty before this task too.
-    // Only hash paths C2C's workspace layer allows us to inspect.
-    const fingerprint = (file: string): string | null => {
-      try {
-        const resolved = this.workspace.resolve(file);
-        const stat = fs.statSync(resolved.abs);
-        if (!stat.isFile() || stat.size > 16 * 1024 * 1024) return `${stat.size}:${stat.mtimeMs}`;
-        return createHash("sha256").update(fs.readFileSync(resolved.abs)).digest("hex");
-      } catch { return null; }
-    };
-    const dirtyBefore = new Map([...runtime.baselineFiles].map((file) => [file, fingerprint(file)]));
-    try {
-      const backend = await this.getOmnigentBackend();
-      if (runtime.finalized || record.cancelRequestedAt || this.closed) return;
-      const result = await backend.execute({
-        taskId: record.taskId, workspaceId: this.workspace.id, workspaceRoot: this.workspace.root,
-        // G1 always uses scoped Codex sandboxing, even when the deployment is
-        // allowed full local access. The prompt describes that actual policy.
-        instruction: this.buildInstruction({ ...input, fullAccess: false }),
-        writeScope: input.writeScope, writableRoots: input.writableRoots,
-        networkRequested: input.networkRequested, networkEffective: input.networkEffective,
-        fullAccess: input.fullAccess, runTests: input.runTests, sessionId: record.sessionId,
-        timeoutMs: this.taskTimeoutMs,
-        onIdentity: (identity) => {
-          if (runtime.finalized) return;
-          record.providerSessionId = identity.providerSessionId;
-          record.threadId = identity.providerSessionId;
-          record.turnId = identity.providerTurnId;
-          this.writeTask(record);
-          this.updateSession(record);
-        },
-      });
-      if (runtime.finalized) return;
-      if (result.provider !== "codex") throw new TaskError("OMNIGENT_PROVIDER_UNSUPPORTED", "Omnigent returned a different provider");
-      record.providerSessionId = result.providerSessionId ?? record.providerSessionId;
-      record.threadId = record.providerSessionId;
-      record.turnId = result.providerTurnId ?? record.turnId;
-      record.providerModel = result.providerModel;
-      record.networkReported = result.networkReported ?? null;
-      if (result.quiescent === false) {
-        unconfirmed = true;
-        record.status = "cancelling";
-        record.error = { code: "OMNIGENT_CANCEL_UNCONFIRMED", message: "Omnigent may still be running; retry cancellation before dispatching more work" };
-        this.writeTask(record);
-        this.updateSession(record);
-        return;
-      }
-      if (result.output) {
-        const output = saveExecutionOutput(this.workspace.id, {
-          command: "omnigent:codex-native", raw: result.output, exitCode: result.status === "completed" ? 0 : 1,
-          taskId: record.taskId, ownerId: record.ownerId, sessionId: record.sessionId,
-        }, this.stateDir);
-        record.outputIds.push(output.id);
-        record.outputAvailable = output.allowed;
-      }
-      const changed = new Set(result.changedFiles);
-      for (const file of new Set([...currentGitFiles(this.workspace), ...dirtyBefore.keys()])) {
-        if (!dirtyBefore.has(file) || dirtyBefore.get(file) !== fingerprint(file)) changed.add(file);
-      }
-      for (const file of changed) {
-        try {
-          const resolved = this.workspace.resolve(file);
-          if (!withinAny(resolved.abs, input.writableRoots)) runtime.policyViolation ??= "Omnigent changed a file outside the declared write scope";
-          runtime.itemPaths.add(resolved.rel);
-        } catch {
-          runtime.policyViolation ??= "Omnigent reported a change outside the authorized workspace";
-        }
-      }
-      if (result.status === "timed_out") runtime.timedOut = true;
-      if (result.error) runtime.failure = new TaskError(result.error.code, result.error.message);
-      if (runtime.policyViolation) runtime.failure = new TaskError("WRITE_SCOPE_VIOLATION", runtime.policyViolation);
-      if (result.status === "completed" && !runtime.failure && input.runTests && !record.cancelRequestedAt && !this.closed) {
-        // Existing C2C-owned fixed command/exec verification, never a legacy
-        // coding turn. It runs only after a successful, stopped Omnigent turn.
-        const client = await this.getAppServer(input.network);
-        if (!verificationProfile || !this.codexRuntime) throw new TaskError("NO_VERIFICATION_PROFILE", "No registered verification profile is available");
-        runtime.verificationRuntimeRoot = this.codexRuntime.root;
-        runtime.verification = materializeVerificationProfile(verificationProfile, this.workspace,
-          prepareVerificationRuntime(this.codexRuntime.root, record.taskId));
-        await this.runVerification(runtime, client);
-      }
-      this.recordTerminal(record, runtime, { status: result.status, threadId: record.threadId ?? "", turnId: record.turnId ?? "" }, runtime.failure);
-    } catch (error) {
-      if (runtime.finalized || unconfirmed) return;
-      const failure = error instanceof TaskError || error instanceof OmnigentError
-        ? new TaskError(error.code, error.message)
-        : new TaskError("OMNIGENT_EXECUTION_FAILED", "Omnigent execution failed");
-      this.recordTerminal(record, runtime, { status: "failed", threadId: record.threadId ?? "", turnId: record.turnId ?? "" }, failure);
-    } finally {
-      if (runtime.verification && runtime.verificationRuntimeRoot) {
-        cleanupVerificationRuntime(runtime.verificationRuntimeRoot, runtime.verification.runtime);
-      }
-      await this.closeAppServer();
-      if (!unconfirmed && this.active?.record.taskId === record.taskId) this.active = null;
-      this.schedulePump();
-    }
-  }
-
   private async executeGeminiTask(
     record: PersistedTaskRecord,
     input: ValidatedTaskInput,
@@ -3054,6 +3090,15 @@ export class CodexTaskManager {
       if (result.providerSessionId) {
         record.providerSessionId = result.providerSessionId;
         record.threadId = result.providerSessionId;
+      } else if (result.error?.code === "ANTIGRAVITY_SESSION_START_FAILED" && record.providerSessionId) {
+        // G2: the resumed AGY conversation is dead — discard the stale C2C
+        // provider-session metadata so neither this record nor the session
+        // registry keeps handing it out as a resume target.
+        record.providerSessionId = undefined;
+        record.threadId = undefined;
+      }
+      if ((result as { sessionRecovered?: boolean }).sessionRecovered) {
+        record.sessionRecoveredAt = new Date().toISOString();
       }
       record.provider = "gemini";
       record.providerRuntime = result.providerRuntime;
@@ -3099,20 +3144,23 @@ export class CodexTaskManager {
         }
       }
 
-      let completionStatus: string = result.status;
-      if (!input.fullAccess && runtime.policyViolation) {
-        completionStatus = "failed";
-      } else if (runtime.timedOut) {
-        completionStatus = "timed_out";
-      } else if (record.cancelRequestedAt) {
-        completionStatus = "cancelled";
+      const cancelled = Boolean(record.cancelRequestedAt);
+      const shuttingDown = !cancelled && (this.closed || runtime.shutdownRequested);
+      if (shuttingDown) {
+        runtime.shutdownRequested = true;
+        record.error ??= { code: "BRIDGE_RESTARTED", message: "The bridge restarted before this task finished." };
       }
 
-      const completion = {
-        status: completionStatus,
-        threadId: record.providerSessionId ?? "",
-        turnId: record.turnId ?? "",
-      };
+      let completionStatus: string = result.status;
+      if (shuttingDown) {
+        completionStatus = "interrupted";
+      } else if (cancelled) {
+        completionStatus = "cancelled";
+      } else if (runtime.timedOut) {
+        completionStatus = "timed_out";
+      } else if (!input.fullAccess && runtime.policyViolation) {
+        completionStatus = "failed";
+      }
 
       let failureError: TaskError | undefined;
       if (!input.fullAccess && runtime.policyViolation) {
@@ -3121,7 +3169,89 @@ export class CodexTaskManager {
         failureError = new TaskError(result.error.code as TaskErrorCode, result.error.message);
       }
 
-      this.recordTerminal(record, runtime, completion, failureError);
+      if (!runtime.finalized && !shuttingDown && !cancelled && completionStatus === "completed" && !runtime.policyViolation && !failureError) {
+        if (input.runTests) {
+          let verificationClient: AppServerClient | null = null;
+          try {
+            if (!record.cancelRequestedAt && !this.closed && !runtime.shutdownRequested) {
+              if (!verificationProfile) {
+                throw new TaskError("NO_VERIFICATION_PROFILE", "No local verification profile is available for this workspace");
+              }
+              try {
+                verificationClient = await this.getAppServer(false);
+              } catch (appServerError) {
+                if (appServerError instanceof TaskError && (
+                  appServerError.code === "NO_VERIFICATION_PROFILE" ||
+                  appServerError.code === "VERIFICATION_PROFILE_INVALID" ||
+                  appServerError.code === "VERIFICATION_EXECUTION_FAILED" ||
+                  appServerError.code === "VERIFICATION_TIMEOUT"
+                )) {
+                  throw appServerError;
+                }
+                throw new TaskError(
+                  "VERIFICATION_EXECUTION_FAILED",
+                  `The registered verification profile could not be executed: ${safeMessage(appServerError, "verification executor unavailable")}`
+                );
+              }
+              if (!record.cancelRequestedAt && !this.closed && !runtime.shutdownRequested) {
+                if (!this.codexRuntime) {
+                  throw new TaskError("NO_VERIFICATION_PROFILE", "No local verification profile is available for this workspace");
+                }
+                try {
+                  const verificationRuntime = prepareVerificationRuntime(this.codexRuntime.root, record.taskId);
+                  runtime.verificationRuntimeRoot = this.codexRuntime.root;
+                  runtime.verification = materializeVerificationProfile(verificationProfile, this.workspace, verificationRuntime);
+                } catch (error) {
+                  throw new TaskError(
+                    "VERIFICATION_PROFILE_INVALID",
+                    `Unable to prepare the local verification profile: ${safeMessage(error, "profile setup failed")}`
+                  );
+                }
+                if (!record.cancelRequestedAt && !this.closed && !runtime.shutdownRequested) {
+                  await this.runVerification(runtime, verificationClient);
+                }
+              }
+            }
+          } catch (error) {
+            if (error instanceof TaskError) {
+              runtime.failure = error;
+            } else {
+              runtime.failure = new TaskError(
+                "VERIFICATION_EXECUTION_FAILED",
+                `The registered verification profile could not be executed: ${safeMessage(error, "verification failed")}`
+              );
+            }
+          } finally {
+            await this.closeAppServer();
+          }
+        }
+      }
+
+      const cancelledAfter = Boolean(record.cancelRequestedAt);
+      const shuttingDownAfter = !cancelledAfter && (this.closed || runtime.shutdownRequested);
+      if (shuttingDownAfter) {
+        runtime.shutdownRequested = true;
+        record.error ??= { code: "BRIDGE_RESTARTED", message: "The bridge restarted before this task finished." };
+      }
+
+      const terminalCompletion = {
+        status: shuttingDownAfter
+          ? "interrupted"
+          : cancelledAfter
+            ? "cancelled"
+            : completionStatus,
+        threadId: record.providerSessionId ?? "",
+        turnId: record.turnId ?? "",
+      };
+
+      this.recordTerminal(
+        record,
+        runtime,
+        terminalCompletion,
+        shuttingDownAfter
+          ? new TaskError("BRIDGE_RESTARTED", "The bridge restarted before this task finished.")
+          : failureError ?? (runtime.failure ? runtime.failure : undefined)
+      );
     } catch (err) {
       if (runtime.finalized) return;
       record.actualProvider = null;
@@ -3131,6 +3261,16 @@ export class CodexTaskManager {
         : new TaskError("ANTIGRAVITY_SESSION_START_FAILED", safeMessage(err, "Gemini execution failed"));
       this.recordTerminal(record, runtime, { status: "failed", threadId: "", turnId: "" }, error);
     } finally {
+      if (runtime.taskTimeout) clearTimeout(runtime.taskTimeout);
+      this.clearApprovalTimers(runtime);
+      if (runtime.verification && runtime.verificationRuntimeRoot) {
+        try {
+          cleanupVerificationRuntime(runtime.verificationRuntimeRoot, runtime.verification.runtime);
+        } catch (error) {
+          this.logger.warn("Unable to clean verification runtime", { taskId: record.taskId, message: safeMessage(error, "cleanup failed") });
+        }
+      }
+      await this.closeAppServer();
       if (this.active?.record.taskId === record.taskId) {
         this.active = null;
       }
@@ -3178,6 +3318,8 @@ export class CodexTaskManager {
       completion,
       resolveCompletion,
       completionSettled: false,
+      turnCompletionResult: null,
+      finalAgentMessage: null,
     };
   }
 
@@ -3321,6 +3463,10 @@ export class CodexTaskManager {
     // known; the App Server lifecycle includes both on task-scoped events.
     if (runtime.record.threadId && eventThreadId !== runtime.record.threadId) return;
     if (runtime.record.turnId && eventTurnId !== runtime.record.turnId) return;
+    if (runtime.record.lifecyclePhase !== "EXECUTING" && runtime.record.lifecyclePhase !== "TERMINAL") {
+      runtime.record.lifecyclePhase = "EXECUTING";
+      this.writeTask(runtime.record);
+    }
     if (notification.method === "item/started") {
       const item = params.item;
       const id = itemId(asObject(item));
@@ -3340,6 +3486,14 @@ export class CodexTaskManager {
       if (id) runtime.pendingItems.delete(id);
       const paths = pathValues(item);
       for (const filePath of paths) this.observePath(runtime, filePath);
+      const itemType = stringValue(item.itemType ?? item.type) ?? "";
+      if (/agent.?message|assistant.?message/i.test(itemType) || (!itemType && typeof item.text === "string" && !item.command)) {
+        // C1: capture the final assistant message so completed tasks always
+        // have a retrievable bounded output. Redact + bound; the LAST one
+        // wins (later assistant messages supersede earlier drafts).
+        const text = redact(stringValue(item.text) ?? outputText(item)).trim();
+        if (text) runtime.finalAgentMessage = text.slice(0, 16000);
+      }
       const command = commandText(item.command);
       if (command && (TEST_COMMAND_PATTERN.test(command) || /\b(?:typecheck|tsc|playwright)\b/i.test(command))) {
         const sourceHash = verificationFingerprint(this.workspace.root);
@@ -3363,13 +3517,21 @@ export class CodexTaskManager {
       const turnId = turnIdFrom(params) ?? runtime.record.turnId ?? "";
       const turn = asObject(params.turn);
       const status = stringValue(params.status ?? turn.status) ?? "completed";
+      if (status === "failed") {
+        const message = normalizedCodexErrorMessage(params);
+        runtime.executionError ??= message;
+        runtime.failure ??= codexExecutionFailure(message);
+      }
       this.resolveCompletion(runtime, { status, threadId, turnId });
       return;
     }
     if (notification.method === "error") {
-      const message = stringValue(params.message) ?? stringValue(params.error) ?? "Codex reported an execution error";
-      runtime.executionError ??= redact(message).slice(0, 500);
-      runtime.failure ??= new TaskError("CODEX_EXECUTION_FAILED", runtime.executionError);
+      // Official v2 ErrorNotification includes willRetry. A retry notice is
+      // diagnostic only; the matching terminal turn decides the task result.
+      if (params.willRetry === true || params.retryable === true) return;
+      const message = normalizedCodexErrorMessage(params);
+      runtime.executionError ??= message;
+      runtime.failure ??= codexExecutionFailure(message);
       this.resolveCompletion(runtime, {
         status: "failed",
         threadId: runtime.record.threadId ?? "",
@@ -3432,6 +3594,7 @@ export class CodexTaskManager {
   private resolveCompletion(runtime: RuntimeTask, completion: TurnCompletion): void {
     if (runtime.completionSettled) return;
     runtime.completionSettled = true;
+    runtime.turnCompletionResult = completion;
     runtime.resolveCompletion(completion);
   }
 
@@ -3471,6 +3634,34 @@ export class CodexTaskManager {
       return;
     }
     this.releaseTaskSlot(record, runtime);
+    // Honest evidence: if the native session metadata is readable, replace the
+    // thread/start echo with what the upstream actually recorded per turn.
+    // Each field is compared ONLY when both the dispatched and the upstream
+    // value exist; missing upstream effort stays unknown (neither "consistent"
+    // nor a mismatch), and max vs ultra are distinct tokens. Contradictions
+    // are flagged via observedSelection.mismatch. Historical records are never
+    // rewritten — this runs once per task at its own terminal transition.
+    if ((record.provider ?? "codex") === "codex" && record.dispatchedSelection && record.threadId && record.turnId && record.startedAt) {
+      try {
+        const evidence = observeNativeModel(record.threadId, record.startedAt, record.turnId);
+        if (evidence) {
+          const dispatchedModel = record.dispatchedSelection.turn?.model ?? record.dispatchedSelection.thread.model ?? null;
+          const dispatchedEffort = record.dispatchedSelection.turn?.effort ?? null;
+          const modelMismatch = typeof dispatchedModel === "string" && evidence.model !== dispatchedModel;
+          const effortMismatch = typeof dispatchedEffort === "string"
+            && typeof evidence.effort === "string" && evidence.effort.length > 0
+            && evidence.effort !== dispatchedEffort;
+          record.observedSelection = {
+            model: evidence.model,
+            effort: evidence.effort,
+            source: evidence.source,
+            ...(modelMismatch || effortMismatch ? { mismatch: true } : {}),
+          };
+        }
+      } catch {
+        // Readback stays unknown; the thread/start echo evidence remains.
+      }
+    }
     if (runtime) {
       // Set the guard before doing any filesystem work. Late turn/completed,
       // cancellation, timeout, and App Server-close paths must converge on
@@ -3503,6 +3694,35 @@ export class CodexTaskManager {
         }
       }
       record.changedFiles = [...changed].sort();
+      // C1: persist the bounded final assistant message as the task's primary
+      // execution output so completed tasks are always retrievable through
+      // execution_output. Redacted + bounded at capture time.
+      if (runtime.finalAgentMessage) {
+        try {
+          const meta = saveExecutionOutput(this.workspace.id, {
+            command: "codex:final-assistant-message",
+            raw: runtime.finalAgentMessage,
+            exitCode: 0,
+            taskId: record.taskId,
+            ownerId: record.ownerId,
+            sessionId: record.sessionId,
+          }, this.stateDir);
+          record.outputIds.unshift(meta.id);
+          record.outputAvailable = meta.allowed;
+        } catch {
+          // best-effort: output capture must never fail the task
+        }
+      }
+      // C2: distinguish "agent turn completed" from "requested action
+      // verified". The authoritative turn status is the runtime completion
+      // (record.status is still "running" here); changed-files evidence is
+      // surfaced so callers can confirm the requested actions match reality
+      // instead of trusting status alone.
+      record.actionEvidence = {
+        turnCompleted: completion?.status === "completed",
+        changedFiles: record.changedFiles.length,
+        finalOutputCaptured: record.outputIds.length > 0,
+      };
       if (runtime.verificationSummary) {
         record.tests = runtime.verificationSummary;
       } else if (runtime.verificationTimedOut) {

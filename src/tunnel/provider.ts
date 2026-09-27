@@ -4,6 +4,8 @@
  * but ngrok / Tailscale / custom providers can be added without touching
  * the bridge.
  */
+export type TunnelManagement = "managed" | "external";
+
 export interface TunnelStatus {
   running: boolean;
   url: string | null;
@@ -20,6 +22,16 @@ export interface TunnelStatus {
   /** Exact executable and argv used to launch the provider, without secrets. */
   executable?: string | null;
   argv?: string[];
+  /** Process management mode: "managed" if owned child process, "external" if externally observed. */
+  management?: TunnelManagement;
+  /** Public route reachability, separate from process ownership. Null means unverified. */
+  reachable?: boolean | null;
+  /** Whether the bridge owns/spawned the process. */
+  ownsProcess?: boolean;
+  /** Whether the bridge can control (stop/restart/kill) the process. */
+  canControlProcess?: boolean;
+  /** Timestamp when external tunnel connectivity was observed. */
+  observedAt?: string;
 }
 
 export interface TunnelDoctorReport {
@@ -35,6 +47,11 @@ export interface TunnelDoctorReport {
   configFile?: string | null;
   executable?: string | null;
   argv?: string[];
+  management?: TunnelManagement;
+  reachable?: boolean | null;
+  ownsProcess?: boolean;
+  canControlProcess?: boolean;
+  observedAt?: string;
 }
 
 export interface TunnelProvider {
@@ -45,5 +62,6 @@ export interface TunnelProvider {
   restart(localPort: number): Promise<string>;
   status(): TunnelStatus;
   getPublicUrl(): string | null;
-  doctor(): Promise<TunnelDoctorReport>;
+  /** Optional current bridge origin for read-only external route observation. */
+  doctor(originPort?: number): Promise<TunnelDoctorReport>;
 }
