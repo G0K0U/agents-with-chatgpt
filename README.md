@@ -434,8 +434,8 @@ This public repository derives from and upstreams [XiaoDuoYa/codex-with-chatgpt]
 
 ## Status & disclaimer
 
-The 0.3.0 candidate's local A2C OAuth path completed a GPT-6 Sol/max nonce
-canary with matching selection and no file changes. See the
+The tested 0.3.0 build's local A2C OAuth path completed a GPT-6 Sol/max nonce
+canary with matching selection, captured final output, and no file changes. See the
 [support matrix](docs/support-matrix.md) for build-specific evidence and
 unverified platforms. The current ChatGPT connector requires its own client
 check. Full-access mode is intentional: a holder of execution scopes can
