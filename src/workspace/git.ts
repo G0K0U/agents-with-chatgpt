@@ -14,6 +14,7 @@ export function runGit(root: string, args: string[]): GitCommandResult {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
     timeout: 30_000,
+    windowsHide: true,
   });
   return {
     ok: result.status === 0,
@@ -48,6 +49,13 @@ export function gitInfo(root: string): GitInfo {
   };
 }
 
+export interface WorkspaceLike {
+  root: string;
+  ignoreRules?: IgnoreRules;
+}
+
+export type GitTarget = string | WorkspaceLike;
+
 export interface GitStatusResult {
   isRepo: boolean;
   branch: string | null;
@@ -58,9 +66,19 @@ export interface GitStatusResult {
   unstaged: { path: string; change: string }[];
   untracked: string[];
   conflicted: string[];
+  hidden: {
+    changes: number;
+    conflicts: number;
+  };
 }
 
-export function gitStatus(root: string): GitStatusResult {
+export function gitStatus(target: GitTarget): GitStatusResult {
+  const root = typeof target === "string" ? target : target.root;
+  const ignoreRules =
+    typeof target === "object" && target.ignoreRules
+      ? target.ignoreRules
+      : new IgnoreRules(root);
+
   const empty: GitStatusResult = {
     isRepo: false,
     branch: null,
@@ -71,10 +89,21 @@ export function gitStatus(root: string): GitStatusResult {
     unstaged: [],
     untracked: [],
     conflicted: [],
+    hidden: {
+      changes: 0,
+      conflicts: 0,
+    },
   };
   const result = runGit(root, ["status", "--porcelain=v2", "--branch", "--", "."]);
   if (!result.ok) return empty;
-  const out: GitStatusResult = { ...empty, isRepo: true };
+  const out: GitStatusResult = {
+    ...empty,
+    isRepo: true,
+    hidden: { changes: 0, conflicts: 0 },
+  };
+
+  const isSensitive = (p: string) => ignoreRules.isSensitive(p);
+
   for (const line of result.stdout.split("\n")) {
     if (line.startsWith("# branch.head ")) {
       out.branch = line.slice("# branch.head ".length).trim();
@@ -86,21 +115,48 @@ export function gitStatus(root: string): GitStatusResult {
         out.ahead = parseInt(m[1], 10);
         out.behind = parseInt(m[2], 10);
       }
-    } else if (line.startsWith("1 ") || line.startsWith("2 ")) {
+    } else if (line.startsWith("1 ")) {
       const parts = line.split(" ");
       const xy = parts[1];
-      const filePath = line.startsWith("2 ")
-        ? line.split("\t")[0]?.split(" ").slice(9).join(" ") + " -> " + (line.split("\t")[1] ?? "")
-        : parts.slice(8).join(" ");
+      const filePath = parts.slice(8).join(" ");
       const x = xy[0];
       const y = xy[1];
-      if (x !== ".") out.staged.push({ path: filePath, change: x });
-      if (y !== ".") out.unstaged.push({ path: filePath, change: y });
+      if (isSensitive(filePath)) {
+        out.hidden.changes++;
+      } else {
+        if (x !== ".") out.staged.push({ path: filePath, change: x });
+        if (y !== ".") out.unstaged.push({ path: filePath, change: y });
+      }
+    } else if (line.startsWith("2 ")) {
+      const parts = line.split(" ");
+      const xy = parts[1];
+      const x = xy[0];
+      const y = xy[1];
+      const tabParts = line.split("\t");
+      const newPath = tabParts[0]?.split(" ").slice(9).join(" ") ?? "";
+      const oldPath = tabParts[1] ?? "";
+      if (isSensitive(newPath) || isSensitive(oldPath)) {
+        out.hidden.changes++;
+      } else {
+        const filePath = `${newPath} -> ${oldPath}`;
+        if (x !== ".") out.staged.push({ path: filePath, change: x });
+        if (y !== ".") out.unstaged.push({ path: filePath, change: y });
+      }
     } else if (line.startsWith("? ")) {
-      out.untracked.push(line.slice(2));
+      const filePath = line.slice(2);
+      if (isSensitive(filePath)) {
+        out.hidden.changes++;
+      } else {
+        out.untracked.push(filePath);
+      }
     } else if (line.startsWith("u ")) {
       const parts = line.split(" ");
-      out.conflicted.push(parts.slice(10).join(" "));
+      const filePath = parts.slice(10).join(" ");
+      if (isSensitive(filePath)) {
+        out.hidden.conflicts++;
+      } else {
+        out.conflicted.push(filePath);
+      }
     }
   }
   return out;
@@ -125,13 +181,6 @@ export interface GitDiffResult {
   nextOffset: number | null;
   diff: string;
 }
-
-export interface WorkspaceLike {
-  root: string;
-  ignoreRules?: IgnoreRules;
-}
-
-export type GitTarget = string | WorkspaceLike;
 
 function getDiffModeArgs(mode: DiffMode): string[] {
   if (mode === "staged") return ["--cached"];

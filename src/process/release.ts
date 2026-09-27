@@ -3,6 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  computeTreeHash,
+  computeSourceTreeHash,
+  installationRoot,
   readBuildManifest,
   readReleasePointer,
   releaseIdFor,
@@ -28,7 +31,7 @@ export const __releaseFilename = fileURLToPath(import.meta.url);
 
 export function releaseRepoRoot(): string {
   // dist/process/release.js -> repo root; src/process/release.ts -> repo root.
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  return installationRoot();
 }
 
 export interface GateStep {
@@ -87,16 +90,24 @@ export function runReleaseGate(repoRoot: string, opts: { quick?: boolean } = {})
   if (ok) ok = push(runStep(repoRoot, "build", tsc, ["-p", "tsconfig.json"], 240_000)) && ok;
   if (ok) ok = push(runStep(repoRoot, "manifest", manifestScript, [], 60_000)) && ok;
   if (ok) {
-    const testArgs = opts.quick ? ["run", ...FOCUSED_TESTS] : ["run"];
+    // Bounded worker count, matching the documented release-readiness gate:
+    // several suites spawn real child processes, and unbounded default
+    // parallelism on many-core machines produces pure resource-contention
+    // flakes (one full gate runs at a time).
+    const testArgs = opts.quick ? ["run", ...FOCUSED_TESTS] : ["run", "--maxWorkers=2"];
     ok = push(runStep(repoRoot, "tests", vitest, testArgs, 1_800_000)) && ok;
   }
   return { ok, steps };
 }
 
 function copyDir(src: string, dest: string): void {
-  fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.cpSync(src, dest, { recursive: true, verbatimSymlinks: false });
+  // mkdir is the collision fence. Never remove or overwrite a prior release,
+  // including a partially copied one whose provenance needs investigation.
+  fs.mkdirSync(dest);
+  for (const entry of fs.readdirSync(src)) {
+    fs.cpSync(path.join(src, entry), path.join(dest, entry), { recursive: true, verbatimSymlinks: false });
+  }
 }
 
 export interface ReleaseBuildResult {
@@ -112,11 +123,30 @@ export function promoteCurrentBuild(repoRoot: string): ReleaseBuildResult {
   const manifest = readBuildManifest(distDir);
   if (!manifest) return { ok: false, releaseId: null, manifest: null, error: "dist/build-manifest.json missing; build first" };
   const identity = resolveRuntimeIdentity({ runtimeDir: distDir });
-  if (identity.buildParity !== "ok") {
-    return { ok: false, releaseId: null, manifest, error: "dist tree changed after the build; rebuild before promoting" };
+  if (identity.buildParity !== "ok" || identity.sourceParity !== "ok") {
+    return { ok: false, releaseId: null, manifest, error: "source or dist tree changed after the build; rebuild before promoting" };
   }
   const releaseId = releaseIdFor(manifest);
-  copyDir(distDir, path.join(repoRoot, "releases", releaseId));
+  const target = path.join(repoRoot, "releases", releaseId);
+  if (fs.existsSync(target)) {
+    const existing = readBuildManifest(target);
+    if (!existing || !fs.existsSync(path.join(target, "cli", "index.js")) ||
+        computeTreeHash(target) !== manifest.buildHash ||
+        existing.version !== manifest.version || existing.buildHash !== manifest.buildHash ||
+        existing.sourceHash !== manifest.sourceHash || existing.sourceCommit !== manifest.sourceCommit ||
+        existing.sourceDirty !== manifest.sourceDirty) {
+      return { ok: false, releaseId: null, manifest, error: `release ${releaseId} already exists with different or incomplete content` };
+    }
+    return { ok: true, releaseId, manifest: existing };
+  }
+  try {
+    copyDir(distDir, target);
+  } catch (error) {
+    return { ok: false, releaseId: null, manifest, error: `could not create immutable release ${releaseId}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (computeTreeHash(target) !== manifest.buildHash || !fs.existsSync(path.join(target, "cli", "index.js"))) {
+    return { ok: false, releaseId: null, manifest, error: `release ${releaseId} copy is incomplete` };
+  }
   return { ok: true, releaseId, manifest };
 }
 
@@ -130,6 +160,8 @@ export interface ActivateResult {
 /**
  * Run the release gate, promote the build, and atomically repoint the
  * last-known-good release. The previous pointer is preserved on any failure.
+ * The previously activated pointer is retained as releases/LKG.previous.json
+ * so `c2c release rollback` can restore it without a rebuild.
  */
 export function activateRelease(repoRoot: string, opts: { quick?: boolean } = {}): ActivateResult {
   const previous = readReleasePointer(repoRoot);
@@ -140,6 +172,9 @@ export function activateRelease(repoRoot: string, opts: { quick?: boolean } = {}
   const promoted = promoteCurrentBuild(repoRoot);
   if (!promoted.ok || !promoted.manifest || !promoted.releaseId) {
     return { ok: false, gate, pointer: previous, error: promoted.error ?? "release promotion failed" };
+  }
+  if (previous) {
+    writePreviousReleasePointer(repoRoot, previous);
   }
   const pointer = {
     schema: 1 as const,
@@ -154,11 +189,141 @@ export function activateRelease(repoRoot: string, opts: { quick?: boolean } = {}
   return { ok: true, gate, pointer };
 }
 
-/** True when the release id's embedded build hash matches the manifest. */
-function releaseHashOf(runningReleaseId: string, distManifest: BuildManifest): string {
-  // releaseId = "<version>-<buildHash[0..8]>"; match by prefix.
-  const prefix = runningReleaseId.split("-").slice(1).join("-");
-  return distManifest.buildHash.startsWith(prefix) ? distManifest.buildHash : `mismatch:${runningReleaseId}`;
+/**
+ * Install an already activated, clean source release into another checkout.
+ * The source activation must have run the normal gate. This copies only its
+ * immutable emitted tree, verifies it against both checkouts' source trees,
+ * and changes the target pointer only after the copy has been checked.
+ */
+export function installActivatedRelease(sourceRoot: string, targetRoot: string): ReleaseBuildResult {
+  const source = path.resolve(sourceRoot);
+  const targetRepo = path.resolve(targetRoot);
+  if (source === targetRepo) return { ok: false, releaseId: null, manifest: null, error: "source and target must differ" };
+  const active = readReleasePointer(source);
+  if (!active || !/^[A-Za-z0-9._-]+$/.test(active.releaseId) ||
+      active.entry !== `releases/${active.releaseId}/cli/index.js`) {
+    return { ok: false, releaseId: null, manifest: null, error: "source has no valid activated release" };
+  }
+  const sourceDir = path.join(source, "releases", active.releaseId);
+  const manifest = readBuildManifest(sourceDir);
+  const revision = spawnSync("git", ["-C", source, "rev-parse", "HEAD"], { encoding: "utf8" });
+  const status = spawnSync("git", ["-C", source, "status", "--porcelain"], { encoding: "utf8" });
+  if (!manifest || manifest.sourceDirty || manifest.sourceRoot !== "src" ||
+      !/^[0-9a-f]{40}$/i.test(manifest.sourceCommit ?? "") ||
+      revision.status !== 0 || revision.stdout.trim() !== manifest.sourceCommit ||
+      status.status !== 0 || status.stdout.trim() !== "" ||
+      active.releaseId !== releaseIdFor(manifest) || active.buildHash !== manifest.buildHash ||
+      active.sourceCommit !== manifest.sourceCommit || active.version !== manifest.version) {
+    return { ok: false, releaseId: null, manifest, error: "source activation is not a clean committed build" };
+  }
+  const identity = resolveRuntimeIdentity({ runtimeDir: sourceDir });
+  if (identity.buildParity !== "ok" || identity.sourceParity !== "ok" ||
+      !fs.existsSync(path.join(sourceDir, "cli", "index.js"))) {
+    return { ok: false, releaseId: null, manifest, error: "source release tree or source parity failed" };
+  }
+  if (computeSourceTreeHash(path.join(targetRepo, "src")) !== manifest.sourceHash) {
+    return { ok: false, releaseId: null, manifest, error: "target source differs from activated release" };
+  }
+  const targetDir = path.join(targetRepo, "releases", active.releaseId);
+  if (fs.existsSync(targetDir)) {
+    const existing = readBuildManifest(targetDir);
+    if (!existing || existing.buildHash !== manifest.buildHash ||
+        existing.sourceHash !== manifest.sourceHash || existing.sourceCommit !== manifest.sourceCommit ||
+        computeTreeHash(targetDir) !== manifest.buildHash) {
+      return { ok: false, releaseId: null, manifest, error: "target release id collision or incomplete copy" };
+    }
+  } else {
+    try {
+      copyDir(sourceDir, targetDir);
+    } catch (error) {
+      return { ok: false, releaseId: null, manifest, error: `release copy failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+  if (!fs.existsSync(path.join(targetDir, "cli", "index.js")) ||
+      computeTreeHash(targetDir) !== manifest.buildHash ||
+      resolveRuntimeIdentity({ runtimeDir: targetDir }).sourceParity !== "ok") {
+    return { ok: false, releaseId: null, manifest, error: "target release verification failed; pointer preserved" };
+  }
+  const previous = readReleasePointer(targetRepo);
+  if (previous && previous.releaseId !== active.releaseId) {
+    const previousDir = path.join(targetRepo, "releases", previous.releaseId);
+    const previousManifest = readBuildManifest(previousDir);
+    if (!/^[A-Za-z0-9._-]+$/.test(previous.releaseId) ||
+        previous.entry !== `releases/${previous.releaseId}/cli/index.js` ||
+        !previousManifest || previousManifest.buildHash !== previous.buildHash ||
+        computeTreeHash(previousDir) !== previous.buildHash ||
+        !fs.existsSync(path.join(targetRepo, previous.entry))) {
+      return { ok: false, releaseId: null, manifest, error: "target previous release is invalid; pointer preserved" };
+    }
+  }
+  if (previous && previous.releaseId !== active.releaseId) writePreviousReleasePointer(targetRepo, previous);
+  if (!previous || previous.releaseId !== active.releaseId) {
+    writeReleasePointer(targetRepo, { ...active, activatedAt: new Date().toISOString() });
+  }
+  return { ok: true, releaseId: active.releaseId, manifest };
+}
+
+const POINTER_FIELDS = ["schema", "releaseId", "entry", "version", "sourceCommit", "buildHash", "activatedAt"] as const;
+
+function writePreviousReleasePointer(repoRoot: string, pointer: NonNullable<ReturnType<typeof readReleasePointer>>): void {
+  const dir = path.join(repoRoot, "releases");
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `LKG.previous.json.tmp-${process.pid}-${Date.now()}`);
+  fs.writeFileSync(tmp, JSON.stringify(pointer, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  fs.renameSync(tmp, path.join(dir, "LKG.previous.json"));
+}
+
+function readPreviousReleasePointer(repoRoot: string): ReturnType<typeof readReleasePointer> {
+  const file = path.join(repoRoot, "releases", "LKG.previous.json");
+  if (!fs.existsSync(file)) return null;
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8")) as ReturnType<typeof readReleasePointer>;
+    return value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export interface RollbackResult {
+  ok: boolean;
+  pointer: ReturnType<typeof readReleasePointer>;
+  error?: string;
+}
+
+/**
+ * Roll the last-known-good pointer back to the previously activated release.
+ * The candidate pointer is fully validated before it replaces LKG.json
+ * (schema, containment under releases/, matching build manifest, existing
+ * entry), so a corrupt or tampered previous file can never become the
+ * active release. The current pointer is preserved as LKG.previous.json,
+ * making rollback a bounded A/B swap.
+ */
+export function rollbackRelease(repoRoot: string): RollbackResult {
+  const current = readReleasePointer(repoRoot);
+  const previous = readPreviousReleasePointer(repoRoot);
+  if (!previous) {
+    return { ok: false, pointer: current, error: "no previous release pointer recorded; nothing to roll back to" };
+  }
+  if (previous.schema !== 1 || POINTER_FIELDS.some((f) => (previous as unknown as Record<string, unknown>)[f] === undefined)) {
+    return { ok: false, pointer: current, error: "previous release pointer is malformed; refusing to activate it" };
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(previous.releaseId) || previous.entry !== `releases/${previous.releaseId}/cli/index.js`) {
+    return { ok: false, pointer: current, error: "previous release pointer entry is not contained in releases/; refusing to activate it" };
+  }
+  const entry = path.join(repoRoot, previous.entry);
+  const releaseDir = path.join(repoRoot, "releases", previous.releaseId);
+  const manifest = readBuildManifest(releaseDir);
+  if (!fs.existsSync(entry) || !manifest || manifest.buildHash !== previous.buildHash) {
+    return { ok: false, pointer: current, error: `previous release ${previous.releaseId} is missing or its manifest does not match; refusing to activate it` };
+  }
+  if (current && current.releaseId === previous.releaseId) {
+    return { ok: true, pointer: current, error: "already running the previous release; pointer unchanged" };
+  }
+  if (current) {
+    writePreviousReleasePointer(repoRoot, current);
+  }
+  writeReleasePointer(repoRoot, previous);
+  return { ok: true, pointer: previous };
 }
 
 export type ReleaseDrift =
@@ -198,10 +363,8 @@ export function releaseStatus(repoRoot: string, runningReleaseId: string | null 
     drift.push("LKG_AHEAD_OF_DIST");
     if (runningReleaseId && runningReleaseId !== pointer.releaseId) drift.push("STALE_RUNTIME");
   }
-  if (!pointer && distManifest && runningReleaseId && distManifest.buildHash !== releaseHashOf(runningReleaseId, distManifest)) {
-    // Classic stale runtime with no LKG pointer yet: the dist tree was
-    // rebuilt after the running process started (release ids embed the build
-    // hash prefix, so a differing id means a differing tree).
+  if (!pointer && distManifest && runningReleaseId && runningReleaseId !== releaseIdFor(distManifest)) {
+    // A different source or emitted tree means the running release is stale.
     drift.push("STALE_RUNTIME");
   }
   return {

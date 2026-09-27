@@ -6,7 +6,7 @@ export const CHATGPT_PLUGINS_URL = "https://chatgpt.com/plugins";
 export const CHATGPT_CREATE_CONNECTOR_URL =
   "https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins";
 
-export const DEFAULT_CONNECTOR_NAME = "Codex with ChatGPT";
+export const DEFAULT_CONNECTOR_NAME = "Agents with ChatGPT";
 
 export interface LastEndpoint {
   workspaceId: string;

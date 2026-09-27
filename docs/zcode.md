@@ -37,7 +37,7 @@ receipts.
 Lifecycle per task:
 
 ```
-queued → (claim window) → dispatched through the native Desktop lane
+queued → (claim window) → dispatched through the Z2C semantic service
         → START receipt → observed terminal → COMPLETED | FAILED | CANCELLED
 CANCEL_REQUESTED while queued → CANCELLED (never dispatched)
 CANCEL_REQUESTED while running → forwarded to the native lane → CANCELLED
@@ -51,30 +51,23 @@ a `START` receipt but no terminal outcome are re-adopted by re-dispatching
 the **same durable idempotency key**, so an already-accepted native task
 replays instead of executing twice.
 
-Dispatch happens only through the governed native Desktop lane
+Dispatch happens only through the governed native lane
 (`zcode_native_*` transport) and only while its identity attestation holds —
-observed Desktop-managed GLM binding (sanctioned: builtin:zai-start-plan/GLM-5.3-Flash,
-the Z.AI Individual Plan route). When the native lane is down the
+observed `builtin:zai-coding-plan / GLM-5.3-Flash / max` from the exact official
+session read. When the native lane is down the
 coordinator degrades explicitly and claims nothing; there is no fallback and
 no silent provider substitution.
 
-### Desktop-agent prerequisite
+### Official ZCode prerequisite
 
-The native lane executes tasks through the Desktop-managed ZCode agent. That
-agent is reachable only when **ZCode Desktop runs with the Z2C desktop-agent
-proxy**, i.e. it is launched with:
-
-```
-ZCODE_AGENT_SERVER_COMMAND = <node.exe>
-ZCODE_AGENT_SERVER_ARGS_JSON = ["<z2c-install>/scripts/desktop-agent-proxy.mjs", "--stdio"]
-```
-
-The proxy publishes the per-workspace registration under
-`%LOCALAPPDATA%\z2c\desktop-agents\` that the Z2C desktop provider requires
-(run Z2C with `Z2C_PROVIDER=desktop` or the default `auto`). Without a live
-Desktop-driven agent, admission fails explicitly (`provider not healthy`)
-and tasks remain safely queued — they are claimed and dispatched
-automatically once the lane recovers.
+The semantic service uses the installed ZCode official `app-server --stdio`
+entry and discovers its packaged built-in provider configuration. ZCode must
+be installed and signed in by the user. Z2C does not inject a Desktop Agent
+override or read ZCode's credential store. A nonstandard CLI path may be
+specified with `Z2C_ZCODE_CLI`; the packaged configuration path can be
+overridden with `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`. When the official
+runtime is unavailable or the session binding cannot be proven, admission
+fails closed and queued work remains paused or queued.
 
 New tasks are claimed only inside the configured claim window
 (`C2C_ZCODE_COORDINATOR_WINDOW`, local `HH:mm-HH:mm` ranges, comma-separated,

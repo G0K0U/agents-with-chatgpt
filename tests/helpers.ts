@@ -82,6 +82,9 @@ export function makeGitRepo(dir: string): void {
 /** Point the persistent state dir at an isolated temp location. */
 export function isolateStateDir(): string {
   const dir = makeTmpDir("state");
+  // Dual-namespace: A2C_* is canonical, C2C_* the legacy alias — writers must
+  // set both so A2C-first readers always see the isolated directory.
+  process.env.A2C_STATE_DIR = dir;
   process.env.C2C_STATE_DIR = dir;
   return dir;
 }

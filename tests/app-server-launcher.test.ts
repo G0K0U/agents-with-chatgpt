@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { spawn } from "node:child_process";
 import path from "node:path";
+import fs from "node:fs";
 import {
   CodexAppServerClient,
+  codexAppServerArgs,
   CodexExecutableResolutionError,
   resolveCodexExecutable,
   type AppServerClient,
@@ -25,6 +27,25 @@ function resolutionError(run: () => unknown): CodexExecutableResolutionError {
 }
 
 describe("Codex App Server executable resolution", () => {
+  it("uses the configured runtime for task launches with a bridge-owned child environment", () => {
+    const stateDir = makeTmpDir("codex-runtime-selection");
+    try {
+      fs.writeFileSync(path.join(stateDir, "codex-runtime.json"), JSON.stringify({ executable: windowsExecutable }));
+      const result = resolveCodexExecutable({
+        stateDir,
+        env: { SERENA_HOME: String.raw`C:\bridge\serena` },
+        platform: "win32",
+        arch: "x64",
+        execPath: String.raw`C:\Node\node.exe`,
+        modulePath: String.raw`C:\A2C\dist\execution\app-server.js`,
+        isFile: (candidate) => candidate === windowsExecutable,
+      });
+      expect(result).toBe(windowsExecutable);
+    } finally {
+      cleanup(stateDir);
+    }
+  });
+
   it("uses a validated absolute override before installation discovery", () => {
     const checked: string[] = [];
     const result = resolveCodexExecutable({
@@ -135,6 +156,31 @@ describe("Codex App Server executable resolution", () => {
 });
 
 describe("Codex App Server launcher", () => {
+  it("launches the persisted runtime even when task setup supplies only SERENA_HOME", async () => {
+    const stateDir = makeTmpDir("codex-task-runtime");
+    try {
+      fs.writeFileSync(path.join(stateDir, "codex-runtime.json"), JSON.stringify({ executable: process.execPath }));
+      const spawnImpl = vi.fn(() => { throw new Error("test spawn stop"); }) as unknown as typeof spawn;
+      const client = new CodexAppServerClient(
+        { workspaceRoot: process.cwd(), logger: nullLogger, stateDir, env: { SERENA_HOME: stateDir } },
+        { spawn: spawnImpl }
+      );
+      await expect(client.initialize()).rejects.toThrow("Unable to start the Codex App Server");
+      expect(spawnImpl).toHaveBeenCalledOnce();
+      expect(spawnImpl.mock.calls[0][0]).toBe(process.execPath);
+    } finally {
+      cleanup(stateDir);
+    }
+  });
+
+  it.each([false, true])("never pins a model or effort into the App Server argv (network=%s)", networkAccess => {
+    const args = codexAppServerArgs({ workspaceRoot: process.cwd(), logger: nullLogger, fullAccess: true, networkAccess });
+    const overrides = args.filter((_, index) => args[index - 1] === "-c");
+    // Model/effort are per-task catalog-confirmed selections passed on
+    // thread/start and turn/start; the launcher must not hardcode one.
+    expect(overrides.filter(value => value.startsWith("model="))).toEqual([]);
+    expect(overrides.filter(value => value.startsWith("model_reasoning_effort="))).toEqual([]);
+  });
   it("spawns the resolved executable directly with shell disabled", async () => {
     const spawnImpl = vi.fn(() => {
       throw new Error("test spawn stop");

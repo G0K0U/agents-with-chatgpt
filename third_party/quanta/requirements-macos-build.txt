@@ -1,0 +1,20 @@
+# macOS arm64 build environment; tested with Python 3.12.13.
+# Keep separate from requirements-windows-build.txt.
+altgraph==0.17.5
+bottle==0.13.4
+macholib==1.16.4
+packaging==26.3
+pillow==12.3.0
+proxy_tools==0.1.0
+pyinstaller==6.22.0
+pyinstaller-hooks-contrib==2026.7
+pyobjc-core==12.2.2
+pyobjc-framework-Cocoa==12.2.2
+pyobjc-framework-Quartz==12.2.2
+pyobjc-framework-Security==12.2.2
+pyobjc-framework-UniformTypeIdentifiers==12.2.2
+pyobjc-framework-WebKit==12.2.2
+pywebview==6.2.1
+rumps==0.4.0
+setuptools==84.0.0
+typing_extensions==4.16.0

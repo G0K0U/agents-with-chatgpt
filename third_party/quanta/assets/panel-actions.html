@@ -1,0 +1,17 @@
+<script>
+(() => {
+  const button = document.getElementById('add-connection');
+  const feedback = document.getElementById('connection-feedback');
+  const ready = () => { button.disabled = !button.dataset.quantaAction; };
+  window.addEventListener('pywebviewready', ready);
+  if (window.pywebview && window.pywebview.api) ready();
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      const opened = await window.pywebview.api.open_connections(button.dataset.quantaAction);
+      feedback.textContent = opened ? '连接设置已打开。验证并保存后，托盘会自动更新；重新打开面板可查看新数据。' : '无法打开连接设置，请使用浮窗的连接按钮重试。';
+    } catch (_) { feedback.textContent = '无法打开连接设置，请使用浮窗的连接按钮重试。'; }
+    finally { button.disabled = false; }
+  });
+})();
+</script>

@@ -86,6 +86,36 @@ it("status exposes requested workspace separately from actual owner and uses cur
   expect(seam.admin).not.toHaveBeenCalled();
 });
 
+it("status refreshes an expired external observation through the read-only owner admin route", async () => {
+  const oldInfo = seam.observation.adminInfo;
+  seam.observation.adminInfo = { ...oldInfo,
+    tunnel: { ...oldInfo.tunnel, management: "external", running: false, reachable: null,
+      detail: "External tunnel observation expired" } };
+  seam.admin.mockResolvedValue({ ...seam.observation.adminInfo,
+    tunnel: { ...seam.observation.adminInfo.tunnel, running: true, reachable: true,
+      detail: undefined, originPort: 50111, ownsProcess: false, canControlProcess: false } });
+  const result = await run("status");
+  expect(result.ok).toBe(true);
+  expect(result.tunnel).toMatchObject({ management: "external", running: true, reachable: true,
+    originPort: 50111, ownsProcess: false, canControlProcess: false });
+  expect(seam.admin).toHaveBeenCalledTimes(1);
+  expect(seam.admin).toHaveBeenCalledWith(seam.observation.runtime, "GET", "/admin/info?observe=1", 15_000);
+});
+
+it("status keeps a reachable MCP challenge separate from an unavailable external identity refresh", async () => {
+  const oldInfo = seam.observation.adminInfo;
+  seam.observation.adminInfo = { ...oldInfo,
+    tunnel: { ...oldInfo.tunnel, management: "external", running: false, reachable: null } };
+  seam.admin.mockRejectedValue(new Error("observation timed out"));
+  const result = await run("status");
+  expect(result.running).toBe(true);
+  expect(result.localHealth.ok).toBe(true);
+  expect(result.public.status).toBe(401);
+  expect(result.ok).toBe(false);
+  expect(result.tunnel).toMatchObject({ management: "external", running: false, reachable: null,
+    detail: "External tunnel observation refresh unavailable" });
+});
+
 it("start --tunnel succeeds and reuses owner without admin tunnel mutation when cloudflared binary is missing but public URL is healthy", async () => {
   seam.cloudflared = null;
   const result = await run("start", ["--tunnel"]);

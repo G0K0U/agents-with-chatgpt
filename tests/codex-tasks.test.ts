@@ -46,7 +46,11 @@ class FakeAppServer implements AppServerClient {
 
   async request<T>(method: string, params?: unknown): Promise<T> {
     this.requests.push({ method, params });
-    if (method === "thread/start") return { thread: { id: "thread-fake-1" } } as T;
+    if (method === "thread/start") {
+      // The official server echoes the started thread's model back.
+      const requestedModel = (params as { model?: string } | undefined)?.model;
+      return { thread: { id: "thread-fake-1" }, ...(requestedModel ? { model: requestedModel } : {}) } as T;
+    }
     if (method === "turn/start") {
       if (this.completeTurn) queueMicrotask(() => this.complete());
       return { turn: { id: "turn-fake-1" } } as T;
@@ -72,6 +76,10 @@ class FakeAppServer implements AppServerClient {
 
   setNotificationHandler(handler: (notification: AppServerNotification) => void | Promise<void>): void {
     this.notificationHandler = handler;
+  }
+
+  emit(notification: AppServerNotification): void {
+    void this.notificationHandler?.(notification);
   }
 
   setRequestHandler(handler: (request: AppServerRequest) => void | Promise<void>): void {
@@ -140,6 +148,14 @@ async function waitForTerminal(manager: CodexTaskManager, taskId: string): Promi
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error(`Task ${taskId} did not finish`);
+}
+
+async function waitForTurn(manager: CodexTaskManager, taskId: string): Promise<void> {
+  for (let i = 0; i < 100; i++) {
+    if (manager.get(taskId).turnId === "turn-fake-1") return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`Task ${taskId} did not start a turn`);
 }
 
 describe("controlled Codex task execution", () => {
@@ -416,6 +432,77 @@ describe("controlled Codex task execution", () => {
       run_tests: false,
     }, { ownerId: "owner", sessionId: session.id });
     expect(upgraded.network).toBe(true);
+  });
+
+  it.each(["queued", "running", "cancelling", "completed"])("never dispatches saved retired-backend work (%s)", async (status) => {
+    await manager.close();
+    const taskId = "c2c_deadbeef";
+    const file = path.join(getStateDir(), "tasks", workspace.id, `${taskId}.json`);
+    writeSecureJson(file, {
+      taskId, workspaceId: workspace.id, ownerId: "owner",
+      orchestrator: "retired-backend", provider: "codex",
+      instructionHash: "historical", instruction: "do not replay this work",
+      writeScope: ["tests"], network: false, runTests: false,
+      approvalMode: "workspace_write", status,
+      submittedAt: new Date().toISOString(), changedFiles: [], tests: null,
+      outputIds: [], approvalEvents: [], executionRecorded: true,
+    });
+    manager = new CodexTaskManager(workspace, { appServerFactory: () => fake });
+    const result = manager.get(taskId);
+    expect(result.status).toBe(status === "completed" ? "completed" : "interrupted");
+    if (status !== "completed") expect(result.error?.code).toBe("UNSUPPORTED_SAVED_BACKEND");
+    expect(result).not.toHaveProperty("orchestrator");
+    await manager.close();
+    expect(fake.requests).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(file, "utf8")).status).toBe(result.status);
+  });
+
+  it("waits through a retryable Codex error notification for the matching completed turn", async () => {
+    fake = new FakeAppServer(undefined, false);
+    manager = new CodexTaskManager(workspace, { appServerFactory: () => fake });
+    const task = manager.submit({ workspace_id: workspace.id, instruction: "Reply with a short marker.",
+      write_scope: ["tests"], network: false, run_tests: false });
+    await waitForTurn(manager, task.taskId);
+    fake.emit({ method: "error", params: { threadId: "thread-fake-1", turnId: "turn-fake-1",
+      error: { message: "temporary provider error" }, willRetry: true } });
+    expect(manager.get(task.taskId).status).toBe("running");
+    fake.emit({ method: "turn/completed", params: { threadId: "thread-fake-1", turnId: "turn-fake-1",
+      turn: { id: "turn-fake-1", status: "completed", error: null } } });
+    const result = await waitForTerminal(manager, task.taskId);
+    expect(result.status).toBe("completed");
+    expect(result.error).toBeNull();
+  });
+
+  it("extracts and classifies the official nested Codex model rejection", async () => {
+    fake = new FakeAppServer(undefined, false);
+    manager = new CodexTaskManager(workspace, { appServerFactory: () => fake });
+    const task = manager.submit({ workspace_id: workspace.id, instruction: "Reply with a short marker.",
+      write_scope: ["tests"], network: false, run_tests: false });
+    await waitForTurn(manager, task.taskId);
+    fake.emit({ method: "error", params: { threadId: "thread-fake-1", turnId: "turn-fake-1",
+      error: { message: JSON.stringify({ type: "error", status: 400, error: {
+        type: "invalid_request_error", message: "The 'gpt-6-sol' model is not supported for this account.",
+      } }) }, willRetry: false } });
+    const result = await waitForTerminal(manager, task.taskId);
+    expect(result.status).toBe("failed");
+    expect(result.error).toEqual({ code: "CODEX_MODEL_UNAVAILABLE",
+      message: "The 'gpt-6-sol' model is not supported for this account." });
+    expect(result.actionEvidence?.turnCompleted).toBe(false);
+  });
+
+  it("reads a failed turn's error when no earlier error notification arrived", async () => {
+    fake = new FakeAppServer(undefined, false);
+    manager = new CodexTaskManager(workspace, { appServerFactory: () => fake });
+    const task = manager.submit({ workspace_id: workspace.id, instruction: "Reply with a short marker.",
+      write_scope: ["tests"], network: false, run_tests: false });
+    await waitForTurn(manager, task.taskId);
+    fake.emit({ method: "turn/completed", params: { threadId: "thread-fake-1", turnId: "turn-fake-1",
+      turn: { id: "turn-fake-1", status: "failed", error: {
+        message: "Account usage limit exceeded", codexErrorInfo: "usageLimitExceeded",
+      } } } });
+    const result = await waitForTerminal(manager, task.taskId);
+    expect(result.status).toBe("failed");
+    expect(result.error).toEqual({ code: "CODEX_EXECUTION_FAILED", message: "Account usage limit exceeded" });
   });
 
   it("preserves a persisted effective network flag before exposing task metadata", () => {
@@ -926,6 +1013,237 @@ describe("controlled Codex task execution", () => {
       networkPolicy: { requested: true, effective: true, reported: true },
     });
   });
+
+  it.each([
+    { label: "empty model", patch: { model: "" } },
+    { label: "shell metacharacters in model", patch: { model: "gpt-6-astra; rm -rf /" } },
+    { label: "oversized model", patch: { model: "g".repeat(65) } },
+    { label: "invalid effort", patch: { effort: "max; rm -rf /" } },
+    { label: "oversized effort", patch: { effort: "m".repeat(21) } },
+  ])("rejects an out-of-bounds continuation pin ($label) before dispatch", ({ patch }) => {
+    const continuation = {
+      idempotencyKey: "invalid-pin", model: "gpt-6-sol", effort: "max", timeoutMs: 10000,
+      authorize: () => true, ...patch,
+    } as NonNullable<Parameters<CodexTaskManager["submit"]>[1]>["continuation"];
+    expect(() => manager.submit({
+      workspace_id: workspace.id, provider: "codex", instruction: "Validate the continuation model pin.",
+      write_scope: ["tests"], network: false, run_tests: false,
+    }, { ownerId: "owner", workspaceId: workspace.id, continuation })).toThrow("Continuation owner/model/budget mismatch");
+  });
+
+  it("routes an explicit catalog selection to thread/start and turn/start with echo confirmation", async () => {
+    const selection = {
+      model: "gpt-6-astra", effort: "max",
+      binding_source: "explicit-task" as const,
+      catalog_revision: "test-revision", catalog_confirmed: true,
+    };
+    const view = manager.submit({
+      workspace_id: workspace.id, provider: "codex", instruction: "Run with the dynamically selected model.",
+      write_scope: ["tests"], network: false, run_tests: false,
+    }, { ownerId: "owner", workspaceId: workspace.id, selection });
+    // The synchronous pump may already have started the task; the routing
+    // assertions below are the real contract.
+    expect(["queued", "running"]).toContain(view.status);
+    const terminal = await waitForTerminal(manager, view.taskId);
+    expect(terminal.status).toBe("completed");
+    const threadStart = fake.requests.find((request) => request.method === "thread/start");
+    const turnStart = fake.requests.find((request) => request.method === "turn/start");
+    expect(threadStart?.params).toMatchObject({ model: "gpt-6-astra" });
+    expect(turnStart?.params).toMatchObject({ model: "gpt-6-astra", effort: "max" });
+    const finalized = manager.get(view.taskId);
+    expect(finalized.selection).toMatchObject({ model: "gpt-6-astra", effort: "max", binding_source: "explicit-task" });
+    expect(finalized.requestedSelection).toEqual({ model: null, effort: null });
+    expect(finalized.dispatchedSelection).toEqual({
+      thread: { model: "gpt-6-astra" },
+      turn: { model: "gpt-6-astra", effort: "max", outcome: "accepted" },
+    });
+    // Honest evidence: thread/start echoes the model but never the effort, so
+    // observed effort must be null — the dispatched max is NOT copied there.
+    expect(finalized.observedSelection).toMatchObject({ model: "gpt-6-astra", effort: null, source: "thread/start" });
+  });
+
+  it("keeps requested/dispatched/observed evidence distinct for an explicit task selection", async () => {
+    const selection = {
+      model: "gpt-6-astra", effort: "high",
+      binding_source: "explicit-task" as const,
+      catalog_revision: "test-revision", catalog_confirmed: true,
+    };
+    const view = manager.submit({
+      workspace_id: workspace.id, provider: "codex", instruction: "Explicit model and effort selection evidence.",
+      write_scope: ["tests"], network: false, run_tests: false, model: "gpt-6-astra", effort: "high",
+    }, { ownerId: "owner", workspaceId: workspace.id, selection });
+    await waitForTerminal(manager, view.taskId);
+    const finalized = manager.get(view.taskId);
+    expect(finalized.requestedSelection).toEqual({ model: "gpt-6-astra", effort: "high" });
+    expect(finalized.dispatchedSelection).toEqual({
+      thread: { model: "gpt-6-astra" },
+      turn: { model: "gpt-6-astra", effort: "high", outcome: "accepted" },
+    });
+    // No session readback exists for the fake thread id; observed stays the
+    // thread/start echo with a null effort rather than the dispatched high.
+    expect(finalized.observedSelection).toMatchObject({ model: "gpt-6-astra", effort: null });
+  });
+
+  it("cancelling between thread/start and turn/start never claims turn effort was dispatched", async () => {
+    let taskId = "";
+    const requests: { method: string }[] = [];
+    const gatedFake: AppServerClient = {
+      async initialize(): Promise<void> {},
+      async request<T>(method: string): Promise<T> {
+        requests.push({ method });
+        if (method === "thread/start") {
+          // Cancel while thread/start is in flight; the response still arrives
+          // and the post-thread cancellation check fires before turn/start.
+          void manager.cancel(taskId).catch(() => undefined);
+          return { thread: { id: "thread-gated" }, model: "gpt-6-astra" } as T;
+        }
+        return {} as T;
+      },
+      notify(): void {},
+      setNotificationHandler(): void {},
+      setRequestHandler(): void {},
+      respond(): void {},
+      respondError(): void {},
+      async close(): Promise<void> {},
+    };
+    manager = new CodexTaskManager(workspace, { appServerFactory: () => gatedFake });
+    const view = manager.submit({
+      workspace_id: workspace.id, provider: "codex", instruction: "Cancelled before the turn was dispatched.",
+      write_scope: ["tests"], network: false, run_tests: false,
+    }, { ownerId: "owner", workspaceId: workspace.id, selection: {
+      model: "gpt-6-astra", effort: "max",
+      binding_source: "explicit-task" as const,
+      catalog_revision: "test-revision", catalog_confirmed: true,
+    } });
+    taskId = view.taskId;
+    const terminal = await waitForTerminal(manager, taskId);
+    expect(terminal.status).toBe("cancelled");
+    // thread/start may prove the model, but turn/start was never sent: no
+    // turn effort (or turn model) may be claimed as dispatched.
+    const cancelledView = manager.get(taskId);
+    expect(cancelledView.dispatchedSelection?.turn ?? null).toBeNull();
+    expect(cancelledView.observedSelection?.effort ?? null).toBeNull();
+    expect(requests.filter((request) => request.method === "turn/start")).toHaveLength(0);
+  });
+
+  // ── native session readback evidence (turn_context) ──────────────────────
+  //
+  // observeNativeModel requires protocol-shaped thread/turn ids (36-char
+  // uuids) and reads them from CODEX_HOME. These tests stub CODEX_HOME at a
+  // fixture directory and write session files with the exact shape the reader
+  // consumes — no real Codex process and no inference is involved.
+
+  const UUID_THREAD = "0f0e0d0c-1111-4222-8333-444455556666";
+  const UUID_TURN = "aabbccdd-1111-4222-8333-444455556666";
+
+  class EvidenceFake implements AppServerClient {
+    readonly requests: { method: string; params: unknown }[] = [];
+    private notificationHandler: ((notification: AppServerNotification) => void | Promise<void>) | null = null;
+    constructor(
+      private readonly model: string,
+      private readonly effort: string,
+      private readonly evidence: { model: string; effort: string } | null,
+      private readonly evidenceHome: string
+    ) {}
+    async initialize(): Promise<void> {}
+    async request<T>(method: string, params?: unknown): Promise<T> {
+      this.requests.push({ method, params });
+      if (method === "thread/start") {
+        const requestedModel = (params as { model?: string } | undefined)?.model;
+        return { thread: { id: UUID_THREAD }, ...(requestedModel ? { model: requestedModel } : {}) } as T;
+      }
+      if (method === "turn/start") {
+        // The upstream evidence file is written while the turn is running, so
+        // the terminal readback observes it exactly like a real session would.
+        if (this.evidence) {
+          writeCodexTurnEvidence(this.evidenceHome, UUID_THREAD, UUID_TURN, this.evidence.model, this.evidence.effort);
+        }
+        queueMicrotask(() => {
+          this.notificationHandler?.({
+            method: "turn/completed",
+            params: { threadId: UUID_THREAD, turnId: UUID_TURN, status: "completed" },
+          });
+        });
+        return { turn: { id: UUID_TURN } } as T;
+      }
+      return {} as T;
+    }
+    notify(): void {}
+    setNotificationHandler(handler: (notification: AppServerNotification) => void | Promise<void>): void {
+      this.notificationHandler = handler;
+    }
+    setRequestHandler(): void {}
+    respond(): void {}
+    respondError(): void {}
+    async close(): Promise<void> {}
+  }
+
+  function writeCodexTurnEvidence(home: string, threadId: string, turnId: string, model: string, effort: string): void {
+    const day = new Date().toISOString().slice(0, 10).replaceAll("-", "/");
+    const dir = path.join(home, "sessions", day);
+    fs.mkdirSync(dir, { recursive: true });
+    const now = new Date().toISOString();
+    const lines = [
+      JSON.stringify({ type: "session_meta", timestamp: now, payload: { id: threadId } }),
+      JSON.stringify({ type: "turn_context", timestamp: now, payload: { turn_id: turnId, thread_id: threadId, model, effort } }),
+    ];
+    fs.writeFileSync(path.join(dir, `rollout-${threadId}.jsonl`), lines.join("\n") + "\n");
+  }
+
+  async function runEvidenceTask(
+    evidence: { model: string; effort: string } | null
+  ): Promise<ReturnType<CodexTaskManager["get"]>> {
+    const home = fs.mkdtempSync(path.join(path.dirname(workspace.root), "codex-home-"));
+    const previousHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    try {
+      const fake = new EvidenceFake("gpt-6-astra", "max", evidence, home);
+      manager = new CodexTaskManager(workspace, { appServerFactory: () => fake });
+      const view = manager.submit({
+        workspace_id: workspace.id, provider: "codex", instruction: "Readback evidence task.",
+        write_scope: ["tests"], network: false, run_tests: false,
+      }, { ownerId: "owner", workspaceId: workspace.id, selection: {
+        model: "gpt-6-astra", effort: "max",
+        binding_source: "explicit-task" as const,
+        catalog_revision: "test-revision", catalog_confirmed: true,
+      } });
+      const terminal = await waitForTerminal(manager, view.taskId);
+      expect(terminal.status).toBe("completed");
+      return manager.get(view.taskId);
+    } finally {
+      if (previousHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousHome;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  it("A: upstream effort contradicting the dispatched effort is flagged as a mismatch", async () => {
+    // requested/dispatched max, upstream reported low.
+    const finalized = await runEvidenceTask({ model: "gpt-6-astra", effort: "low" });
+    expect(finalized.dispatchedSelection?.turn).toMatchObject({ model: "gpt-6-astra", effort: "max", outcome: "accepted" });
+    expect(finalized.observedSelection).toMatchObject({ model: "gpt-6-astra", effort: "low", source: "native_turn_context", mismatch: true });
+  });
+
+  it("B: no upstream effort evidence keeps observed effort unknown without a mismatch flag", async () => {
+    const finalized = await runEvidenceTask(null);
+    expect(finalized.observedSelection).toMatchObject({ model: "gpt-6-astra", effort: null, source: "thread/start" });
+    expect(finalized.observedSelection?.mismatch).toBeUndefined();
+  });
+
+  it("C: max and ultra are distinct efforts — an ultra readback against a dispatched max mismatches", async () => {
+    const finalized = await runEvidenceTask({ model: "gpt-6-astra", effort: "ultra" });
+    expect(finalized.observedSelection).toMatchObject({ effort: "ultra", mismatch: true });
+  });
+
+  it("E: a model mismatch is flagged once and the task reaches exactly one stable terminal state", async () => {
+    const finalized = await runEvidenceTask({ model: "gpt-5.6-sol", effort: "max" });
+    expect(finalized.status).toBe("completed");
+    expect(finalized.observedSelection).toMatchObject({ model: "gpt-5.6-sol", effort: "max", mismatch: true });
+    // The execution record was written exactly once for this task.
+    const records = readExecutionRecords(workspace.id).filter((record) => record.taskId === finalized.taskId);
+    expect(records).toHaveLength(1);
+  });
+
 
   it("keeps safe MCP configuration restricted while preserving explicit full access", () => {
     const safeArgs = codexAppServerArgs({ workspaceRoot: workspace.root, logger: nullLogger, fullAccess: false, networkAccess: false });

@@ -71,8 +71,10 @@ function Test-Cmd([string]$name) { return [bool](Get-Command $name -ErrorAction 
 try {
   # ── uninstall ──────────────────────────────────────────────────────────────
   if ($Uninstall) {
-    $task = Get-ScheduledTask -TaskName 'C2C Bridge' -ErrorAction SilentlyContinue
-    if ($task) { Unregister-ScheduledTask -TaskName 'C2C Bridge' -Confirm:$false }
+    foreach ($legacyTask in @('C2C Bridge', 'C2C Bridge Supervisor')) {
+      $task = Get-ScheduledTask -TaskName $legacyTask -ErrorAction SilentlyContinue
+      if ($task) { Unregister-ScheduledTask -TaskName $legacyTask -Confirm:$false }
+    }
     if (Test-Cmd 'node') { try { node $Cli stop --workspace $Workspace --state-dir $StateDir 2>$null } catch {} }
     if (Test-Path $InstallRoot) { Remove-Item -Recurse -Force $InstallRoot }
     if ($PurgeUserData -and (Test-Path $StateDir)) { Remove-Item -Recurse -Force $StateDir }
@@ -144,9 +146,27 @@ try {
     & $pnpm build 2>&1 | ForEach-Object { if (-not $Json) { Write-Host "  $_" } }
     $buildExit = $LASTEXITCODE
     Step 'build completed' ($buildExit -eq 0 -and (Test-Path $Cli)) "pnpm build exit=$buildExit"
-    # command shim so the documented `c2c ...` examples work from the install dir
+    # ── Z2C companion (governed GLM lane) ────────────────────────────────────
+    # Ships in-repo under z2c/ (MIT). Build it so the supervisor's desktop-agent
+    # reconciler and the Z2C control plane resolve immediately after install.
+    $z2cDir = Join-Path $InstallRoot 'z2c'
+    if (Test-Path (Join-Path $z2cDir 'package.json')) {
+      Push-Location $z2cDir
+      try {
+        npm ci --no-audit --no-fund 2>&1 | ForEach-Object { if (-not $Json) { Write-Host "  $_" } }
+        $z2cInstallExit = $LASTEXITCODE
+        npm run build 2>&1 | ForEach-Object { if (-not $Json) { Write-Host "  $_" } }
+        $z2cBuildExit = $LASTEXITCODE
+        Step 'z2c companion built' ($z2cInstallExit -eq 0 -and $z2cBuildExit -eq 0 -and (Test-Path (Join-Path $z2cDir 'dist\service\main.js'))) "install exit=$z2cInstallExit build exit=$z2cBuildExit"
+      } finally { Pop-Location }
+    } else {
+      Step 'z2c companion present' $false 'z2c/package.json not found; governed GLM lane requires the Z2C companion'
+    }
+    # command shim so the documented `c2c ...` examples work from the install
+    # dir. It routes through bin\c2c.js so commands always run the ACTIVE LKG
+    # release rather than mutable dist output.
     $shim = Join-Path $InstallRoot 'c2c.cmd'
-    Set-Content -Path $shim -Value "@echo off`r`nnode `"%~dp0dist\cli\index.js`" %*"
+    Set-Content -Path $shim -Value "@echo off`r`nnode `"%~dp0bin\c2c.js`" %*"
     Step 'c2c command shim created' (Test-Path $shim) $shim
   } finally { $ErrorActionPreference = $prevEap; Pop-Location }
 
@@ -169,11 +189,38 @@ try {
   # ── optional autostart (explicit opt-in only) ──────────────────────────────
   # The supervisor is the boot owner: logon -> supervisor -> bridge -> tunnel,
   # then the supervisor reconnects provider lanes (Z2C, desktop agent) itself.
+  # The task runs the stable bin\c2c.js launcher, which resolves the ACTIVE
+  # LKG release at execution time — a release activation must never leave a
+  # permanently stale dist path baked into Task Scheduler.
   if ($EnableAutoStart) {
-    $action = New-ScheduledTaskAction -Execute 'node.exe' -Argument "`"$Cli`" supervisor run --workspace `"$Workspace`"" -WorkingDirectory $InstallRoot
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
-    Register-ScheduledTask -TaskName 'C2C Bridge' -Action $action -Trigger $trigger -Force | Out-Null
-    Step 'autostart registered (opt-in)' $true 'Scheduled Task "C2C Bridge" at logon runs the bounded supervisor'
+    $launcher = Join-Path $InstallRoot 'bin\c2c.js'
+    Step 'autostart launcher present' (Test-Path $launcher) $launcher
+    # Resolve the ABSOLUTE node executable: Task Scheduler launches with a
+    # minimal environment where a PATH-relative node.exe fails (0x80070002).
+    $node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+    if (-not $node) {
+      foreach ($candidate in @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\node\node.exe'),
+        'C:\Program Files\nodejs\node.exe'
+      )) { if (Test-Path $candidate) { $node = $candidate; break } }
+    }
+    Step 'autostart node resolved' ($node -and (Test-Path $node)) $node
+    $user = "$env:COMPUTERNAME\$env:USERNAME"
+    $action = New-ScheduledTaskAction -Execute $node `
+      -Argument "`"$launcher`" supervisor run --workspace `"$Workspace`" --state-dir `"$StateDir`"" `
+      -WorkingDirectory $InstallRoot
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
+      -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+      -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName 'A2C Bridge Supervisor' -Action $action -Trigger $trigger `
+      -Principal $principal -Settings $settings -Force | Out-Null
+    # Retain the legacy task for inspection, but leave only one autostart owner.
+    if (Get-ScheduledTask -TaskName 'C2C Bridge' -ErrorAction SilentlyContinue) {
+      Disable-ScheduledTask -TaskName 'C2C Bridge' | Out-Null
+    }
+    Step 'autostart registered (opt-in)' $true 'Scheduled Task "A2C Bridge Supervisor" at logon runs the LKG-aware supervisor launcher'
   } else {
     Step 'autostart not requested' $true 'pass -EnableAutoStart to register a logon task'
   }

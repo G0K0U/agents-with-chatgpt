@@ -3,7 +3,7 @@
 // Runs after `tsc` so the dist tree is final. See src/bridge/runtime-identity.ts.
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,7 +12,22 @@ const distDir = path.join(repoRoot, "dist");
 const srcDir = path.join(repoRoot, "src");
 const MANIFEST_NAME = "build-manifest.json";
 
-function collectFiles(root, out) {
+// TypeScript leaves emitted files behind when their source is deleted. Both
+// npm build and the release gate run this step before hashing/promoting dist.
+// Only remove compiler output without a matching source; preserve assets.
+function pruneDeletedSourceOutput(dir) {
+  if (!existsSync(dir)) return;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) pruneDeletedSourceOutput(full);
+    else if (entry.isFile() && /\.js(?:\.map)?$/.test(entry.name)) {
+      const relative = path.relative(distDir, full).replace(/\.js(?:\.map)?$/, ".ts");
+      if (!existsSync(path.join(srcDir, relative))) unlinkSync(full);
+    }
+  }
+}
+
+function collectFiles(root, out, sourceFilesOnly = false) {
   let entries;
   try {
     entries = readdirSync(root, { withFileTypes: true });
@@ -21,15 +36,16 @@ function collectFiles(root, out) {
   }
   for (const entry of entries) {
     const full = path.join(root, entry.name);
-    if (entry.isDirectory()) collectFiles(full, out);
-    else if (entry.isFile() && entry.name !== MANIFEST_NAME && !entry.name.endsWith(".map")) out.push(full);
+    if (entry.isDirectory()) collectFiles(full, out, sourceFilesOnly);
+    else if (entry.isFile() && entry.name !== MANIFEST_NAME && !entry.name.endsWith(".map") &&
+      (!sourceFilesOnly || /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|json)$/.test(entry.name))) out.push(full);
   }
 }
 
-function treeHash(root) {
+function treeHash(root, sourceFilesOnly = false) {
   if (!existsSync(root)) return null;
   const files = [];
-  collectFiles(root, files);
+  collectFiles(root, files, sourceFilesOnly);
   if (files.length === 0) return null;
   const hashed = files.sort().map((file) => ({
     rel: path.relative(root, file).replaceAll("\\", "/"),
@@ -49,8 +65,9 @@ function git(args) {
 }
 
 const pkg = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8"));
+pruneDeletedSourceOutput(distDir);
 const buildHash = treeHash(distDir);
-const sourceHash = treeHash(srcDir);
+const sourceHash = treeHash(srcDir, true);
 if (!buildHash || !sourceHash) {
   console.error("write-build-manifest: dist/ or src/ missing; refusing to write a manifest");
   process.exit(1);
@@ -62,7 +79,9 @@ const manifest = {
   version: pkg.version,
   sourceCommit: commit,
   sourceDirty: Boolean(dirty),
-  sourceRoot: srcDir,
+  // Resolve against the installation at runtime. An absolute build-machine
+  // path would leak into the release and break source parity after cloning.
+  sourceRoot: "src",
   sourceHash,
   buildHash,
   builtAt: new Date().toISOString(),

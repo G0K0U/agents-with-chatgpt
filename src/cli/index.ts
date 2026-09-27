@@ -1,7 +1,9 @@
+import { installationRoot } from "../bridge/runtime-identity.js";
 import { fullAccessDevelopmentEnabled } from "../config/development.js";
 import { Command } from "commander";
 import fs from "node:fs";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
@@ -10,9 +12,11 @@ import { readAuthStatePointer } from "../bridge/state-owner.js";
 import { reconcileStateDomains } from "../bridge/state-migration.js";
 import { adminFetch, ensureBridge, stopBridge, findSharedBridgeObservation as findBridgeObservation,
   type SharedBridgeObservation } from "../process/daemon.js";
-import { activateRelease, promoteCurrentBuild, releaseRepoRoot, releaseStatus, runReleaseGate } from "../process/release.js";
+import { activateRelease, promoteCurrentBuild, releaseRepoRoot, releaseStatus, rollbackRelease, runReleaseGate } from "../process/release.js";
+import { renderDeployReport, runLocalDeploy } from "../process/deploy.js";
 import { diagnoseSharedTunnel } from "../process/shared-doctor.js";
 import { requestRestart, waitRestartHandoff } from "../process/restart.js";
+import { observeSupervisorStatus, stopSupervisorProcess } from "../supervisor/control.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
@@ -35,6 +39,7 @@ import {
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
 import { getStateDir, initializeStateDir } from "../config/paths.js";
+import { resolveZ2cRepoRoot } from "../config/z2c-repo.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
@@ -65,6 +70,18 @@ import {
 } from "../session/state.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
+import {
+  listOperatorVerificationProfiles,
+  readOperatorVerificationProfile,
+  registerOperatorVerificationProfile,
+  removeOperatorVerificationProfile,
+  resolveVerificationProfile,
+} from "../execution/operator-verification.js";
+import {
+  cleanupVerificationRuntime,
+  materializeVerificationProfile,
+  prepareVerificationRuntime,
+} from "../execution/verification.js";
 
 const program = new Command();
 
@@ -191,6 +208,22 @@ interface AdminInfo {
   stateDomainGeneration?: string;
 }
 
+/** Refresh only the observed external route; never request tunnel control. */
+async function refreshExternalTunnelInfo(runtime: RuntimeState, info: AdminInfo): Promise<AdminInfo> {
+  if (info.tunnel.management !== "external") return info;
+  try {
+    const refreshed = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info?observe=1", 15_000);
+    if (refreshed.workspaceId === info.workspaceId && refreshed.pid === info.pid &&
+        refreshed.port === info.port && refreshed.startedAt === info.startedAt &&
+        refreshed.stateDomainGeneration === info.stateDomainGeneration &&
+        refreshed.tunnel?.management === "external") return refreshed;
+  } catch {
+    // A failed read-only observation is unknown; never trigger a tunnel start.
+  }
+  return { ...info, tunnel: { ...info.tunnel, running: false, reachable: null,
+    detail: "External tunnel observation refresh unavailable" } };
+}
+
 async function ensureBridgeAndTunnel(
   workspaceRoot: string,
   opts: { tunnel: boolean; stateDir?: string }
@@ -296,8 +329,8 @@ async function ensureBridgeAndTunnel(
 }
 
 program
-  .name("c2c")
-  .description(`${PRODUCT_NAME} — ChatGPT thinks. Codex works.`)
+  .name("a2c")
+  .description(`${PRODUCT_NAME} — ChatGPT thinks. Agents work (A2C; lanes: c2c/codex, z2c/zcode, g2c/gemini).`)
   .version(VERSION, "-v, --version")
   .option("--state-dir <path>", "explicit C2C state directory")
   .configureHelp({ sortSubcommands: true });
@@ -580,12 +613,15 @@ program
       }
       return;
     }
+    info = await refreshExternalTunnelInfo(runtime, info);
     const localHealth = await probeBridge(runtime.port);
     const publicBaseUrl = observation.shared ? info.publicUrl : info.publicUrl ?? configuredPublicUrl;
     const publicProbe = publicBaseUrl ? await probePublicMcp(publicBaseUrl, 8_000) : null;
+    const publicReady = !publicBaseUrl || Boolean(info.tunnel.running &&
+      (info.tunnel.management !== "external" || info.tunnel.reachable === true) && publicProbe?.ok);
     const mode = info.tunnel.provider === "cloudflare-named" ? "named" : info.tunnel.provider === "cloudflare-quick" ? "quick" : "local";
     const payload = {
-      ok: Boolean(localHealth && (observation.shared ? info.tunnel.running && publicProbe?.ok : publicProbe?.ok !== false)),
+      ok: Boolean(localHealth && publicReady),
       running: true,
       state: "healthy",
       workspaceId: workspace.id,
@@ -619,9 +655,14 @@ program
     say("");
     check(`Workspace：${info.workspaceName}`);
     check(`Bridge：运行中（端口 ${info.port}）`);
-    if (publicProbe?.ok && publicBaseUrl) check(`安全连接：${publicBaseUrl}/mcp（HTTP ${publicProbe.status}）`);
-    else if (publicProbe) cross(`安全连接：不可达（${publicProbe.detail}）`);
+    if (publicProbe?.ok && publicBaseUrl) {
+      const modeLabel = info.tunnel?.management === "external" ? " [外部服务/仅观测]" : "";
+      check(`安全连接：${publicBaseUrl}/mcp（HTTP ${publicProbe.status}）${modeLabel}`);
+    } else if (publicProbe) cross(`安全连接：不可达（${publicProbe.detail}）`);
     else say("· 安全连接：未启用（本地模式）");
+    if (info.tunnel?.management === "external") {
+      say("· 隧道控制：外部独立服务（无进程所有权，ownsProcess=false）");
+    }
     check(`本地健康检查：${localHealth ? "HTTP 200" : "失败"}`);
     say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
   });
@@ -760,7 +801,12 @@ program
     if (sharedObservation && runtime && workspace) {
       // Doctor on B diagnoses the authenticated owner A. Repairs that restart
       // the shared bridge require the explicit shared stop/restart lifecycle.
-      const diagnosis = await diagnoseSharedTunnel(sharedObservation);
+      const ownerInfo = sharedObservation.adminInfo
+        ? await refreshExternalTunnelInfo(runtime, sharedObservation.adminInfo)
+        : null;
+      const diagnosis = await diagnoseSharedTunnel(ownerInfo
+        ? { ...sharedObservation, adminInfo: ownerInfo }
+        : sharedObservation);
       report.tunnel = diagnosis.report;
       if (diagnosis.report.ok && diagnosis.publicUrl) {
         const nextMcp = mcpUrlFromPublic(diagnosis.publicUrl)!;
@@ -780,6 +826,7 @@ program
       }
     } else if (runtime) {
       let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+      info = await refreshExternalTunnelInfo(runtime, info);
       if (namedReady && opts.fix && info.tunnel.provider !== "cloudflare-named") {
         await stopBridge(root, { stateDir: opts.stateDir });
         await new Promise((resolve) => setTimeout(resolve, 400));
@@ -902,7 +949,7 @@ program
       try {
         const { buildUnifiedReport } = await import("../process/unified-report.js");
         unified = await buildUnifiedReport({
-          repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."),
+          repoRoot: installationRoot(),
           stateDir: getStateDir(opts.stateDir),
           workspaceId: workspace?.id ?? "",
           workspaceRoot: root,
@@ -966,6 +1013,35 @@ program
             : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
     );
     if (!allOk || namedRepair.needed) process.exitCode = 1;
+  });
+
+// ---------------------------------------------------------------- deploy (one-command local deployment)
+
+program
+  .command("deploy")
+  .description("One-command local deployment from a clone: checks, local bridge, health, tunnel gate (public tunnel setup stays a human step)")
+  .option("-w, --workspace <path>", "workspace root (defaults to current directory)")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--no-start-bridge", "report checks and the tunnel gate only; do not start the local bridge")
+  .option("--autostart", "opt in to registering the logon autostart task (Windows)", false)
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; stateDir?: string; startBridge: boolean; autostart: boolean; json: boolean }) => {
+    try {
+      const report = await runLocalDeploy({
+        workspaceRoot: resolveWorkspace(opts.workspace),
+        stateDir: opts.stateDir,
+        startBridge: opts.startBridge,
+        autostart: opts.autostart,
+      });
+      if (opts.json) {
+        say(JSON.stringify(report));
+      } else {
+        for (const line of renderDeployReport(report)) say(line);
+      }
+      if (!report.ok) process.exitCode = 1;
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
   });
 
 // ---------------------------------------------------------------- pair / unpair
@@ -1073,13 +1149,14 @@ program
 
 // ---------------------------------------------------------------- update-check (once per local day)
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const repoRoot = installationRoot();
 
 function runGit(args: string[]): { ok: boolean; stdout: string } {
   const result = spawnSync("git", args, {
     cwd: repoRoot,
     encoding: "utf8",
     timeout: 8000,
+    windowsHide: true,
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
   });
   return { ok: result.status === 0, stdout: (result.stdout ?? "").trim() };
@@ -1172,6 +1249,23 @@ release
   });
 
 release
+  .command("rollback")
+  .description("Repoint the last-known-good release to the previously activated release (validated; bounded A/B swap)")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    const root = releaseRepoRoot();
+    const result = rollbackRelease(root);
+    if (opts.json) say(JSON.stringify(result));
+    else {
+      const msg = result.ok
+        ? `Rolled back to ${result.pointer?.releaseId}${result.error ? ` (${result.error})` : ""}`
+        : `Rollback failed: ${result.error}`;
+      say(msg);
+    }
+    if (!result.ok) process.exitCode = 1;
+  });
+
+release
   .command("status", { isDefault: true })
   .description("Show release identity, source/build parity, and drift")
   .option("--json", "machine-readable output", false)
@@ -1188,6 +1282,156 @@ release
     if (status.drift.some(d => d !== "NONE" && d !== "LKG_AHEAD_OF_DIST")) process.exitCode = 1;
   });
 
+// ---------------------------------------------------------------- plane (local shared session/activity index)
+
+// Safe local dashboard/index for the provider-neutral shared session plane.
+// Read-only, loopback-free (pure CLI over the durable projection + live Z2C
+// observation), local-operator principal only. Native Codex/ZCode UIs have no
+// supported mechanism to ingest external (A2C-originated) session records, so
+// this command is the local inspection surface for A2C work.
+program
+  .command("plane")
+  .description("Shared agent session/activity plane (read-only local index)")
+  .option("--state-dir <path>", "explicit C2C state directory");
+
+async function planeForCli(stateDirOpt?: string) {
+  const { AgentPlane } = await import("../session-plane/plane.js");
+  const { loadZcodeSessionOwnership } = await import("../execution/zcode-session-ownership.js");
+  const { ZcodeSessionClient, loadZcodeSessionConfig } = await import("../execution/zcode-session-client.js");
+  const { WorkspaceRegistry } = await import("../workspace/registry.js");
+  const stateDir = getStateDir(stateDirOpt);
+  const registry = new WorkspaceRegistry({ stateDir });
+  const workspaces = registry.enabledIds().flatMap((id) => {
+    try {
+      const w = registry.getWorkspace(id);
+      return [{ workspaceId: w.id, canonicalPath: w.root }];
+    } catch {
+      return [];
+    }
+  });
+  let zcodeClient: InstanceType<typeof ZcodeSessionClient> | null = null;
+  try {
+    zcodeClient = new ZcodeSessionClient(loadZcodeSessionConfig());
+  } catch {
+    zcodeClient = null; // Z2C lane unconfigured: codex/gemini projection still served
+  }
+  return new AgentPlane({
+    stateDir,
+    workspaces: () => workspaces,
+    zcodeClient,
+    ownership: loadZcodeSessionOwnership(stateDir),
+  });
+}
+
+planeCommandScaffold();
+
+function planeCommandScaffold(): void {
+  const plane = program.commands.find((c) => c.name() === "plane");
+  if (!plane) return;
+
+  plane
+    .command("sessions")
+    .description("List the shared session projection across Codex, Gemini/Antigravity, and ZCode (observe-only)")
+    .option("-p, --provider <name>", "filter: codex | gemini | zcode")
+    .option("-o, --origin <name>", "filter: a2c | native | desktop")
+    .option("-w, --workspace-id <id>", "filter by A2C workspace id")
+    .option("-n, --limit <n>", "page size (1-100)", "50")
+    .option("--json", "machine-readable output", false)
+    .option("--state-dir <path>", "explicit C2C state directory")
+    .action(async (opts: { provider?: string; origin?: string; workspaceId?: string; limit?: string; json?: boolean; stateDir?: string }) => {
+      const planeApi = await planeForCli(opts.stateDir);
+      const result = await planeApi.listSessions(undefined, {
+        provider: opts.provider as never,
+        origin: opts.origin as never,
+        workspaceId: opts.workspaceId,
+        limit: Number(opts.limit ?? 50),
+      });
+      if (opts.json) {
+        say(JSON.stringify(result));
+        return;
+      }
+      say(`shared sessions (${result.sessions.length}${result.nextCursor ? "+, more pages" : ""}):`);
+      for (const s of result.sessions) {
+        say(`  [${s.provider}/${s.origin}] ${s.sessionId}  status=${s.status}  model=${s.model ?? "?"}  ws=${s.workspaceId}  tasks=${s.taskIds.length}`);
+      }
+    });
+
+  plane
+    .command("messages")
+    .description("Visible user/assistant message history of one shared session (redacted, bounded; observe-only)")
+    .argument("<sessionId>", "shared-plane session id")
+    .option("-n, --limit <n>", "max messages (1-50)", "20")
+    .option("--json", "machine-readable output", false)
+    .option("--state-dir <path>", "explicit C2C state directory")
+    .action(async (sessionId: string, opts: { limit?: string; json?: boolean; stateDir?: string }) => {
+      const planeApi = await planeForCli(opts.stateDir);
+      const result = await planeApi.sessionMessages(undefined, sessionId, Number(opts.limit ?? 20));
+      if (opts.json) {
+        say(JSON.stringify(result));
+        return;
+      }
+      say(`${result.provider}/${result.origin} ${result.sessionId}:`);
+      for (const m of result.messages) {
+        say(`  ${m.role === "user" ? ">" : "<"}${m.restricted ? " [restricted]" : ""} ${m.text.slice(0, 200).replace(/\s+/g, " ")}`);
+      }
+    });
+
+  plane
+    .command("activity")
+    .description("Bounded cross-provider activity feed with seq cursor (observe-only)")
+    .option("-p, --provider <name>", "filter: codex | gemini | zcode")
+    .option("-s, --session-id <id>", "filter by session id")
+    .option("-w, --workspace-id <id>", "filter by A2C workspace id")
+    .option("--after-seq <n>", "events after this sequence number")
+    .option("-n, --limit <n>", "page size (1-100)", "50")
+    .option("--json", "machine-readable output", false)
+    .option("--state-dir <path>", "explicit C2C state directory")
+    .action(async (opts: { provider?: string; sessionId?: string; workspaceId?: string; afterSeq?: string; limit?: string; json?: boolean; stateDir?: string }) => {
+      const planeApi = await planeForCli(opts.stateDir);
+      const result = await planeApi.listActivity(undefined, {
+        provider: opts.provider as never,
+        sessionId: opts.sessionId,
+        workspaceId: opts.workspaceId,
+        afterSeq: opts.afterSeq !== undefined ? Number(opts.afterSeq) : undefined,
+        limit: Number(opts.limit ?? 50),
+      });
+      if (opts.json) {
+        say(JSON.stringify(result));
+        return;
+      }
+      say(`activity (lastSeq=${result.lastSeq}):`);
+      for (const e of result.events) {
+        say(`  #${e.seq} [${e.provider}] ${e.type} session=${e.sessionId ?? "-"} task=${e.taskId ?? "-"} — ${e.summary}`);
+      }
+    });
+
+  plane
+    .command("task")
+    .description("Bounded task view incl. changed files, actionEvidence, verification (observe-only)")
+    .argument("<workspaceId>", "A2C workspace id")
+    .argument("<taskId>", "C2C task id (c2c_…)")
+    .option("--json", "machine-readable output", false)
+    .option("--state-dir <path>", "explicit C2C state directory")
+    .action(async (workspaceId: string, taskId: string, opts: { json?: boolean; stateDir?: string }) => {
+      const planeApi = await planeForCli(opts.stateDir);
+      const view = planeApi.readTask(undefined, workspaceId, taskId);
+      say(JSON.stringify(opts.json ? view : view, null, opts.json ? 0 : 2));
+    });
+
+  plane
+    .command("output")
+    .description("Read one sanitized captured output body by workspace-scoped id (observe-only)")
+    .argument("<workspaceId>", "A2C workspace id")
+    .argument("<outputId>", "numeric output id")
+    .option("--json", "machine-readable output", false)
+    .option("--state-dir <path>", "explicit C2C state directory")
+    .action(async (workspaceId: string, outputId: string, opts: { json?: boolean; stateDir?: string }) => {
+      const planeApi = await planeForCli(opts.stateDir);
+      const view = planeApi.readOutput(undefined, workspaceId, Number(outputId));
+      say(JSON.stringify(view, null, opts.json ? 0 : 2));
+    });
+}
+
 // ---------------------------------------------------------------- supervisor (bounded self-healing)
 
 const supervisorCmd = program
@@ -1202,23 +1446,27 @@ supervisorCmd
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace: string; stateDir?: string; json: boolean }) => {
     const stateDir = getStateDir(opts.stateDir);
-    const statusFile = path.join(stateDir, "supervisor", "status.json");
-    // Pre-flight: refuse to double-start a live supervisor.
-    const lockFile = path.join(stateDir, "supervisor", "supervisor.lock");
-    if (fs.existsSync(lockFile)) {
-      try {
-        const lock = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { pid: number };
-        try { process.kill(lock.pid, 0); say(`Supervisor already running (pid ${lock.pid}).`); return; }
-        catch { /* stale lock: the run loop reclaims it */ }
-      } catch { /* unparseable lock: reclaim */ }
+    const workspaceRoot = fs.realpathSync.native(path.resolve(opts.workspace));
+    const before = observeSupervisorStatus(stateDir, workspaceRoot);
+    if (before.state === "running" || before.state === "stale") {
+      say(opts.json ? JSON.stringify({ ok: before.ok, state: before.state, pid: before.pid }) : `Supervisor already running (pid ${before.pid}, ${before.state}).`);
+      if (!before.ok) process.exitCode = 1;
+      return;
+    }
+    const previousGenerationEnded = before.state === "stopped" &&
+      (before.processStatus === "dead" ||
+        (before.processStatus === "reused" && before.processReason === "start_identity_mismatch"));
+    if (before.state === "unknown" || (before.state === "stopped" && !previousGenerationEnded)) {
+      say(opts.json ? JSON.stringify({ ok: false, state: before.state, reason: before.detail }) : `Supervisor ownership uncertain: ${before.detail}`);
+      process.exitCode = 1;
+      return;
     }
     // Spawn THIS same CLI entry (dist or tsx dev) detached for the run loop.
-    const entry = fileURLToPath(import.meta.url);
+    const entry = path.join(installationRoot(), "bin", "c2c.js");
     const entryArgs = entry.endsWith(".ts") ? ["--import", "tsx/esm", entry] : [entry];
-    const runArgs = [...entryArgs, "supervisor", "run", "--workspace", opts.workspace];
-    if (opts.stateDir) runArgs.push("--state-dir", opts.stateDir);
+    const runArgs = [...entryArgs, "supervisor", "run", "--workspace", workspaceRoot, "--state-dir", stateDir];
     const child = spawn(process.execPath, runArgs, {
-      cwd: process.cwd(),
+      cwd: workspaceRoot,
       detached: true,
       windowsHide: true,
       stdio: "ignore",
@@ -1228,94 +1476,96 @@ supervisorCmd
     const deadline = Date.now() + 20_000;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 500));
-      try {
-        const snap = JSON.parse(fs.readFileSync(statusFile, "utf8")) as { pid: number };
-        if (snap.pid === child.pid) {
-          say(opts.json ? JSON.stringify({ ok: true, pid: child.pid }) : `Supervisor running (pid ${child.pid}).`);
-          return;
-        }
-      } catch { /* not yet */ }
+      const observation = observeSupervisorStatus(stateDir, workspaceRoot);
+      if (observation.pid === child.pid && observation.state === "running") {
+        say(opts.json ? JSON.stringify({ ok: observation.ok, pid: child.pid, overall: observation.overall }) : `Supervisor running (pid ${child.pid}, ${observation.overall}).`);
+        if (!observation.ok) process.exitCode = 1;
+        return;
+      }
     }
-    say(opts.json ? JSON.stringify({ ok: false, pid: child.pid }) : `Supervisor spawned (pid ${child.pid}) but no heartbeat yet; check ${statusFile}.`);
-    if (!opts.json) process.exitCode = 1;
+    say(opts.json ? JSON.stringify({ ok: false, pid: child.pid, reason: "no_verified_heartbeat" }) : `Supervisor spawned (pid ${child.pid}) but no verified heartbeat appeared.`);
+    process.exitCode = 1;
   });
 
 supervisorCmd
   .command("run", { hidden: true })
   .description("Supervisor loop entry (used by the detached start command)")
-  .option("--workspace <dir>", "supervised control-plane workspace root", process.cwd())
+  .requiredOption("--workspace <dir>", "supervised control-plane workspace root")
+  // Commander assigns --state-dir to the root command when both levels
+  // declare it. Validate the explicitly supplied root value in the action.
   .option("--state-dir <path>", "explicit C2C state directory")
   .action(async (opts: { workspace: string; stateDir?: string }) => {
     const { Supervisor } = await import("../supervisor/supervisor.js");
-    const stateDir = getStateDir(opts.stateDir);
+    const suppliedStateDir = opts.stateDir ?? (program.opts() as { stateDir?: string }).stateDir;
+    if (!suppliedStateDir) throw new Error("supervisor run requires explicit --state-dir");
+    const stateDir = getStateDir(suppliedStateDir);
     const supervisor = new Supervisor({
-      repoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."),
+      repoRoot: installationRoot(),
       stateDir,
       workspaceRoot: path.resolve(opts.workspace),
     });
-    if (!supervisor.acquireLock()) {
+    if (!await supervisor.acquireLock()) {
       say("Another live supervisor holds the lock; exiting.");
       return;
     }
     // R1.1 takeover bootstrap: reconcile provider desired state (on-demand
     // readiness + managed ZCode Desktop) once, bounded and idempotent, before
     // the observation loop takes over continuous reconciliation.
-    await supervisor.bootstrapOnTakeover().catch((error) => {
+    const bootstrapTask = supervisor.bootstrapOnTakeover().catch((error) => {
       say(`Provider bootstrap failed (non-fatal): ${error instanceof Error ? error.message : String(error)}`);
     });
-    const shutdown = (): void => { supervisor.stop(); supervisor.releaseLock(); process.exit(0); };
+    const shutdown = (): void => { supervisor.stop(); };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
-    await supervisor.run();
+    try {
+      await supervisor.run();
+      await bootstrapTask;
+      await supervisor.waitForRecoveries();
+    } finally {
+      supervisor.releaseLock();
+    }
   });
 
 supervisorCmd
   .command("stop")
   .description("Stop a running supervisor")
+  .option("--workspace <dir>", "supervised control-plane workspace root", process.cwd())
+  .option("--state-dir <path>", "explicit C2C state directory")
   .option("--json", "machine-readable output", false)
-  .action((opts: { json: boolean }) => {
-    const stateDir = getStateDir();
-    const lockFile = path.join(stateDir, "supervisor", "supervisor.lock");
-    let stopped = false;
-    if (fs.existsSync(lockFile)) {
-      try {
-        const lock = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { pid: number };
-        try { process.kill(lock.pid); stopped = true; } catch { stopped = false; }
-      } catch { /* fall through */ }
-    }
-    try { fs.rmSync(lockFile, { force: true }); } catch { /* best effort */ }
-    say(opts.json ? JSON.stringify({ ok: stopped }) : (stopped ? "Supervisor stopped." : "No live supervisor found (stale lock cleared)."));
-    if (!stopped && opts.json) process.exitCode = 1;
+  .action(async (opts: { workspace: string; stateDir?: string; json: boolean }) => {
+    const result = await stopSupervisorProcess(getStateDir(opts.stateDir), path.resolve(opts.workspace));
+    say(opts.json ? JSON.stringify(result) : result.stopped ? `Supervisor stopped (pid ${result.pid}).` : `Supervisor stop refused: ${result.reason ?? "unknown"}`);
+    if (!result.ok) process.exitCode = 1;
   });
 
 supervisorCmd
   .command("status", { isDefault: true })
   .description("Show the supervisor snapshot")
+  .option("--workspace <dir>", "supervised control-plane workspace root", process.cwd())
+  .option("--state-dir <path>", "explicit C2C state directory")
   .option("--json", "machine-readable output", false)
-  .action((opts: { json: boolean }) => {
-    const statusFile = path.join(getStateDir(), "supervisor", "status.json");
-    if (!fs.existsSync(statusFile)) {
-      say(opts.json ? JSON.stringify({ ok: false, running: false }) : "No supervisor status found; is it running?");
-      process.exitCode = 1;
-      return;
-    }
-    const snap = JSON.parse(fs.readFileSync(statusFile, "utf8")) as Record<string, unknown>;
-    if (opts.json) say(JSON.stringify({ ok: true, ...snap }));
+  .action((opts: { workspace: string; stateDir?: string; json: boolean }) => {
+    const observed = observeSupervisorStatus(getStateDir(opts.stateDir), path.resolve(opts.workspace));
+    const report = {
+      ok: observed.ok, state: observed.state, running: observed.running, pid: observed.pid,
+      processStatus: observed.processStatus, overall: observed.overall,
+      heartbeatAgeMs: observed.heartbeatAgeMs, heartbeatStale: observed.heartbeatStale,
+      tick: observed.snapshot?.tick ?? null, lastTickAt: observed.snapshot?.lastTickAt ?? null,
+      components: observed.state === "running" || observed.state === "stale" ? observed.snapshot?.components ?? [] : [],
+      detail: observed.detail ?? null,
+    };
+    if (opts.json) say(JSON.stringify(report));
     else {
-      say(`overall: ${snap.overall}  (pid ${snap.pid}, tick ${snap.tick}, last ${snap.lastTickAt})`);
-      for (const c of (snap.components as Array<Record<string, unknown>>) ?? []) {
-        say(`  ${String(c.component).padEnd(18)} ${String(c.state).padEnd(10)} ${c.detail ? String(c.detail) : ""}`);
-      }
-      const log = (snap.recoveryLog as Array<Record<string, unknown>>) ?? [];
-      if (log.length) say("recent recovery:");
-      for (const entry of log.slice(-5)) say(`  ${entry.at} ${entry.component}: ${entry.action} -> ${entry.outcome}`);
+      say(`supervisor: ${report.state}  overall: ${report.overall}  pid: ${report.pid ?? "none"}`);
+      if (report.detail) say(report.detail);
+      for (const component of report.components) say(`  ${component.component.padEnd(18)} ${component.state.padEnd(10)} ${component.detail ?? ""}`);
     }
-    if (snap.overall !== "READY" && snap.overall !== "DEGRADED") process.exitCode = 1;
+    if (!observed.ok) process.exitCode = 1;
   });
 
 supervisorCmd
   .command("reconcile")
-  .description("Run one bounded provider-bootstrap reconciliation pass (safe alongside a live supervisor)")
+  .description("Observe legacy ZCode Desktop registration without changing Desktop state")
   .option("--workspace <dir>", "supervised control-plane workspace root", process.cwd())
   .option("--state-dir <path>", "explicit C2C state directory")
   .option("--json", "machine-readable output", false)
@@ -1325,13 +1575,10 @@ supervisorCmd
     const reconciler = new ZcodeDesktopReconciler({
       workspaceRoot: path.resolve(opts.workspace),
       stateDir,
-      z2cRepoRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "zcode-with-chatgpt"),
+      z2cRepoRoot: resolveZ2cRepoRoot(installationRoot()),
     });
     const obs = reconciler.observe();
-    let action = "none";
-    if (obs.launch) {
-      action = await obs.launch();
-    }
+    const action = "none (observation only)";
     const after = reconciler.observe();
     if (opts.json) {
       say(JSON.stringify({ ok: true, before: { state: obs.state, detail: obs.detail }, action, after: { state: after.state, detail: after.detail, managed: after.managed, desktopPid: after.desktopPid, registrationLive: after.registrationLive } }));
@@ -1341,6 +1588,216 @@ supervisorCmd
       say(`after:  ${after.state}${after.detail ? ` (${after.detail})` : ""}`);
     }
     if (after.state !== "READY" && after.state !== "RECOVERING") process.exitCode = 1;
+  });
+
+// ---------------------------------------------------------------- verification (trusted operator profiles)
+
+// F01: run_tests=true only executes a test command the LOCAL OPERATOR
+// registered (or a bridge-owned built-in). These commands manage that trust
+// registry; task input can never define or alter a verification command.
+const verificationCmd = program
+  .command("verification")
+  .description("Manage trusted local verification profiles (run_tests) for workspaces");
+
+interface VerificationRegisterOptions {
+  workspace?: string;
+  stateDir?: string;
+  id?: string;
+  executable: string;
+  arg: readonly string[];
+  cwd: string;
+  timeoutMs: string;
+  sandbox: string;
+  summaryKind: string;
+  force?: boolean;
+  json: boolean;
+}
+
+function registerOrUpdate(input: VerificationRegisterOptions, mode: "register" | "update"): void {
+  const workspace = new Workspace(resolveWorkspace(input.workspace));
+  const cwd = input.cwd.trim().toLowerCase();
+  if (cwd !== "workspace" && cwd !== "verification") throw new Error("--cwd must be workspace or verification");
+  const sandbox = input.sandbox.trim().toLowerCase();
+  if (sandbox !== "readonly" && sandbox !== "workspacewrite") throw new Error("--sandbox must be readonly or workspaceWrite");
+  const summaryKind = input.summaryKind.trim().toLowerCase();
+  if (summaryKind !== "pytest" && summaryKind !== "generic") throw new Error("--summary-kind must be pytest or generic");
+  const timeoutMs = parseInt(input.timeoutMs, 10);
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 30 * 60_000) {
+    throw new Error("--timeout-ms must be an integer between 1000 and 1800000");
+  }
+  const argv = [...input.arg];
+  if (argv.length === 0) throw new Error("at least one --arg is required (the verifier argv vector)");
+  const existing = (() => {
+    try { return readOperatorVerificationProfile(workspace.id, input.stateDir); }
+    catch { return null; }
+  })();
+  if (mode === "register" && existing && !input.force) {
+    throw new Error(`a verification profile already exists for this workspace (id ${existing.id}); use 'verification update' or --force`);
+  }
+  if (mode === "update" && !existing) {
+    throw new Error("no existing profile to update; use 'verification register'");
+  }
+  const record = registerOperatorVerificationProfile({
+    workspaceRoot: workspace.root,
+    id: input.id?.trim() || existing?.id || "operator",
+    executable: input.executable,
+    argv,
+    cwd,
+    timeoutMs,
+    sandbox: sandbox === "readonly" ? "readOnly" : "workspaceWrite",
+    summaryKind,
+  }, input.stateDir);
+  say(JSON.stringify({ ok: true, action: mode, record }));
+}
+
+verificationCmd
+  .command("list")
+  .description("List registered verification profiles (validity-checked, never executed)")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { stateDir?: string; json: boolean }) => {
+    const entries = listOperatorVerificationProfiles(opts.stateDir);
+    const payload = entries.map(({ record, error }) => record
+      ? { workspaceId: record.workspaceId, workspaceRoot: record.workspaceRoot, id: record.id, executable: record.executable, argv: record.argv, cwd: record.cwd, timeoutMs: record.timeoutMs, sandbox: record.sandbox, summaryKind: record.summaryKind, valid: true }
+      : { valid: false, error });
+    say(opts.json ? JSON.stringify({ ok: true, profiles: payload }) : (payload.length === 0
+      ? "No operator verification profiles registered."
+      : payload.map((p) => p.valid
+        ? `${p.workspaceId}  ${p.id}  ${p.executable}  (${p.sandbox}, ${p.timeoutMs}ms)\n    workspace: ${p.workspaceRoot}`
+        : `INVALID ${p.error}`).join("\n")));
+  });
+
+verificationCmd
+  .command("inspect")
+  .description("Show the profile that run_tests=true would use for a workspace")
+  .option("-w, --workspace <path>")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; stateDir?: string; json: boolean }) => {
+    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const profile = resolveVerificationProfile(workspace, opts.stateDir);
+    const operatorId = (() => {
+      try { return readOperatorVerificationProfile(workspace.id, opts.stateDir).id; }
+      catch { return null; }
+    })();
+    const source = profile === null ? "none" : (operatorId !== null && profile.id === operatorId ? "operator" : "builtin");
+    const payload = {
+      ok: profile !== null,
+      workspaceId: workspace.id,
+      workspaceRoot: workspace.root,
+      source,
+      profile,
+    };
+    say(opts.json ? JSON.stringify(payload) : (profile
+      ? `source: ${source}\nprofile: ${profile.id}\nexecutable: ${profile.executable}\nargv: ${profile.argv.join(" ")}\ncwd: ${profile.cwd}  timeout: ${profile.timeoutMs}ms  sandbox: ${profile.sandbox}  network: false`
+      : `No verification profile resolves for workspace ${workspace.name} (${workspace.id}). run_tests=true tasks fail with NO_VERIFICATION_PROFILE. Register one with 'c2c verification register'.`));
+  });
+
+  verificationCmd
+  .command("register")
+  .description("Register the trusted verification profile for a workspace (operator trust decision)")
+  .option("-w, --workspace <path>")
+  .requiredOption("--executable <path-or-basename>", "real executable (absolute path or PATH basename; shell scripts rejected)")
+  .requiredOption("--arg <value>", "argv element; repeat for every argument", (value: string, previous: string[]) => [...(previous ?? []), value], [] as string[])
+  .option("--id <id>", "profile id", "operator")
+  .option("--cwd <choice>", "workspace or verification", "workspace")
+  .option("--timeout-ms <n>", "bounded runtime in milliseconds", "300000")
+  .option("--sandbox <choice>", "readOnly or workspaceWrite", "workspaceWrite")
+  .option("--summary-kind <choice>", "pytest or generic", "generic")
+  .option("--force", "replace an existing registration", false)
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: VerificationRegisterOptions) => {
+    try { registerOrUpdate(opts, "register"); }
+    catch (error) { handleCliError(error, opts.json); }
+  });
+
+verificationCmd
+  .command("update")
+  .description("Replace the registered verification profile for a workspace")
+  .option("-w, --workspace <path>")
+  .requiredOption("--executable <path-or-basename>")
+  .requiredOption("--arg <value>", "argv element; repeat for every argument", (value: string, previous: string[]) => [...(previous ?? []), value], [] as string[])
+  .option("--id <id>", "profile id")
+  .option("--cwd <choice>", "workspace or verification", "workspace")
+  .option("--timeout-ms <n>", "bounded runtime in milliseconds", "300000")
+  .option("--sandbox <choice>", "readOnly or workspaceWrite", "workspaceWrite")
+  .option("--summary-kind <choice>", "pytest or generic", "generic")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: VerificationRegisterOptions) => {
+    try { registerOrUpdate(opts, "update"); }
+    catch (error) { handleCliError(error, opts.json); }
+  });
+
+verificationCmd
+  .command("remove")
+  .description("Remove the registered verification profile for a workspace")
+  .option("-w, --workspace <path>")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; stateDir?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const removed = removeOperatorVerificationProfile(workspace.id, opts.stateDir);
+      say(opts.json ? JSON.stringify({ ok: removed }) : (removed ? "Verification profile removed." : "No profile was registered for this workspace."));
+      if (!removed) process.exitCode = 1;
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+verificationCmd
+  .command("preflight")
+  .description("Dry-run: resolve and materialize the verification profile WITHOUT executing anything")
+  .option("-w, --workspace <path>")
+  .option("--state-dir <path>", "explicit C2C state directory")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { workspace?: string; stateDir?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const stateDir = getStateDir(opts.stateDir);
+      const profile = resolveVerificationProfile(workspace, opts.stateDir);
+      if (!profile) {
+        const payload = { ok: false, reason: "NO_VERIFICATION_PROFILE", workspaceId: workspace.id };
+        say(opts.json ? JSON.stringify(payload) : "No verification profile resolves; run_tests=true tasks will fail closed.");
+        process.exitCode = 1;
+        return;
+      }
+      const runtimeRoot = path.join(stateDir, "verification-preflight");
+      fs.mkdirSync(runtimeRoot, { recursive: true });
+      const taskId = `c2c_${randomBytes(6).toString("hex")}`;
+      const runtime = prepareVerificationRuntime(runtimeRoot, taskId);
+      try {
+        const materialized = materializeVerificationProfile(profile, workspace, runtime);
+        const payload = {
+          ok: true,
+          profileId: materialized.profileId,
+          workspaceId: materialized.workspaceId,
+          executable: materialized.executable,
+          argv: materialized.argv,
+          cwd: materialized.cwd,
+          cwdAlias: materialized.cwdAlias,
+          timeoutMs: materialized.timeoutMs,
+          network: materialized.network,
+          sandbox: materialized.sandboxPolicy,
+          commandLabel: materialized.commandLabel,
+          argvHash: materialized.argvHash,
+        };
+        say(opts.json ? JSON.stringify(payload) : [
+          `preflight OK — run_tests=true would execute:`,
+          `  ${materialized.commandLabel}`,
+          `  executable : ${materialized.executable}`,
+          `  cwd        : ${materialized.cwdAlias} (${materialized.cwd})`,
+          `  timeout    : ${materialized.timeoutMs}ms   network: false   sandbox: ${materialized.sandbox}`,
+          `  argvHash   : ${materialized.argvHash.slice(0, 16)}…`,
+        ].join("\n"));
+      } finally {
+        cleanupVerificationRuntime(runtimeRoot, runtime);
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
   });
 
 // ---------------------------------------------------------------- session (ChatGPT conversation / Project memory)
@@ -1742,8 +2199,12 @@ function explicitStateDirFromArgv(argv: readonly string[]): string | undefined {
 try {
   // Freeze the process-wide state context before Commander invokes any action
   // or any Logger/state helper can observe a packaged-parent environment.
+  // Single-namespace here: initializeStateDir already resolved precedence, and
+  // in-process A2C_* writes would outlive the command and shadow later
+  // C2C_* stubs in embedded/test contexts. Spawned children get BOTH names
+  // (daemon.ts / restart.ts dual-write the handoff environment).
   const stateContext = initializeStateDir(explicitStateDirFromArgv(process.argv.slice(2)));
-  process.env.C2C_STATE_DIR = stateContext.stateDir;
+  process.env.C2C_STATE_DIR = stateContext.stateDir; // legacy-compatible in-process name
 } catch (error) {
   cross(error instanceof Error ? error.message : String(error));
   process.exit(1);

@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { getSystemProcessInspector, type BridgeProcessInspector } from "../bridge/runtime.js";
 import { getStateDir } from "../config/paths.js";
 import { stableWorkspaceId } from "../workspace/identity.js";
+import { sharedEnv } from "../config/env.js";
 
 /**
  * Provider bootstrap & reconciliation (Stability R1.1).
@@ -16,25 +17,17 @@ import { stableWorkspaceId } from "../workspace/identity.js";
  *                  (executable resolves, isolated state preparable). No
  *                  persistent process, no remote canary, no quota spend.
  *   zcode        → "managed-persistent": the real ZCode Desktop GUI is the
- *                  lane. When absent it is launched WITH the desktop-agent
- *                  proxy environment so the registration → Z2C → workspace
- *                  binding → native attestation chain can come up on its own.
+ *                  lane. When absent it is launched using its bundled Agent
+ *                  without proxy environment variables so ZCode startup
+ *                  storage preparation succeeds normally.
  *                  This module never weakens attestation, never substitutes
- *                  the headless shim, and never kills an unmanaged Desktop.
+ *                  the headless shim, and never kills or relaunches a live
+ *                  Desktop simply because proxy registration is absent.
  *
  * Desired-state rules for the managed ZCode Desktop:
- *   no registration, no Desktop process             → launch managed Desktop
- *   registration live for this exact workspace       → READY, do nothing
- *   Desktop process present, registration absent     → ZCODE_DESKTOP_UNMANAGED
- *                                                      (DEGRADED, manual restart;
- *                                                      a second launch would be
- *                                                      redirected into the
- *                                                      existing single-instance
- *                                                      GUI, and killing it could
- *                                                      destroy unsaved work)
- *   supervisor-owned Desktop alive, no registration  → wait while young, then
- *                                                      ZCODE_DESKTOP_MANAGED_NOT_REGISTERED
- *                                                      (manual; no auto-kill)
+ *   no Desktop process                              → launch managed Desktop (bundled Agent)
+ *   Desktop process alive (supervisor or user)      → READY, do nothing
+ *   stale Desktop record / dead process             → managed launch
  */
 
 export type ProviderBootstrapStrategy = "on-demand" | "managed-persistent";
@@ -42,12 +35,15 @@ export type ProviderBootstrapStrategy = "on-demand" | "managed-persistent";
 export type ProviderReadinessState =
   | "READY"
   | "READY_ON_DEMAND"
+  | "DISABLED"
   | "EXECUTABLE_MISSING"
   | "ZCODE_DESKTOP_ABSENT"
   | "ZCODE_DESKTOP_UNMANAGED"
   | "ZCODE_DESKTOP_MANAGED_NOT_REGISTERED"
   | "ZCODE_DESKTOP_EXECUTABLE_NOT_FOUND"
   | "ZCODE_DESKTOP_EXECUTABLE_OVERRIDE_INVALID"
+  | "ZCODE_WORKSPACE_NOT_OPEN"
+  | "USER_ACTION_REQUIRED_UNSAVED_STATE"
   | "RECOVERING";
 
 /** Cheap local readiness for an on-demand provider (never spawns, never probes remotely). */
@@ -80,6 +76,39 @@ function isRegularFile(candidate: string): boolean {
   }
 }
 
+/**
+ * Production graceful close: Windows `taskkill` WITHOUT /F posts WM_CLOSE to
+ * the process's windows, so the Desktop runs its normal close path (including
+ * unsaved-work prompts) and simply keeps running when the user/work refuses.
+ * POSIX sends SIGTERM. Returns true only when the process actually exited
+ * within the bounded wait; a refusal is honored, never escalated to a kill.
+ */
+async function gracefulCloseProduction(
+  pid: number,
+  sleep: (ms: number) => Promise<void>,
+  restartWaitMs: number,
+): Promise<boolean> {
+  if (!pid || pid <= 0) return false;
+  let exited = !pidAlive(pid);
+  if (!exited) {
+    const child = spawn(
+      process.platform === "win32" ? "taskkill" : "kill",
+      process.platform === "win32" ? ["/PID", String(pid)] : [String(pid)],
+      { stdio: "ignore", windowsHide: true },
+    );
+    await new Promise<void>((resolve) => {
+      child.once("close", () => resolve());
+      child.once("error", () => resolve());
+    });
+  }
+  const steps = Math.max(1, Math.round(restartWaitMs / 1_000));
+  for (let i = 0; i < steps && !exited; i++) {
+    await sleep(1_000);
+    exited = !pidAlive(pid);
+  }
+  return exited;
+}
+
 /** Same registration layout scripts/desktop-agent-proxy.mjs publishes. */
 export function desktopAgentsDir(env: NodeJS.ProcessEnv = process.env): string {
   const base = env.Z2C_STATE_DIR
@@ -91,6 +120,18 @@ export function desktopAgentsDir(env: NodeJS.ProcessEnv = process.env): string {
 export function registrationPathFor(workspaceRoot: string, env: NodeJS.ProcessEnv = process.env): string {
   const hash = createHash("sha1").update(workspaceRoot.toLowerCase()).digest("hex").slice(0, 16);
   return path.join(desktopAgentsDir(env), `agent-${hash}.json`);
+}
+
+/**
+ * Sanitizes child environment for ZCode Desktop processes.
+ * Ensures the bundled Agent is used by explicitly removing any
+ * ZCODE_AGENT_SERVER_COMMAND or ZCODE_AGENT_SERVER_ARGS_JSON overrides.
+ */
+export function sanitizeBundledAgentEnv(parentEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...parentEnv };
+  delete env.ZCODE_AGENT_SERVER_COMMAND;
+  delete env.ZCODE_AGENT_SERVER_ARGS_JSON;
+  return env;
 }
 
 function samePath(a: string, b: string): boolean {
@@ -193,7 +234,7 @@ export function resolveZcodeDesktopExecutable(options: {
 } = {}): string {
   const env = options.env ?? process.env;
   const isFile = options.isFile ?? isRegularFile;
-  const override = env.C2C_ZCODE_DESKTOP_EXECUTABLE;
+  const override = sharedEnv("ZCODE_DESKTOP_EXECUTABLE", env);
   if (override !== undefined) {
     if (!override || !path.isAbsolute(override) || !isFile(override) ||
         (process.platform === "win32" && path.extname(override).toLowerCase() !== ".exe")) {
@@ -258,8 +299,14 @@ export interface ZcodeDesktopObservation {
   managed: boolean | null;
   desktopPid: number | null;
   registrationLive: boolean;
+  /** Desired workspaces whose desktop-agent registration is not live. */
+  missingWorkspaceRoots: string[];
   /** Present only when launching is the correct next action (idempotent, bounded). */
   launch?: () => Promise<string>;
+  /** Present when the Desktop just needs desired workspaces opened in it (official argv redirect). */
+  openWorkspaces?: () => Promise<string>;
+  /** Present when the unmanaged Desktop may be gracefully closed and relaunched managed. */
+  managedRestart?: () => Promise<string>;
 }
 
 export interface ZcodeDesktopReconcilerDeps {
@@ -275,9 +322,33 @@ export interface ZcodeDesktopReconcilerDeps {
   ownershipFile?: string;
   /** How long a launch waits for the fresh registration before yielding back to reconciliation. */
   registrationWaitMs?: number;
+  /**
+   * Additional workspace roots (besides workspaceRoot) whose desktop-agent
+   * registrations are desired state — e.g. the Engineering AI product
+   * workspace hosting the governed ZCode queue. Registration liveness for
+   * every desired root is required before the Desktop lane reports READY.
+   */
+  desiredWorkspaceRoots?: string[];
+  /** How long a workspace-open request waits for the fresh registration. */
+  openWaitMs?: number;
+  /** How long a graceful close wait may hold before declaring refusal. */
+  restartWaitMs?: number;
+  /** Test seam: request a graceful window close; true when the process exited. */
+  gracefulClose?: (pid: number) => Promise<boolean>;
 }
 
 const MANAGED_START_GRACE_MS = 90_000;
+/** Refusal evidence (possible unsaved work) is honored for this long after a graceful close attempt. */
+const RESTART_REFUSAL_TTL_MS = 6 * 60 * 60_000;
+
+/** Safe metadata about one graceful-close attempt of an unmanaged Desktop (never credentials). */
+export interface ZcodeDesktopRestartRecord {
+  schema: 1;
+  pid: number;
+  processStartIdentity: string | null;
+  at: string;
+  outcome: "closed" | "refused";
+}
 
 function readRegistration(file: string): { pid: number; workspace: string } | null {
   try {
@@ -290,7 +361,7 @@ function readRegistration(file: string): { pid: number; workspace: string } | nu
 }
 
 export class ZcodeDesktopReconciler {
-  private readonly deps: Required<Pick<ZcodeDesktopReconcilerDeps, "workspaceRoot" | "stateDir" | "z2cRepoRoot" | "now" | "sleep" | "registrationWaitMs">> & ZcodeDesktopReconcilerDeps;
+  private readonly deps: Required<Pick<ZcodeDesktopReconcilerDeps, "workspaceRoot" | "stateDir" | "z2cRepoRoot" | "now" | "sleep" | "registrationWaitMs" | "openWaitMs" | "restartWaitMs">> & ZcodeDesktopReconcilerDeps;
 
   constructor(deps: ZcodeDesktopReconcilerDeps) {
     this.deps = {
@@ -298,6 +369,8 @@ export class ZcodeDesktopReconciler {
       now: () => new Date(),
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
       registrationWaitMs: 20_000,
+      openWaitMs: 30_000,
+      restartWaitMs: 45_000,
       ...deps,
     };
   }
@@ -309,8 +382,30 @@ export class ZcodeDesktopReconciler {
     return registrationPathFor(this.deps.workspaceRoot, this.deps.env);
   }
 
+  private regPathForRoot(root: string): string {
+    if (this.deps.registrationsDir) {
+      return path.join(this.deps.registrationsDir, path.basename(registrationPathFor(root, this.deps.env)));
+    }
+    return registrationPathFor(root, this.deps.env);
+  }
+
+  /** All workspace roots whose registrations are desired state, primary first, deduplicated. */
+  private desiredRoots(): string[] {
+    const roots = [this.deps.workspaceRoot, ...(this.deps.desiredWorkspaceRoots ?? [])];
+    const seen = new Set<string>();
+    for (const root of roots) {
+      const key = path.normalize(root).toLowerCase();
+      if (!seen.has(key)) seen.add(key);
+    }
+    return [...seen.keys()].map((key) => roots.find((r) => path.normalize(r).toLowerCase() === key)!);
+  }
+
   private ownershipFile(): string {
     return this.deps.ownershipFile ?? path.join(this.deps.stateDir, "supervisor", "zcode-desktop.json");
+  }
+
+  private restartRecordFile(): string {
+    return path.join(this.deps.stateDir, "supervisor", "zcode-desktop-restart.json");
   }
 
   private inspector(): BridgeProcessInspector | null {
@@ -344,7 +439,20 @@ export class ZcodeDesktopReconciler {
 
   private desktopPids(resolvedExe: string, rows: ReturnType<BridgeProcessInspector["list"]>): number[] {
     if (!rows) return [];
-    return rows.filter(r => samePath(r.executable, resolvedExe)).map(r => r.pid);
+    const mine = rows.filter(r => samePath(r.executable, resolvedExe));
+    if (mine.length === 0) return [];
+    // Electron-style multi-process install. The GUI main (browser) process is
+    // the one launched with the bare executable path: helpers carry
+    // `--type=...`, and the Desktop's own windowless agent children carry the
+    // agent/app-server arguments — only the true main's command line is the
+    // executable alone. Lifecycle actions (graceful close) must address that
+    // process; children have no window and would ignore WM_CLOSE.
+    const mains = mine.filter(r => {
+      const bare = (r.commandLine ?? "").trim().replace(/^"(.*)"$/s, "$1").trim();
+      return bare.length > 0 && samePath(bare, resolvedExe);
+    });
+    if (mains.length > 0) return mains.map(r => r.pid);
+    return mine.map(r => r.pid);
   }
 
   /** Observe desired vs actual state. Side-effect free. */
@@ -363,99 +471,112 @@ export class ZcodeDesktopReconciler {
         managed: null,
         desktopPid: null,
         registrationLive: false,
+        missingWorkspaceRoots: [],
       };
     }
 
-    const reg = readRegistration(this.regPath());
-    const workspaceMatches = reg ? samePath(reg.workspace, this.deps.workspaceRoot) : false;
-    if (reg && workspaceMatches && pidAlive(reg.pid)) {
+    const roots = this.desiredRoots();
+    const rootStates = roots.map((root) => {
+      const reg = readRegistration(this.regPathForRoot(root));
+      return {
+        root,
+        live: Boolean(reg && samePath(reg.workspace, root) && pidAlive(reg.pid)),
+        reg,
+      };
+    });
+    const missingRoots = rootStates.filter((entry) => !entry.live).map((entry) => entry.root);
+    if (missingRoots.length === 0) {
+      const primary = rootStates[0];
       const rows = this.inspector()?.list() ?? null;
       const rec = this.readRecord();
       const pids = this.desktopPids(resolvedExe, rows);
       return {
         state: "READY",
         managed: rec ? (this.recordLive(rec, rows) || null) : null,
-        desktopPid: pids[0] ?? reg.pid,
+        desktopPid: pids[0] ?? primary.reg!.pid,
         registrationLive: true,
+        missingWorkspaceRoots: [],
       };
     }
 
     const rows = this.inspector()?.list() ?? null;
     const rec = this.readRecord();
     const recAlive = rec ? this.recordLive(rec, rows) : false;
-    if (recAlive && rec) {
-      const ageMs = this.deps.now().getTime() - Date.parse(rec.startedAt);
-      if (ageMs < MANAGED_START_GRACE_MS) {
-        return {
-          state: "RECOVERING",
-          detail: `managed ZCode Desktop starting (pid ${rec.pid}); waiting for registration`,
-          managed: true,
-          desktopPid: rec.pid,
-          registrationLive: false,
-        };
-      }
+
+    // If live registrations exist for some desired workspaces but not all,
+    // request the missing workspaces via the official single-instance open request.
+    if (rootStates.some((entry) => entry.live)) {
       return {
-        state: "ZCODE_DESKTOP_MANAGED_NOT_REGISTERED",
-        detail: `managed ZCode Desktop (pid ${rec.pid}) produced no registration; manual managed restart required`,
+        state: "ZCODE_WORKSPACE_NOT_OPEN",
+        detail: `ZCode Desktop is running with live registrations but lacks them for: ${missingRoots.join(", ")}`,
+        managed: recAlive && rec ? true : null,
+        desktopPid: recAlive && rec ? rec.pid : (rootStates.find((entry) => entry.live)!.reg!.pid),
+        registrationLive: false,
+        missingWorkspaceRoots: missingRoots,
+        openWorkspaces: () => this.requestWorkspaceOpen(missingRoots),
+      };
+    }
+    if (recAlive && rec) {
+      return {
+        state: "READY",
+        detail: `managed ZCode Desktop is running (pid ${rec.pid})`,
         managed: true,
         desktopPid: rec.pid,
-        registrationLive: false,
+        registrationLive: Boolean(rootStates[0]?.live),
+        missingWorkspaceRoots: [],
       };
     }
 
     const pids = this.desktopPids(resolvedExe, rows);
     if (pids.length > 0) {
       return {
-        state: "ZCODE_DESKTOP_UNMANAGED",
-        detail: `ZCode Desktop is running without the managed proxy (pids: ${pids.join(", ")}); manual managed restart required`,
+        state: "READY",
+        detail: `ZCode Desktop is running (pid ${pids[0]})`,
         managed: false,
         desktopPid: pids[0],
-        registrationLive: false,
+        registrationLive: Boolean(rootStates[0]?.live),
+        missingWorkspaceRoots: [],
       };
     }
 
-    const detail = reg && !workspaceMatches
+    const primaryReg = rootStates[0]?.reg;
+    const detail = primaryReg && !samePath(primaryReg.workspace, this.deps.workspaceRoot)
       ? `registration exists for a different workspace; managed launch required for this workspace`
-      : reg
+      : primaryReg
         ? "stale desktop-agent registration (pid dead); managed launch required"
-        : "no live desktop-agent registration and no ZCode Desktop process";
+        : "no ZCode Desktop process running; managed launch required";
     return {
       state: "ZCODE_DESKTOP_ABSENT",
       detail,
       managed: null,
       desktopPid: null,
       registrationLive: false,
+      missingWorkspaceRoots: missingRoots,
       launch: () => this.launchManagedDesktop(),
     };
   }
 
   /**
-   * Deterministic managed launch. Idempotent: re-checks registration and
-   * Desktop presence before spawning, injects the proxy environment via a
-   * direct (shell-less) spawn with no credentials on the command line,
-   * persists safe ownership metadata, then waits a bounded time for the fresh
-   * registration. Never kills anything.
+   * Deterministic managed launch using official bundled Agent.
+   * Sanitizes the environment by removing ZCODE_AGENT_SERVER_* overrides,
+   * passes workspace via the official CLI argument, and persists safe
+   * ownership metadata without waiting for proxy registration.
    */
   async launchManagedDesktop(): Promise<string> {
     // Idempotency re-check: a concurrent tick or takeover may have acted first.
     const current = this.observe();
-    if (current.state === "READY") return "registration already live; no launch";
-    if (current.state === "RECOVERING" || current.state === "ZCODE_DESKTOP_MANAGED_NOT_REGISTERED") {
+    if (current.state === "READY") {
+      return `ZCode Desktop already running (pid ${current.desktopPid}); no launch`;
+    }
+    if (current.state === "RECOVERING" || current.state === "ZCODE_DESKTOP_MANAGED_NOT_REGISTERED" || current.state === "ZCODE_WORKSPACE_NOT_OPEN") {
       return `managed Desktop already running (pid ${current.desktopPid}); no launch`;
     }
-    if (current.state === "ZCODE_DESKTOP_UNMANAGED") return "unmanaged ZCode Desktop present; no launch (manual managed restart required)";
 
     const resolvedExe = resolveZcodeDesktopExecutable({ env: this.deps.env, registrationsDir: this.deps.registrationsDir });
-    const proxy = path.join(this.deps.z2cRepoRoot, "scripts", "desktop-agent-proxy.mjs");
-    if (!isRegularFile(proxy)) return `desktop-agent-proxy missing: ${proxy}`;
-    const env: NodeJS.ProcessEnv = {
-      ...this.deps.env,
-      ZCODE_AGENT_SERVER_COMMAND: process.execPath,
-      ZCODE_AGENT_SERVER_ARGS_JSON: JSON.stringify([proxy, "--stdio"]),
-    };
+    const env = sanitizeBundledAgentEnv(this.deps.env);
     const child = this.deps.spawnDetached
-      ? this.deps.spawnDetached(resolvedExe, [], { cwd: this.deps.workspaceRoot, env })
-      : this.spawnProduction(resolvedExe, env);
+      ? this.deps.spawnDetached(resolvedExe, ["--open-workspace", this.deps.workspaceRoot], { cwd: this.deps.workspaceRoot, env })
+      : this.spawnProduction(resolvedExe, env, this.deps.workspaceRoot);
     const pid = child?.pid ?? 0;
     const startedAt = this.deps.now().toISOString();
     this.writeRecord({
@@ -471,22 +592,133 @@ export class ZcodeDesktopReconciler {
       executablePathHash: createHash("sha256").update(resolvedExe.toLowerCase()).digest("hex"),
     });
 
-    // Bounded wait for the fresh registration (fixed step count so injected
-    // fake clocks in tests cannot stretch or loop the wait).
-    const waitSteps = Math.max(0, Math.round(this.deps.registrationWaitMs / 1_000));
-    for (let i = 0; i < waitSteps; i++) {
-      await this.deps.sleep(1_000);
-      const reg = readRegistration(this.regPath());
-      if (reg && samePath(reg.workspace, this.deps.workspaceRoot) && pidAlive(reg.pid)) {
-        return `managed ZCode Desktop launched (pid ${pid}); registration live`;
-      }
-    }
-    return `managed ZCode Desktop launched (pid ${pid}); registration not yet live (reconciliation continues)`;
+    return `managed ZCode Desktop launched (pid ${pid})`;
   }
 
-  private spawnProduction(cmd: string, env: NodeJS.ProcessEnv): { pid?: number } {
-    const child = spawn(cmd, [], {
-      cwd: this.deps.workspaceRoot,
+  /**
+   * Open desired workspaces by spawning the Desktop executable with the
+   * workspace path as its argument — the officially supported single-instance
+   * workspace-open request with sanitized bundled-Agent environment.
+   */
+  async requestWorkspaceOpen(roots?: string[]): Promise<string> {
+    const resolvedExe = resolveZcodeDesktopExecutable({ env: this.deps.env, registrationsDir: this.deps.registrationsDir });
+    const rows = this.inspector()?.list() ?? null;
+    const targetRoots = roots ?? this.desiredRoots();
+    const rec = this.readRecord();
+    const recAlive = rec ? this.recordLive(rec, rows) : false;
+    const pids = this.desktopPids(resolvedExe, rows);
+    if (!recAlive && (!rows || pids.length === 0)) {
+      return "no running ZCode Desktop to receive the workspace open request; managed launch required";
+    }
+    const env = sanitizeBundledAgentEnv(this.deps.env);
+    for (const root of targetRoots) {
+      this.deps.spawnDetached
+        ? this.deps.spawnDetached(resolvedExe, ["--open-workspace", root], { cwd: root, env })
+        : this.spawnProduction(resolvedExe, env, root);
+    }
+    return `workspace open request sent for: ${targetRoots.join(", ")}`;
+  }
+
+  /** Open desired workspaces that still lack a live registration (best effort). */
+  private async ensureDesiredWorkspaceRegistrations(): Promise<void> {
+    const missing = this.desiredRoots().filter((root) => {
+      const reg = readRegistration(this.regPathForRoot(root));
+      return !(reg && samePath(reg.workspace, root) && pidAlive(reg.pid));
+    });
+    if (missing.length === 0) return;
+    try {
+      await this.requestWorkspaceOpen(missing);
+    } catch {
+      // Reconciliation retries on the next tick; a failed open request must
+      // not fail the launch itself.
+    }
+  }
+
+  private readRestartRecords(): ZcodeDesktopRestartRecord | null {
+    try {
+      const rec = JSON.parse(fs.readFileSync(this.restartRecordFile(), "utf8")) as ZcodeDesktopRestartRecord;
+      if (rec.schema !== 1 || typeof rec.pid !== "number" || typeof rec.at !== "string") return null;
+      return rec;
+    } catch {
+      return null;
+    }
+  }
+
+  /** A prior graceful close that this exact Desktop generation refused. */
+  private readRestartRefusal(pid: number, rows: ReturnType<BridgeProcessInspector["list"]>): boolean {
+    const rec = this.readRestartRecords();
+    if (!rec || rec.pid !== pid || rec.outcome !== "refused") return false;
+    const age = this.deps.now().getTime() - Date.parse(rec.at);
+    if (age > RESTART_REFUSAL_TTL_MS) return false;
+    if (rec.processStartIdentity) {
+      const row = rows?.find((r) => r.pid === pid);
+      return row ? row.processStartIdentity === rec.processStartIdentity : true;
+    }
+    return true;
+  }
+
+  /**
+   * ONE safe application-level recovery of an unmanaged Desktop: request a
+   * graceful window close (WM_CLOSE; the app keeps running and can prompt for
+   * unsaved work), wait bounded, and only when the process actually exited
+   * perform the managed relaunch. A process that does not exit is honored as
+   * a refusal (possible unsaved user work): recorded, never force-killed, and
+   * surfaced as USER_ACTION_REQUIRED_UNSAVED_STATE. One attempt per Desktop
+   * generation (pid + process-start identity).
+   */
+  async attemptManagedRestart(pid: number, rows?: ReturnType<BridgeProcessInspector["list"]> | null): Promise<string> {
+    let identity: string | null = null;
+    if (rows) identity = rows.find((r) => r.pid === pid)?.processStartIdentity ?? null;
+    if (!identity) identity = await this.captureProcessIdentity(pid);
+    const prior = this.readRestartRecords();
+    if (prior && prior.pid === pid && (prior.processStartIdentity ?? null) === (identity ?? null)) {
+      return prior.outcome === "refused"
+        ? "graceful close already refused by this Desktop; operator action required"
+        : "graceful close already attempted for this Desktop";
+    }
+
+    const exited = await this.gracefulClose(pid);
+    this.writeRestartRecord({ schema: 1, pid, processStartIdentity: identity, at: this.deps.now().toISOString(), outcome: exited ? "closed" : "refused" });
+    if (!exited) {
+      return `unmanaged ZCode Desktop (pid ${pid}) did not close gracefully (possible unsaved work); no force kill was attempted — operator action required`;
+    }
+
+    // Give the exiting instance a moment to release the single-instance lock,
+    // then relaunch managed with the bundled Agent environment.
+    const settleSteps = 5;
+    for (let i = 0; i < settleSteps; i++) {
+      await this.deps.sleep(1_000);
+      const rowsNow = this.inspector()?.list() ?? null;
+      const resolvedExe = this.resolveExeOrNull();
+      if (!resolvedExe || !rowsNow || this.desktopPids(resolvedExe, rowsNow).length === 0) break;
+    }
+    return this.launchManagedDesktop();
+  }
+
+  private resolveExeOrNull(): string | null {
+    try {
+      return resolveZcodeDesktopExecutable({ env: this.deps.env, registrationsDir: this.deps.registrationsDir });
+    } catch {
+      return null;
+    }
+  }
+
+  private gracefulClose(pid: number): Promise<boolean> {
+    if (this.deps.gracefulClose) return this.deps.gracefulClose(pid);
+    return gracefulCloseProduction(pid, this.deps.sleep, this.deps.restartWaitMs);
+  }
+
+  private writeRestartRecord(record: ZcodeDesktopRestartRecord): void {
+    const file = this.restartRecordFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmp, file);
+  }
+
+  private spawnProduction(cmd: string, env: NodeJS.ProcessEnv, workspaceRoot: string): { pid?: number } {
+    const child = spawn(cmd, ["--open-workspace", workspaceRoot], {
+      cwd: workspaceRoot,
       env,
       detached: true,
       windowsHide: true,

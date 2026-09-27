@@ -78,6 +78,8 @@ export function mapAntigravityErrorCode(reason: AntigravityFailureReason, exitCo
 
 export interface AntigravityProviderStatus {
   status: "AVAILABLE" | "DEGRADED" | "UNAVAILABLE";
+  /** On-demand lifecycle state (G3): zero active sessions is normal, not degraded. */
+  readiness: AntigravityReadinessState;
   cliInstalled: boolean;
   cliVersion: string | null;
   providerReachable: boolean;
@@ -93,6 +95,101 @@ export interface AntigravityProviderStatus {
     timestamp: string;
     exitCode: number | null;
   } | null;
+  /** Reason the provider is not callable right now, when applicable. */
+  notCallableReason?: string;
+}
+
+export type AntigravityReadinessState =
+  | "READY_ON_DEMAND"
+  | "ACTIVE"
+  | "AUTH_REQUIRED"
+  | "EXECUTABLE_MISSING"
+  | "PROVIDER_UNAVAILABLE"
+  | "QUOTA_BLOCKED"
+  | "FAILED";
+
+/**
+ * Durable, credential-free last-attempt evidence. Survives C2C restarts so
+ * status stays truthful (G5) without ever spending quota on startup canaries
+ * (G4): the only evidence is real task traffic.
+ */
+export interface AntigravityAttemptEvidence {
+  schema: 1;
+  lastAttempt: {
+    at: string;
+    taskId: string;
+    status: "completed" | "failed" | "cancelled" | "timed_out";
+    reason: string | null;
+    exitCode: number | null;
+  };
+  lastSuccessAt: string | null;
+  lastAuthErrorAt: string | null;
+  lastModelErrorAt: string | null;
+}
+
+function antigravityProviderDir(stateDir?: string): string {
+  const root = stateDir ?? getStateDir();
+  return path.join(root, "providers", "antigravity");
+}
+
+function antigravityEvidenceFile(stateDir?: string): string {
+  return path.join(antigravityProviderDir(stateDir), "last-attempt.json");
+}
+
+/** Read the durable evidence record; malformed or absent files read as null. */
+export function readAntigravityAttemptEvidence(stateDir?: string): AntigravityAttemptEvidence | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(antigravityEvidenceFile(stateDir), "utf8")) as AntigravityAttemptEvidence;
+    if (parsed.schema !== 1 || !parsed.lastAttempt || typeof parsed.lastAttempt.at !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeAntigravityAttemptEvidence(evidence: AntigravityAttemptEvidence, stateDir?: string): void {
+  try {
+    const file = antigravityEvidenceFile(stateDir);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(evidence, null, 2), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch {
+    // Evidence is an honest-status aid, never execution truth; a failed write
+    // must not fail the task.
+  }
+}
+
+/**
+ * Map durable evidence onto an explicit non-callable state, or null when the
+ * provider is on-demand callable. Only a real FAILED task attempt blocks
+ * (cancelled and timed-out attempts are task-scoped, not lane-scoped), and
+ * only when it is the LATEST attempt: auth → AUTH_REQUIRED, model/quota →
+ * QUOTA_BLOCKED, anything else → FAILED. An unclassified failure landing
+ * within 10 minutes AFTER a proven success is treated as transient (several
+ * lanes share this provider store; a background lane's flake must not mask a
+ * just-proven callable provider). AUTH_REQUIRED and QUOTA_BLOCKED always
+ * block regardless of prior success — those states do not heal with time.
+ */
+export function antigravityEvidenceReadiness(
+  evidence: AntigravityAttemptEvidence
+): { state: Extract<AntigravityReadinessState, "AUTH_REQUIRED" | "QUOTA_BLOCKED" | "FAILED">; detail: string } | null {
+  const attempt = evidence.lastAttempt;
+  if (attempt.status !== "failed") return null;
+  const at = Date.parse(attempt.at);
+  const successAt = evidence.lastSuccessAt ? Date.parse(evidence.lastSuccessAt) : NaN;
+  if (Number.isFinite(successAt) && successAt >= at) return null;
+  if (attempt.reason === "AUTH_ERROR") {
+    return { state: "AUTH_REQUIRED", detail: `last real Antigravity task (${attempt.taskId}) failed authentication` };
+  }
+  if (attempt.reason === "MODEL_UNAVAILABLE") {
+    return { state: "QUOTA_BLOCKED", detail: `last real Antigravity task (${attempt.taskId}) could not resolve the model (quota/model unavailable)` };
+  }
+  const transientWindowMs = 10 * 60_000;
+  if (Number.isFinite(successAt) && at - successAt <= transientWindowMs) {
+    return null; // transient lane flake right after a proven-good run
+  }
+  return { state: "FAILED", detail: `last real Antigravity task (${attempt.taskId}) failed (reason=${attempt.reason ?? "unknown"})` };
 }
 
 export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash-high";
@@ -445,10 +542,8 @@ export class AntigravityBackend implements ExecutionBackend {
   async getProviderStatus(): Promise<AntigravityProviderStatus> {
     let cliInstalled = false;
     let cliVersion: string | null = null;
-    let cliPath: string | null = null;
-    let providerReachable = false;
     try {
-      cliPath = this.getExecutablePath();
+      const cliPath = this.getExecutablePath();
       cliInstalled = true;
       const ver = execSync(`"${cliPath}" --version`, {
         timeout: 5000,
@@ -458,15 +553,45 @@ export class AntigravityBackend implements ExecutionBackend {
         cliVersion = /^v?\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(ver) ? ver : null;
       }
     } catch {
-      providerReachable = false;
+      // getExecutablePath only throws when the executable cannot be resolved;
+      // a failed --version probe after resolution leaves cliInstalled true
+      // (the version string is cosmetic and never gates reachability).
     }
 
-    // Installation is a local fact; only a successful session verifies reachability.
-    providerReachable = cliInstalled && this.lastCanaryRecord?.status === "completed";
-    const status = !cliInstalled ? "UNAVAILABLE" : providerReachable ? "AVAILABLE" : "DEGRADED";
+    // On-demand truth (G3): installation + preparable isolated state is a
+    // callable local execution path — no permanently running process exists
+    // or is required, so zero active sessions is NORMAL, not degraded. Only
+    // real task evidence (durable, survives restarts) can mark the provider
+    // AUTH_REQUIRED / QUOTA_BLOCKED / FAILED. Evidence is never fabricated
+    // and no startup canary ever runs (G4).
+    const evidence = readAntigravityAttemptEvidence(this.baseStateDir);
+    let readiness: AntigravityReadinessState;
+    let notCallableReason: string | undefined;
+    if (!cliInstalled) {
+      readiness = "EXECUTABLE_MISSING";
+      notCallableReason = "agy.exe not found in standard locations";
+    } else {
+      const blocked = evidence ? antigravityEvidenceReadiness(evidence) : null;
+      if (blocked) {
+        readiness = blocked.state;
+        notCallableReason = blocked.detail;
+      } else if (this.activeProcesses.size > 0) {
+        readiness = "ACTIVE";
+      } else {
+        readiness = "READY_ON_DEMAND";
+      }
+    }
+    const status: AntigravityProviderStatus["status"] =
+      readiness === "EXECUTABLE_MISSING"
+        ? "UNAVAILABLE"
+        : readiness === "READY_ON_DEMAND" || readiness === "ACTIVE"
+          ? "AVAILABLE"
+          : "DEGRADED";
+    const providerReachable = status === "AVAILABLE";
 
     return {
       status,
+      readiness,
       cliInstalled,
       cliVersion,
       providerReachable,
@@ -476,8 +601,46 @@ export class AntigravityBackend implements ExecutionBackend {
       networkPolicyCapability: "tool_prevention_and_interception",
       supportedModels: Object.keys(ANTIGRAVITY_MODEL_DEFINITIONS),
       activeSessionsCount: this.activeProcesses.size,
-      lastCanaryStatus: this.lastCanaryRecord,
+      ...(notCallableReason ? { notCallableReason } : {}),
+      lastCanaryStatus: evidence
+        ? {
+            taskId: evidence.lastAttempt.taskId,
+            status: evidence.lastAttempt.status,
+            timestamp: evidence.lastAttempt.at,
+            exitCode: evidence.lastAttempt.exitCode,
+          }
+        : this.lastCanaryRecord,
     };
+  }
+
+  private executableResolvable(): boolean {
+    try {
+      this.getExecutablePath();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Merge one finished attempt into the durable evidence record (G5). */
+  private recordAttemptEvidence(attempt: {
+    taskId: string;
+    status: "completed" | "failed" | "cancelled" | "timed_out";
+    reason: string | null;
+    exitCode: number | null;
+  }): void {
+    try {
+      const prior = readAntigravityAttemptEvidence(this.baseStateDir);
+      const at = new Date().toISOString();
+      const next: AntigravityAttemptEvidence = {
+        schema: 1,
+        lastAttempt: { at, taskId: attempt.taskId, status: attempt.status, reason: attempt.reason, exitCode: attempt.exitCode },
+        lastSuccessAt: attempt.status === "completed" ? at : prior?.lastSuccessAt ?? null,
+        lastAuthErrorAt: attempt.reason === "AUTH_ERROR" ? at : prior?.lastAuthErrorAt ?? null,
+        lastModelErrorAt: attempt.reason === "MODEL_UNAVAILABLE" ? at : prior?.lastModelErrorAt ?? null,
+      };
+      writeAntigravityAttemptEvidence(next, this.baseStateDir);
+    } catch { /* never fail a finished task on evidence bookkeeping */ }
   }
 
   private readTranscriptModel(isolatedHome: string, conversationId: string): string | null {
@@ -731,7 +894,87 @@ export class AntigravityBackend implements ExecutionBackend {
     // scope back to the workspace root.
     const allowedRoots = preflight.writableRoots;
 
-    const timeoutSec = Math.max(10, Math.ceil(request.timeoutMs / 1000));
+    const executeStartedAt = Date.now();
+    // Capture baseline files via git ONCE before the first attempt so a
+    // stale-session retry (which re-runs the agent) is still diffed against
+    // the true pre-task state.
+    const baselineFiles = this.captureWorkspaceFiles(request.workspaceRoot);
+
+    const runAttempt = (resumeConversationId: string | undefined, budgetMs: number) =>
+      this.runAgyProcess({
+        exePath, env, model, request, preflight, allowedRoots, providerOwnedRoots,
+        baselineFiles, resumeConversationId, budgetMs,
+      });
+
+    let result = await runAttempt(request.providerSessionId, request.timeoutMs);
+
+    // G2 — stale-session recovery: a supplied conversation id AGY can no
+    // longer resume must never fail the task. Discard ONLY the stale C2C
+    // provider-session metadata and start a fresh session when the first
+    // attempt died before establishing any session of its own.
+    let sessionRecovered = false;
+    if (
+      request.providerSessionId &&
+      result.status === "failed" &&
+      result.error?.code === "ANTIGRAVITY_SESSION_START_FAILED" &&
+      !result.providerSessionId &&
+      result.actualProvider === null
+    ) {
+      const remaining = request.timeoutMs - (Date.now() - executeStartedAt);
+      if (remaining >= 5_000) {
+        const retried = await runAttempt(undefined, remaining);
+        sessionRecovered = retried.status === "completed" || retried.providerSessionId != null;
+        result = {
+          ...retried,
+          ...(retried.phaseDurations
+            ? { phaseDurations: { ...retried.phaseDurations, totalDurationMs: Math.max(0, Date.now() - executeStartedAt) } }
+            : {}),
+        };
+      }
+    }
+
+    // Durable, credential-free evidence (G5): the next status projection and
+    // post-restart state stay truthful without ever spending quota (G4).
+    // Background janitor lanes opt out (evidence: false) — they keep their own
+    // health records and must not mask task-lane provider capability.
+    const evidenceReason =
+      result.error?.code === "ANTIGRAVITY_AUTH_ERROR" ? "AUTH_ERROR"
+      : result.error?.code === "ANTIGRAVITY_MODEL_UNAVAILABLE" ? "MODEL_UNAVAILABLE"
+      : result.status === "completed" ? null
+      : "CLI_EXIT_UNCLASSIFIED";
+    if (request.evidence !== false) {
+      this.recordAttemptEvidence({
+        taskId: request.taskId,
+        status: result.status === "completed" ? "completed"
+          : result.status === "timed_out" ? "timed_out"
+          : result.status === "cancelled" ? "cancelled"
+          : "failed",
+        reason: evidenceReason,
+        exitCode: result.exitCode ?? null,
+      });
+    }
+
+    return sessionRecovered ? { ...result, sessionRecovered: true } : result;
+  }
+
+  /**
+   * One AGY process attempt (spawn → stream-json observation → bounded
+   * result). All security layers (recursion check, network denial, scope
+   * verdicts, post-run audit) run here exactly as before.
+   */
+  private runAgyProcess(params: {
+    exePath: string;
+    env: NodeJS.ProcessEnv;
+    model: string;
+    request: BackendExecutionRequest;
+    preflight: WriteScopePreflight;
+    allowedRoots: string[];
+    providerOwnedRoots: string[];
+    baselineFiles: Map<string, string>;
+    resumeConversationId?: string;
+    budgetMs: number;
+  }): Promise<BackendExecutionResult> {
+    const { exePath, env, model, request, preflight, allowedRoots, providerOwnedRoots, baselineFiles } = params;
     const args: string[] = [
       "--add-dir",
       request.workspaceRoot,
@@ -743,20 +986,15 @@ export class AntigravityBackend implements ExecutionBackend {
       // AppContainer here can stop headless run_command at an admin setup prompt.
       ...(request.fullAccess ? ["--dangerously-skip-permissions"] : ["--sandbox"]),
       "--disable-slash-commands",
+      "--input-format",
+      "stream-json",
       "--output-format",
       "stream-json",
-      "--print-timeout",
-      `${timeoutSec}s`,
     ];
 
-    if (request.providerSessionId) {
-      args.push("--conversation", request.providerSessionId);
+    if (params.resumeConversationId) {
+      args.push("--conversation", params.resumeConversationId);
     }
-
-    args.push("--print", request.instruction);
-
-    // Capture baseline files via git before execution
-    const baselineFiles = this.captureWorkspaceFiles(request.workspaceRoot);
 
     const spawnStartedAt = Date.now();
     request.onLifecyclePhase?.("SPAWNING_PROVIDER");
@@ -807,6 +1045,8 @@ export class AntigravityBackend implements ExecutionBackend {
       let finalResponse = "";
       let finalStatus: "completed" | "failed" | "cancelled" | "timed_out" = "completed";
       let failureError: { code: string; message: string } | undefined;
+      let finalResultReceived = false;
+      let processClosed = false;
       let tokenUsage: BackendExecutionResult["tokenUsage"];
       const outputChunks: string[] = [];
       let diagnosticTail = "";
@@ -818,16 +1058,16 @@ export class AntigravityBackend implements ExecutionBackend {
         if (reason !== "CLI_EXIT_UNCLASSIFIED") failureReason = reason;
       };
 
-      // 1. Overall task timeout
+      // 1. Overall task timeout (this attempt's budget)
       let timer: NodeJS.Timeout | null = setTimeout(() => {
         timer = null;
         finalStatus = "timed_out";
         failureError = { code: "ANTIGRAVITY_TIMEOUT", message: "Task exceeded maximum allowed timeout" };
         this.terminateProcess(pid);
-      }, request.timeoutMs);
+      }, params.budgetMs);
 
       // 2. Bounded pre-session startup timeout
-      const startupTimeoutMs = Math.min(this.sessionStartupTimeoutMs, request.timeoutMs);
+      const startupTimeoutMs = Math.min(this.sessionStartupTimeoutMs, params.budgetMs);
       let startupTimer: NodeJS.Timeout | null = setTimeout(() => {
         startupTimer = null;
         if (!sessionEstablished && finalStatus === "completed") {
@@ -855,6 +1095,7 @@ export class AntigravityBackend implements ExecutionBackend {
       };
 
       if (child.stdout) {
+        child.stdout.on("error", () => {});
         const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
         rl.on("line", (line) => {
           const trimmed = line.trim();
@@ -992,6 +1233,14 @@ export class AntigravityBackend implements ExecutionBackend {
                   code: errCode === "ANTIGRAVITY_PROCESS_EXIT" ? "ANTIGRAVITY_EXECUTION_ERROR" : errCode,
                   message: `Antigravity task reported execution error (reason=${failureReason})`,
                 };
+              } else if (res.status === "SUCCESS" || (!res.status && res.response)) {
+                finalResultReceived = true;
+              } else if (res.status && res.status !== "SUCCESS") {
+                finalStatus = "failed";
+                failureError = {
+                  code: "ANTIGRAVITY_EXECUTION_ERROR",
+                  message: "Antigravity task reported unknown terminal status",
+                };
               }
             }
           } catch {
@@ -1002,18 +1251,21 @@ export class AntigravityBackend implements ExecutionBackend {
       }
 
       if (child.stderr) {
+        child.stderr.on("error", () => {});
         child.stderr.on("data", (d) => {
           observeDiagnostic(d.toString());
         });
       }
 
       child.on("error", () => {
+        if (processClosed) return;
         finalStatus = "failed";
         failureError = { code: "SPAWN_FAILED", message: "Antigravity CLI could not start (reason=SPAWN_FAILED)" };
       });
 
       // close follows stdio drain; exit may precede the final result/diagnostic.
       child.on("close", (code) => {
+        processClosed = true;
         if (timer) {
           clearTimeout(timer);
           timer = null;
@@ -1080,7 +1332,7 @@ export class AntigravityBackend implements ExecutionBackend {
           }
         }
 
-        if (finalStatus === "completed" && !sessionEstablished) {
+        if (finalStatus === "completed" && (!sessionEstablished || !finalResultReceived)) {
           finalStatus = "failed";
           failureError = { code: "ANTIGRAVITY_SESSION_START_FAILED", message: "Antigravity exited without session evidence" };
         }
@@ -1129,6 +1381,48 @@ export class AntigravityBackend implements ExecutionBackend {
           error: failureError,
         });
       });
+
+      const handleStdinFailure = () => {
+        if (processClosed) return;
+        if (!finalResultReceived) {
+          if (finalStatus === "completed") {
+            finalStatus = "failed";
+            failureReason = "SESSION_START_FAILED";
+            failureError = {
+              code: "ANTIGRAVITY_SESSION_START_FAILED",
+              message: "Antigravity stdin stream failed",
+            };
+          }
+          this.terminateProcess(pid);
+        }
+      };
+
+      const stdin = child.stdin;
+      if (!stdin) {
+        finalStatus = "failed";
+        failureReason = "SESSION_START_FAILED";
+        failureError = {
+          code: "ANTIGRAVITY_SESSION_START_FAILED",
+          message: "Antigravity CLI process stdin is not available",
+        };
+        this.terminateProcess(pid);
+      } else {
+        stdin.on("error", () => {
+          handleStdinFailure();
+        });
+
+        try {
+          stdin.end(
+            JSON.stringify({
+              event: "user",
+              message: { content: request.instruction },
+            }) + "\n",
+            "utf8",
+          );
+        } catch {
+          handleStdinFailure();
+        }
+      }
     });
   }
 

@@ -10,6 +10,12 @@ export interface WorkspaceSlotLock {
   provider: "codex" | "gemini" | "z2c";
   taskId: string;
   sessionId?: string;
+  /**
+   * Upstream native task id for z2c leases whose reservation was acquired
+   * before the upstream task existed (A-fix). Present once the upstream
+   * accepted the task; terminal observation releases by either id.
+   */
+  nativeTaskId?: string;
   pid: number;
   acquiredAt: string;
 }
@@ -88,6 +94,7 @@ function validateLock(value: unknown): WorkspaceSlotLock | null {
     taskId: candidate.taskId,
     provider: (candidate.provider ?? "codex") as WorkspaceSlotLock["provider"],
     ...(typeof candidate.sessionId === "string" ? { sessionId: candidate.sessionId } : {}),
+    ...(typeof candidate.nativeTaskId === "string" ? { nativeTaskId: candidate.nativeTaskId } : {}),
     pid: candidate.pid,
     acquiredAt: candidate.acquiredAt,
   };
@@ -218,6 +225,10 @@ export function reconcileWorkspaceSlot(
   if (!current.lock || current.lock.workspaceId !== workspaceId) {
     throw new WorkspaceSlotError(null);
   }
+  // Z2C leases are reconciled via observeNativeTask (upstream terminal
+  // observation matches by reservation/native identity), NOT via this
+  // codex-task-registry lookup. The "unresolved" isolation here is correct:
+  // the upstream Z2C state must be confirmed before the slot is released.
   if (current.lock.provider === "z2c") return { lock: current.lock, cleared: false, reason: "unresolved" };
 
   const task = taskLookup(current.lock.taskId);
@@ -269,16 +280,27 @@ export function reconcileUnknownWorkspaceSlots(
 
 /** Bind the reserved slot to the upstream task and session returned by Z2C. */
 export function bindWorkspaceSlot(
-  workspaceId: string, reservationId: string, taskId: string, sessionId: string, stateDir?: string,
+  workspaceId: string, reservationId: string, taskId: string, sessionId: string | null, stateDir?: string,
 ): WorkspaceSlotLock {
   const slot = readWorkspaceSlot(workspaceId, stateDir);
+  // A-fix: accept a re-bind when the slot carries the reservation identity
+  // (with or without a previously recorded nativeTaskId from an earlier
+  // partial bind), as long as no session was bound yet.
   if (!slot || slot.provider !== "z2c" || slot.taskId !== reservationId || slot.sessionId) {
     throw new Error("Workspace slot reservation mismatch");
   }
-  if (!NATIVE_TASK_ID_PATTERN.test(taskId) || !SESSION_ID_PATTERN.test(sessionId)) {
-    throw new Error("Invalid native task/session namespace");
+  if (!NATIVE_TASK_ID_PATTERN.test(taskId)) {
+    throw new Error("Invalid native task namespace");
   }
-  const bound = { ...slot, taskId, sessionId };
+  if (sessionId !== null && !SESSION_ID_PATTERN.test(sessionId)) {
+    throw new Error("Invalid native session namespace");
+  }
+  const bound = {
+    ...slot,
+    taskId,
+    nativeTaskId: taskId,
+    ...(sessionId ? { sessionId } : {}),
+  };
   const file = workspaceSlotFile(workspaceId, stateDir);
   const temporary = file + ".tmp";
   fs.writeFileSync(temporary, JSON.stringify(bound, null, 2), { mode: 0o600 });

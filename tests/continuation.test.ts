@@ -14,7 +14,7 @@ import { ZcodeNativeError, nativeRequestFingerprint, type ZcodeNativeTaskView } 
 class NativeFixture implements AppServerClient {
   handler?: (n: AppServerNotification) => void | Promise<void>;
   requests: Array<{ method: string; params: any }> = [];
-  threadId = randomUUID(); turns = 0; hold = false; fail = false; model = "gpt-6-astra";
+  threadId = randomUUID(); turns = 0; hold = false; fail = false; model = "gpt-6-sol";
   async initialize() {}
   async request<T>(method: string, params?: any): Promise<T> {
     this.requests.push({ method, params });
@@ -22,7 +22,7 @@ class NativeFixture implements AppServerClient {
     if (method === "turn/start") {
       this.turns++;
       const date = new Date().toISOString().slice(0, 10).replaceAll("-", "/");
-      write(process.env.CODEX_HOME!, `sessions/${date}/rollout-${this.threadId}.jsonl`, JSON.stringify({ type: "session_meta", payload: { id: this.threadId } }) + "\n" + JSON.stringify({ type: "turn_context", timestamp: new Date().toISOString(), payload: { turn_id: "turn-fixture", thread_id: this.threadId, model: this.model, effort: params.effort ?? "high" } }));
+      write(process.env.CODEX_HOME!, `sessions/${date}/rollout-${this.threadId}.jsonl`, JSON.stringify({ type: "session_meta", payload: { id: this.threadId } }) + "\n" + JSON.stringify({ type: "turn_context", timestamp: new Date().toISOString(), payload: { turn_id: "turn-fixture", thread_id: this.threadId, model: this.model, effort: params.effort ?? "max" } }));
       if (!this.hold) setTimeout(() => this.complete(), 0);
       return { turn: { id: "turn-fixture" } } as T;
     }
@@ -56,7 +56,7 @@ describe("approved continuation workflow", () => {
     fake = new NativeFixture(); authorized = true; now = Date.now(); collections = 0; mirrorFail = false;
     reviewFailure = undefined; reviewLoseReply = false;
     reviewHold = false; reviewUnavailable = false; reviewCalls = []; reviewTasks = new Map(); reviewInputs = new Map(); reviewOutput = undefined; reviewAfterOutput = undefined;
-    const node = (id: string, dependencies: string[] = []) => ({ id, provider: "codex" as const, model: "gpt-6-astra" as const, effort: "high" as const, instruction: `Bounded ${id}`, writeScope: ["apps/web", "docs"], network: false, networkBoundary: "offline" as const, dependencies, idempotencyKey: id, timeoutMs: 10000, correctiveInputs: [], kind: "ui" as const });
+    const node = (id: string, dependencies: string[] = []) => ({ id, provider: "codex" as const, model: "gpt-6-sol" as const, effort: "max" as const, instruction: `Bounded ${id}`, writeScope: ["apps/web", "docs"], network: false, networkBoundary: "offline" as const, dependencies, idempotencyKey: id, timeoutMs: 10000, correctiveInputs: [], kind: "ui" as const });
     manifest = { version: 1, planId: "approved", workspaceId: new Workspace(root).id, ownerId: "owner", approvedAt: new Date(now).toISOString(), authorizationReference: "test-user-request", enabled: true, leaseMs: 86400000, maxNewTasks: 12, nodes: [node("U02"), node("U03", ["U02"])] };
   });
   function boot(install = true, paused = false) {
@@ -73,7 +73,7 @@ describe("approved continuation workflow", () => {
             return { ...prior, idempotency: { ...prior.idempotency!, replayed: true } };
           }
           const task = { task_id: `z2c_review_${reviewCalls.length}`, workspace_id: input.workspace_id, session_id: `sess_${randomUUID()}`,
-            status: "running", output_id: `out_${reviewCalls.length}`, model_binding: { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3-Flash", source: "session/read" },
+            status: "running", output_id: `out_${reviewCalls.length}`, model_binding: { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3-Flash", source: "session/read" },
             idempotency: { protocol: "workspace-task-v1" as const, key: input.idempotency_key!, request_fingerprint: nativeRequestFingerprint(input), replayed: false } };
           reviewTasks.set(task.task_id, task); reviewInputs.set(task.task_id, JSON.parse(input.instruction.split("\nEvidence:\n")[1]));
           if (reviewLoseReply) { reviewLoseReply = false; throw new ZcodeNativeError("ZCODE_NATIVE_TIMEOUT", "accepted reply lost"); }
@@ -174,7 +174,7 @@ describe("approved continuation workflow", () => {
     expect(status().nodes.U03.taskIds).toEqual([]);
     expect(manager.getQueueState().activeTask).toBeNull();
     expect(reviewCalls[0]).toMatchObject({ write_scope: "readonly", mode: "plan" });
-    expect(status().machineReview.U02.reviewer.model_binding).toMatchObject({ provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3-Flash" });
+    expect(status().machineReview.U02.reviewer.model_binding).toMatchObject({ provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3-Flash" });
     reviewHold = false; controller.wake("review-completed"); await until(() => status().state === "BACKLOG_COMPLETE");
     expect(status().machineReview.U02.lastValidReceipt.decision).toBe("PASS");
     expect(status().lastAuthenticatedChatGptReviewAt).toBeNull();
@@ -455,11 +455,11 @@ describe("approved continuation workflow", () => {
     expect(status().nodes.U02.state).toBe("STABLE"); expect(status().nodes.U03.state).toBe("STABLE");
     expect(status().nodes.U03.evidence.status).toBe("completed"); expect(fake.turns).toBe(2);
   });
-  it("architecture gate: exact current-turn model mismatch blocks acceptance and successors", async () => {
+  it.each([["model", "gpt-6-sol", "other-model"], ["effort", "max", "high"]])("architecture gate: exact current-turn %s mismatch blocks acceptance and successors", async (field, expected, wrong) => {
     fake.hold = true; boot(); await until(() => fake.turns === 1);
     const date = new Date().toISOString().slice(0, 10).replaceAll("-", "/");
     const file = path.join(native, `sessions/${date}/rollout-${fake.threadId}.jsonl`);
-    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace('"model":"gpt-6-astra"', '"model":"other-model"'));
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace(JSON.stringify(field) + ":" + JSON.stringify(expected), JSON.stringify(field) + ":" + JSON.stringify(wrong)));
     fake.complete(); await until(() => status().nodes.U02.state === "WAITING_REVIEW");
     expect(status().nodes.U03.taskIds).toEqual([]); expect(fake.turns).toBe(1);
   });
@@ -472,7 +472,7 @@ describe("approved continuation workflow", () => {
   it("dispatches terminal → next automatically with exact native model and stable source proof", async () => {
     boot(); await until(() => status().state === "BACKLOG_COMPLETE");
     expect(fake.turns).toBe(2); expect(status().events.filter((e: any) => e.type === "handoff")).toHaveLength(2);
-    expect(fake.requests.filter(r => r.method === "turn/start").every(r => r.params.model === "gpt-6-astra" && r.params.effort === "high")).toBe(true);
+    expect(fake.requests.filter(r => r.method === "turn/start").every(r => r.params.model === "gpt-6-sol" && r.params.effort === "max")).toBe(true);
     expect(status().nodes.U02.evidence.actualModel.source).toBe("native_turn_context");
   });
   it("does not duplicate on finish callbacks or restart", async () => {
@@ -511,8 +511,15 @@ describe("approved continuation workflow", () => {
     authorized = false; boot(); await controller.settled(); expect(status().state).toBe("BROKEN_CONTINUATION"); expect(fake.turns).toBe(0);
     authorized = true; fake.model = "other-model"; controller.wake("restart"); await until(() => status().nodes.U02.state === "FAILED"); expect(fake.turns).toBe(0);
   });
-  it("rejects wrong model, scope, duplicate corrective input and untrusted fields", () => {
-    for (const patch of [{ model: "fallback" }, { writeScope: ["../src"] }, { correctiveInputs: [manifest.nodes[0].instruction] }, { surprise: true }]) {
+  it("rejects out-of-bounds model, effort, scope, duplicate corrective input and untrusted fields", () => {
+    // Model/effort are bounded protocol identifiers now; anything outside the
+    // identifier grammar (or structurally untrusted fields) is still rejected
+    // at install time. Catalog listing is enforced later, at dispatch.
+    for (const patch of [
+      { model: "gpt 6 astra; rm -rf /" }, { model: "" }, { model: "m".repeat(65) },
+      { effort: "max; rm -rf /" }, { effort: "" },
+      { writeScope: ["../src"] }, { correctiveInputs: [manifest.nodes[0].instruction] }, { surprise: true },
+    ]) {
       expect(() => installApprovedManifest(state, { ...manifest, nodes: [{ ...manifest.nodes[0], ...patch }] })).toThrow();
     }
   });

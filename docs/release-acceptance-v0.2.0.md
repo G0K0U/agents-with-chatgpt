@@ -4,6 +4,10 @@ This summary describes what was verified for the v0.2.0 release candidate and
 what remains explicitly unverified. Internal evidence (logs, machine paths,
 acceptance JSON) is kept out of the public repository by design.
 
+**Historical record:** this page does not describe the current 0.3.0 source or
+running deployment. Use the current [support matrix](support-matrix.md) and
+the 0.3.0 release acceptance record for current claims.
+
 ## Verified for this release
 
 - **Source & regression**: `tsc --noEmit` clean; full test suite 52 files,

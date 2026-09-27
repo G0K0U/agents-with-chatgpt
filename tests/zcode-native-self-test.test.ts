@@ -17,7 +17,7 @@ describe("daemon-owned native protocol self-test", () => {
   beforeEach(() => {
     tasks = new Map(); requests = [];
     deps = {
-      providerStatus: vi.fn(async () => ({ workspace_id: workspace, durable_idempotency: "workspace-task-v1" })),
+      providerStatus: vi.fn(async () => ({ workspace_id: workspace, durable_idempotency: "workspace-task-v1", provider: "zcode-desktop" })),
       snapshot: vi.fn(() => ({ queue: "a".repeat(64), writer: "b".repeat(64) })),
       submitNative: vi.fn(async input => {
         requests.push({ ...input });
@@ -28,7 +28,7 @@ describe("daemon-owned native protocol self-test", () => {
           return { ...previous, idempotency: { ...previous.idempotency!, replayed: true } };
         }
         const task: ZcodeNativeTaskView = { workspace_id: input.workspace_id, task_id: `z2c_${randomUUID()}`, session_id: `sess_${randomUUID()}`,
-          status: "queued", model_binding: { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3-Flash" },
+          status: "queued", model_binding: { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3-Flash" },
           idempotency: { protocol: "workspace-task-v1", key: input.idempotency_key!, request_fingerprint: fingerprint, replayed: false } };
         tasks.set(input.idempotency_key!, task); return task;
       }),
@@ -126,7 +126,7 @@ describe("daemon-owned native protocol self-test", () => {
     try {
       acquireWorkspaceSlot(ws.id, `c2c_${"a".repeat(16)}`, state, "gemini");
       const held = readWorkspaceSlot(ws.id, state), before = manager.nativeAdmissionSnapshot();
-      const result = await nativeSelfTest(ws.id, { providerStatus: async () => ({ workspace_id: ws.id, durable_idempotency: "workspace-task-v1" }),
+      const result = await nativeSelfTest(ws.id, { providerStatus: async () => ({ workspace_id: ws.id, durable_idempotency: "workspace-task-v1", provider: "zcode-desktop" }),
         submitNative: input => manager.submitNative(input), snapshot: () => manager.nativeAdmissionSnapshot(),
         cancel: input => manager.cancelNative(input, true) });
       expect(result.overall).toBe("PASS"); expect(tasks.size).toBe(1);

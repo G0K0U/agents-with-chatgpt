@@ -83,6 +83,8 @@ export interface QuantaCodexAccountTelemetry {
 
 export interface QuantaCodexTelemetry {
   status: "available" | "unavailable";
+  observed_at?: string | null;
+  freshness?: "fresh" | "unknown";
   current_account: QuantaCodexAccountTelemetry | null;
   stale_accounts: QuantaCodexAccountTelemetry[];
   live_error?: string | null;
@@ -100,6 +102,8 @@ export interface QuantaAntigravityPoolTelemetry {
 
 export interface QuantaAntigravityTelemetry {
   status: "available" | "unavailable";
+  observed_at?: string | null;
+  freshness?: "fresh" | "unknown";
   plan?: string;
   pools: {
     gemini: QuantaAntigravityPoolTelemetry;
@@ -110,6 +114,8 @@ export interface QuantaAntigravityTelemetry {
 
 export interface QuantaGlmTelemetry {
   status: "available" | "unavailable";
+  observed_at?: string | null;
+  freshness?: "fresh" | "unknown";
   level?: string;
   five_hour_window: QuantaWindowTelemetry;
   weekly_window: QuantaWindowTelemetry;
@@ -124,7 +130,9 @@ export interface QuantaGenericProviderTelemetry {
 
 export interface QuantaTelemetryReport {
   observed_at?: string | null;
+  observed_at_scope?: "all_providers" | "partial_summary" | "unknown";
   fetched_at?: string;
+  /** Fresh means at least one provider has a current sample; inspect each provider separately. */
   freshness?: "fresh" | "unknown";
   timestamp: string;
   quanta_available: boolean;
@@ -159,9 +167,37 @@ function timestampToIso(timestamp: unknown): string | null {
   return null;
 }
 
+// Quanta's observed_at and snapshot_at contract is ISO 8601 with an explicit
+// timezone. Numeric reset timestamps and generated_at are not sample times.
+function observationIso(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  if (!match) return null;
+  const [, year, month, day, hour, minute, second, zone] = match;
+  const calendar = new Date(0);
+  calendar.setUTCFullYear(Number(year), Number(month) - 1, Number(day));
+  calendar.setUTCHours(Number(hour), Number(minute), Number(second), 0);
+  if (calendar.getUTCFullYear() !== Number(year) || calendar.getUTCMonth() + 1 !== Number(month) ||
+      calendar.getUTCDate() !== Number(day) || calendar.getUTCHours() !== Number(hour) ||
+      calendar.getUTCMinutes() !== Number(minute) || calendar.getUTCSeconds() !== Number(second)) return null;
+  if (zone !== "Z") {
+    const zoneHour = Number(zone.slice(1, 3));
+    const zoneMinute = Number(zone.slice(4, 6));
+    if (zoneHour > 14 || zoneMinute > 59 || (zoneHour === 14 && zoneMinute !== 0)) return null;
+  }
+  const millis = Date.parse(value);
+  return Number.isFinite(millis) ? new Date(millis).toISOString() : null;
+}
+
+function freshObservation(value: string | null, now: number): boolean {
+  if (!value) return false;
+  const age = now - Date.parse(value);
+  return Number.isFinite(age) && age >= 0 && age <= 60_000;
+}
+
 export class QuantaClient {
   private configPath: string;
-  private cache: { report: QuantaTelemetryReport; expiresAt: number } | null = null;
+  private cache: { raw: Record<string, unknown>; serverUrl: string; fetchedAt: string; expiresAt: number } | null = null;
   private cacheTtlMs: number;
 
   constructor(opts: { configPath?: string; cacheTtlMs?: number } = {}) {
@@ -188,7 +224,7 @@ export class QuantaClient {
   async getTelemetry(opts: { forceRefresh?: boolean } = {}): Promise<QuantaTelemetryReport> {
     const now = Date.now();
     if (!opts.forceRefresh && this.cache && this.cache.expiresAt > now) {
-      return this.cache.report;
+      return this.normalize(this.cache.raw, this.cache.serverUrl, this.cache.fetchedAt);
     }
 
     const cfg = this.readConfig();
@@ -208,17 +244,19 @@ export class QuantaClient {
     }
 
     try {
-      const rawData = await this.fetchRaw(cfg.host, cfg.port, cfg.token);
-      const normalized = this.normalize(rawData, serverUrl);
-      this.cache = { report: normalized, expiresAt: now + this.cacheTtlMs };
+      const rawData = await this.fetchRaw(cfg.host, cfg.port, cfg.token, opts.forceRefresh);
+      const fetchedAt = new Date().toISOString();
+      const normalized = this.normalize(rawData, serverUrl, fetchedAt);
+      this.cache = { raw: rawData, serverUrl, fetchedAt, expiresAt: Date.now() + this.cacheTtlMs };
       return normalized;
     } catch (err: unknown) {
-
+      const code = err instanceof Error ? err.message : "";
+      const safeCodes = new Set(["QUANTA_TIMEOUT", "QUANTA_AUTH_FAILED", "QUANTA_HTTP_ERROR", "QUANTA_RESPONSE_TOO_LARGE", "QUANTA_INVALID_JSON", "QUANTA_RESPONSE_ERROR", "QUANTA_REQUEST_ERROR"]);
       const errorReport: QuantaTelemetryReport = {
         timestamp: new Date().toISOString(),
         quanta_available: false,
         server_url: serverUrl,
-        error: "QUANTA_UNREACHABLE",
+        error: safeCodes.has(code) ? code : "QUANTA_UNREACHABLE",
         retry_guidance: "Local Quanta telemetry could not be retrieved safely.",
         providers: this.emptyProviders(),
       };
@@ -226,7 +264,7 @@ export class QuantaClient {
     }
   }
 
-  private fetchRaw(host: string, port: number, token: string): Promise<Record<string, unknown>> {
+  private fetchRaw(host: string, port: number, token: string, forceRefresh: boolean = false): Promise<Record<string, unknown>> {
     if (!["127.0.0.1", "::1"].includes(host) || !Number.isInteger(port) || port < 1 || port > 65535) return Promise.reject(new Error("QUANTA_ENDPOINT_UNSUPPORTED"));
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -236,9 +274,14 @@ export class QuantaClient {
         clearTimeout(timer);
         if (error) reject(new Error(error)); else resolve(value!);
       };
-      const timer = setTimeout(() => { finish("QUANTA_TIMEOUT"); req.destroy(); }, 4000);
-      const req = http.request({ hostname: host, port, path: "/api/usage", method: "GET", headers: { "X-Token": token, Accept: "application/json" } }, res => {
-        if (res.statusCode !== 200) { finish("QUANTA_HTTP_ERROR"); res.destroy(); return; }
+      const timer = setTimeout(() => { finish("QUANTA_TIMEOUT"); req.destroy(); }, forceRefresh ? 45_000 : 10_000);
+      const reqPath = forceRefresh ? "/api/usage?force_refresh=true" : "/api/usage";
+      const headers: Record<string, string> = { "X-Token": token, Accept: "application/json" };
+      if (forceRefresh) {
+        headers["X-Force-Refresh"] = "1";
+      }
+      const req = http.request({ hostname: host, port, path: reqPath, method: "GET", headers }, res => {
+        if (res.statusCode !== 200) { finish(res.statusCode === 401 || res.statusCode === 403 ? "QUANTA_AUTH_FAILED" : "QUANTA_HTTP_ERROR"); res.destroy(); return; }
         const chunks: Buffer[] = [];
         let size = 0;
         res.on("data", chunk => {
@@ -257,16 +300,41 @@ export class QuantaClient {
           } catch { finish("QUANTA_INVALID_JSON"); }
         });
       });
-      req.on("error", () => finish("QUANTA_REQUEST_ERROR"));
+      req.on("error", (error: NodeJS.ErrnoException) => finish(error.code === "ECONNREFUSED" || error.code === "ENOTFOUND" ? "QUANTA_UNREACHABLE" : "QUANTA_REQUEST_ERROR"));
       req.end();
     });
   }
-  private normalize(raw: Record<string, unknown>, serverUrl: string): QuantaTelemetryReport {
-    const observed = typeof raw.observed_at === "string" ? raw.observed_at : timestampToIso(raw.observed_at ?? raw.sampled_at);
-    const age = observed ? Date.now() - Date.parse(observed) : NaN;
-    const fresh = Number.isFinite(age) && age >= 0 && age <= 60000;
+
+  private normalize(raw: Record<string, unknown>, serverUrl: string, fetchedAt: string): QuantaTelemetryReport {
+    const now = Date.now();
+    const asObject = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+    const codex = asObject(raw.codex);
+    const ag = asObject(raw.antigravity);
+    const glm = asObject(raw.glm);
+    const currentAccount = Array.isArray(codex.accounts) ? codex.accounts.map(asObject).find(account => account.is_current === true) : undefined;
+    const currentSample = currentAccount ? observationIso(currentAccount.snapshot_at) : null;
+    const codexOwn = currentAccount && Object.hasOwn(currentAccount, "snapshot_at")
+      ? currentSample
+      : codex.observed_at_scope === "current_account" ? observationIso(codex.observed_at) : null;
+    const agOwn = observationIso(ag.observed_at);
+    const glmOwn = observationIso(glm.observed_at);
+    const topObserved = observationIso(raw.observed_at);
+    const globalSample = raw.observed_at_scope === "all_providers" ? topObserved : null;
+    const codexTime = currentAccount && Object.hasOwn(currentAccount, "snapshot_at") || Object.hasOwn(codex, "observed_at") ? codexOwn : globalSample;
+    const agTime = Object.hasOwn(ag, "observed_at") ? agOwn : globalSample;
+    const glmTime = Object.hasOwn(glm, "observed_at") ? glmOwn : globalSample;
+    const codexFresh = !!currentAccount && !codex.error && freshObservation(codexTime, now);
+    const agFresh = !ag.error && freshObservation(agTime, now);
+    const glmFresh = !glm.error && freshObservation(glmTime, now);
+    const providerTimes = [codexOwn, agOwn, glmOwn].filter((value): value is string => value !== null);
+    const observed = topObserved ?? (providerTimes.length ? new Date(Math.min(...providerTimes.map(Date.parse))).toISOString() : null);
+    const isReportFresh = codexFresh || agFresh || glmFresh;
+
     const report: QuantaTelemetryReport = {
-      observed_at: observed, fetched_at: new Date().toISOString(), freshness: fresh ? "fresh" : "unknown",
+      observed_at: observed,
+      observed_at_scope: globalSample ? "all_providers" : observed ? "partial_summary" : "unknown",
+      fetched_at: fetchedAt,
+      freshness: isReportFresh ? "fresh" : "unknown",
       timestamp: new Date().toISOString(),
       quanta_available: true,
       server_url: serverUrl,
@@ -278,15 +346,32 @@ export class QuantaClient {
         muse: this.normalizeMuse(raw.muse),
       },
     };
-    if (!fresh) {
-      const invalidate = (value: unknown): void => {
-        if (!value || typeof value !== "object") return;
-        const item = value as Record<string, unknown>;
-        if (item.status === "known" && "remaining_percent" in item) { item.status = "unknown"; item.remaining_percent = null; item.used_percent = null; item.remaining_units = null; }
-        for (const child of Object.values(item)) invalidate(child);
-      };
-      invalidate(report.providers);
+
+    for (const [provider, sample, fresh] of [
+      [report.providers.codex, codexTime, codexFresh],
+      [report.providers.antigravity, agTime, agFresh],
+      [report.providers.glm, glmTime, glmFresh],
+    ] as const) {
+      provider.observed_at = sample;
+      provider.freshness = fresh ? "fresh" : "unknown";
     }
+
+    const invalidate = (value: unknown): void => {
+      if (!value || typeof value !== "object") return;
+      const item = value as Record<string, unknown>;
+      if (item.status === "known" && "remaining_percent" in item) {
+        item.status = "unknown";
+        item.remaining_percent = null;
+        item.used_percent = null;
+        item.remaining_units = null;
+      }
+      for (const child of Object.values(item)) invalidate(child);
+    };
+
+    if (!codexFresh) invalidate(report.providers.codex);
+    if (!agFresh) invalidate(report.providers.antigravity);
+    if (!glmFresh) invalidate(report.providers.glm);
+
     return report;
   }
 

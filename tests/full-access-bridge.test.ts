@@ -115,7 +115,7 @@ describe("full-access bridge MCP lifecycle", () => {
     authFile = path.join(makeTmpDir("full-access-auth"), "store.json");
     const factory = (_options: AppServerFactoryOptions): AppServerClient => new FullAccessFakeAppServer();
     bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false, authStoreFile: authFile, fullAccess: true, appServerFactory: factory });
-    bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => entry.name === "c2c-bridge")!.id;
+    bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => ["a2c-bridge", "c2c-bridge"].includes(entry.name))!.id;
     token = bridge.authStore.issueTokens({
       clientId: "full-access-owner",
       scopes: ["workspace.read", "execution.read", "execution.submit", "execution.cancel"],

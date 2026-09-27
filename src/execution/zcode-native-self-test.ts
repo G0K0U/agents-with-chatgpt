@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { assertNativeIdempotency, nativeRequestFingerprint, ZcodeNativeError,
+import { assertNativeIdempotency, isAdmissibleZcodeProvider, nativeRequestFingerprint, ZcodeNativeError,
   ZCODE_IDEMPOTENCY_PROTOCOL, ZCODE_NATIVE_REQUIRED_IDENTITY, type ZcodeNativeClient, type ZcodeNativeTaskView } from "./zcode-native.js";
 
 const PROBE = "Read-only protocol probe. Do not use tools, read files, run commands, or change anything. Reply only: C2C native protocol probe.";
@@ -101,7 +101,7 @@ export async function nativeSelfTest(workspaceId: string, deps: NativeSelfTestDe
     layers.transport = "PASS";
     layers.workspace_binding = status?.workspace_id === workspaceId ? "PASS" : "FAIL";
     layers.desktop_managed_auth =
-      (typeof status?.provider === "string" ? status.provider : "") === ZCODE_NATIVE_REQUIRED_IDENTITY.provider ? "PASS" : "FAIL";
+      isAdmissibleZcodeProvider(typeof status?.provider === "string" ? status.provider : "") ? "PASS" : "FAIL";
     if (status?.workspace_id !== workspaceId || status.durable_idempotency !== ZCODE_IDEMPOTENCY_PROTOCOL) return evidence;
     layers.service_protocol = "PASS";
     evidence.protocol = ZCODE_IDEMPOTENCY_PROTOCOL;

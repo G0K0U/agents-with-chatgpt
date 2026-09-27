@@ -11,8 +11,9 @@ import {
   writeSecureJson,
 } from "../config/paths.js";
 import { stableWorkspaceId } from "../workspace/identity.js";
-import { readReleasePointer } from "./runtime-identity.js";
-import { SERVICE_NAME, VERSION } from "../version.js";
+import { installationRoot, readReleasePointer } from "./runtime-identity.js";
+import { WINDOWS_PROCESS_QUERY } from "./windows-native-process.js";
+import { isBridgeServiceName, SERVICE_NAME, VERSION } from "../version.js";
 
 import { readStateDomainOwnerStatus } from "./state-owner.js";
 
@@ -121,6 +122,7 @@ export interface HealthPayload {
 
 export interface BridgeProcessIdentity {
   pid: number;
+  parentPid?: number;
   executable: string;
   commandLine: string;
   listeningPorts: readonly number[];
@@ -165,7 +167,7 @@ function isRuntimeState(value: unknown): value is RuntimeState {
   if (!isRecord(value)) return false;
   const row = value as Partial<RuntimeState>;
   return (
-    row.service === SERVICE_NAME &&
+    isBridgeServiceName(row.service) &&
     typeof row.version === "string" &&
     typeof row.workspaceId === "string" &&
     row.workspaceId.length > 0 &&
@@ -253,7 +255,7 @@ function optionValue(tokens: readonly string[], option: string): string | null {
 }
 
 function bridgeEntrypoints(): string[] {
-  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const repositoryRoot = installationRoot();
   const entries = [
     path.join(repositoryRoot, "dist", "cli", "index.js"),
     path.join(repositoryRoot, "src", "cli", "index.ts"),
@@ -337,6 +339,7 @@ function systemBinary(name: string): string | null {
 
 interface RawProcessRow {
   pid: number;
+  parentPid?: number;
   executable: string;
   commandLine: string;
   processStartIdentity?: string;
@@ -345,15 +348,17 @@ interface RawProcessRow {
 function windowsProcessRows(): RawProcessRow[] | null {
   const powershell = systemBinary("WindowsPowerShell\\v1.0\\powershell.exe");
   if (!powershell) return null;
-  const query = [
-    "$OutputEncoding = [System.Text.UTF8Encoding]::new()",
-    "Get-CimInstance -ClassName Win32_Process | Select-Object ProcessId,ExecutablePath,CommandLine,CreationDate | ConvertTo-Json -Compress -Depth 3",
-  ].join("; ");
-  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", query], {
+  const queryProcess = () => spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_PROCESS_QUERY], {
     encoding: "utf8",
     timeout: 5_000,
     windowsHide: true,
+    maxBuffer: 4 * 1024 * 1024,
   });
+  let result = queryProcess();
+  if ((result.status !== 0 || result.error) && !result.stdout) {
+    // Non-destructive bounded retry on transient inventory query failure
+    result = queryProcess();
+  }
   if (result.status !== 0 || result.error) return null;
   const stdout = String(result.stdout ?? "");
   if (!stdout.trim()) return [];
@@ -363,6 +368,9 @@ function windowsProcessRows(): RawProcessRow[] | null {
     return rows.flatMap((value) => {
       if (!isRecord(value)) return [];
       const pid = value.ProcessId;
+      const parentPid = typeof value.ParentProcessId === "number" && value.ParentProcessId > 0
+        ? Number(value.ParentProcessId)
+        : undefined;
       const executable = value.ExecutablePath;
       const commandLine = value.CommandLine;
       const creationDate = value.CreationDate;
@@ -372,10 +380,12 @@ function windowsProcessRows(): RawProcessRow[] | null {
         typeof executable !== "string" ||
         typeof commandLine !== "string"
       ) return [];
+      // Keep Windows PowerShell's serialized CIM start value byte-for-byte:
+      // existing owner records were minted from this same inventory shape.
       const processStartIdentity = typeof creationDate === "string" && creationDate.length > 0
         ? creationDate
         : undefined;
-      return [{ pid: Number(pid), executable, commandLine, processStartIdentity }];
+      return [{ pid: Number(pid), parentPid, executable, commandLine, processStartIdentity }];
     });
   } catch {
     return null;
@@ -431,10 +441,12 @@ function posixProcessRows(): RawProcessRow[] | null {
       const stat = fs.readFileSync(`/proc/${entry.name}/stat`, "utf8");
       const closeParen = stat.lastIndexOf(")");
       const fields = closeParen >= 0 ? stat.slice(closeParen + 2).trim().split(/\s+/) : [];
+      const ppid = fields[1] ? Number(fields[1]) : undefined;
+      const parentPid = Number.isInteger(ppid) && ppid! > 0 ? ppid : undefined;
       // /proc/<pid>/stat field 22 is the process start time.  After the
       // comm field, it is index 19 in this remainder.
       const processStartIdentity = fields[19] ? `proc-start:${fields[19]}` : undefined;
-      if (commandLine) rows.push({ pid, executable, commandLine, processStartIdentity });
+      if (commandLine) rows.push({ pid, parentPid, executable, commandLine, processStartIdentity });
     } catch {
       // Processes can exit between directory enumeration and inspection.
     }
@@ -467,19 +479,32 @@ function posixListeningPorts(): Map<number, Set<number>> | null {
   return null;
 }
 
+let cachedProcessList: { time: number; list: readonly BridgeProcessIdentity[] } | null = null;
+const CACHE_TTL_MS = 1_000;
+
+export function clearProcessInspectorCache(): void {
+  cachedProcessList = null;
+}
+
 function systemProcessInspector(): BridgeProcessInspector {
   return {
     list: () => {
+      const now = Date.now();
+      if (cachedProcessList && now - cachedProcessList.time < CACHE_TTL_MS) {
+        return cachedProcessList.list;
+      }
       const rows = process.platform === "win32" ? windowsProcessRows() : posixProcessRows();
       if (rows === null) return null;
       const ports = process.platform === "win32" ? windowsListeningPorts() : posixListeningPorts();
       if (ports === null) return null;
-      return rows
+      const list = rows
         .map((row) => ({
           ...row,
           listeningPorts: [...(ports.get(row.pid) ?? new Set<number>())].sort((a, b) => a - b),
         }))
         .sort((a, b) => a.pid - b.pid);
+      cachedProcessList = { time: now, list };
+      return list;
     },
   };
 }
@@ -501,7 +526,7 @@ export async function probeBridge(
     clearTimeout(timer);
     if (!response.ok) return null;
     const body = (await response.json()) as HealthPayload;
-    if (body.service !== SERVICE_NAME) return null;
+    if (!isBridgeServiceName(body.service)) return null;
     return body;
   } catch {
     return null;
@@ -581,7 +606,7 @@ async function discoverValidBridges(
       .sort((a, b) => a - b);
     for (const port of ports) {
       const health = await safeProbe(probe, port);
-      if (!health || health.service !== SERVICE_NAME || health.workspaceId !== workspaceId || health.status !== "ok") continue;
+      if (!health || !isBridgeServiceName(health.service) || health.workspaceId !== workspaceId || health.status !== "ok") continue;
       candidates.push({ processInfo, port, health });
       seenPids.add(processInfo.pid);
       break;
@@ -806,7 +831,7 @@ export async function reconcileBridgeRuntime(
     }
 
     const health = await safeProbe(probe, runtime.port);
-    if (health && health.service === SERVICE_NAME && health.workspaceId === workspaceId && health.status === "ok") {
+    if (health && isBridgeServiceName(health.service) && health.workspaceId === workspaceId && health.status === "ok") {
       return { state: "unknown", runtime, reason: "pid_unknown" };
     }
 

@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
 import { writeSecureJson } from "../src/config/paths.js";
-import { readRuntimeState, writeRuntimeState, type RuntimeState, type BridgeProcessIdentity } from "../src/bridge/runtime.js";
+import { readRuntimeState, writeRuntimeState, findBridgeObservation, type RuntimeState, type BridgeProcessIdentity } from "../src/bridge/runtime.js";
 import { stateDomainOwnerFile, type StateDomainOwnerRecord } from "../src/bridge/state-owner.js";
 import { findSharedBridgeObservation, ensureBridge, stopBridge, type AdminInfo, type SharedBridgeObservationOptions } from "../src/process/daemon.js";
 import { diagnoseSharedTunnel } from "../src/process/shared-doctor.js";
@@ -97,6 +97,15 @@ describe("post-reboot shared bridge discovery (hermetic)", () => {
     expect(await discover()).toMatchObject({ state: "unknown" });
     expect(options.adminFetchImpl).not.toHaveBeenCalled();
   });
+  it("reports owner_runtime_unhealthy (not active_owner_conflict) when the owner's own runtime degraded", async () => {
+    // The active owner's serve process no longer holds its runtime port: the
+    // owner's OWN observation degrades to stale_runtime. A requesting shared
+    // workspace must surface THAT precise fault, not a misleading ownership
+    // conflict (the 2026-09-16 incident diagnosis).
+    rows[0].listeningPorts = [];
+    expect(await findBridgeObservation(a.id, a.root, options)).toMatchObject({ state: "unknown", reason: "stale_runtime" });
+    expect(await discover()).toMatchObject({ state: "unknown", reason: "owner_runtime_unhealthy" });
+  });
   it("B doctor uses current authenticated owner named URL and public probe with no B tunnel file", async () => {
     const observation = await discover();
     if (observation.state !== "healthy") throw new Error("proof failed");
@@ -119,6 +128,23 @@ describe("post-reboot shared bridge discovery (hermetic)", () => {
     expect(options.adminFetchImpl).toHaveBeenCalledWith(expect.objectContaining({ workspaceId: a.id }), "POST", "/admin/shutdown", 5000,
       { expectedRuntime: { workspaceId: a.id, pid: runtime.pid, port: runtime.port, startedAt: runtime.startedAt, stateDomainGeneration: owner.generation } });
     expect(kill).not.toHaveBeenCalled(); expect(readRuntimeState(a.id, stateDir)).toBeNull(); expect(readRuntimeState(b.id, stateDir)).toBeNull();
+  });
+  it("waits for the old process to disappear from inventory before starting a replacement", async () => {
+    let shutdown = false;
+    let postShutdownInventories = 0;
+    const processInspector = { list: () => {
+      if (!shutdown) return rows;
+      postShutdownInventories += 1;
+      return postShutdownInventories <= 3 ? rows : [];
+    } };
+    const probe = async () => shutdown ? null : { service: SERVICE_NAME, version: VERSION, workspaceId: a.id, status: "ok" as const };
+    const adminFetchImpl = vi.fn(async <T>(_runtime: RuntimeState, method: string) => {
+      if (method === "POST") { shutdown = true; return {} as T; }
+      return structuredClone(info) as T;
+    });
+    expect(await stopBridge(a.root, { ...options, processInspector, probe, adminFetchImpl })).toBe(true);
+    expect(postShutdownInventories).toBeGreaterThan(3);
+    expect(readRuntimeState(a.id, stateDir)).toBeNull();
   });
   it("stop rejects changed generation before shutdown and re-proves authorization before PID fallback", async () => {
     const kill = vi.fn();

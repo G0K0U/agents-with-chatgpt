@@ -37,12 +37,18 @@ describe('R4 offline safety fixtures', () => {
     const report=client().normalize({observed_at,generated_at:Date.now(),codex:{accounts:[{is_current:true,primary_used_percent:10,secondary_used_percent:10}]}},'fixture');
     expect(report.freshness).toBe('unknown');
     expect(report.providers.codex.current_account.constraints[0].remaining_percent).toBeNull();
-    expect(evaluateRoute(report,{task_type:'coding'}).decision).toBe('blocked');
+    // R1 policy: unknown quota telemetry does NOT block an available provider.
+    // The provider routes with unverified quota (ranked after known-good pools).
+    const routed=evaluateRoute(report,{task_type:'coding'});
+    expect(routed.decision).toBe('route');
+    expect(routed.estimated_pool_health).toBe('unknown');
   });
   it('preserves fresh observation separately from fetch time', () => {
     const observed_at=new Date(Date.now()-1000).toISOString();
-    const report=client().normalize({observed_at},'fixture');
-    expect(report.observed_at).toBe(observed_at); expect(report.fetched_at).not.toBe(observed_at); expect(report.freshness).toBe('fresh');
+    const fetched_at=new Date().toISOString();
+    const report=client().normalize({observed_at,observed_at_scope:'all_providers',codex:{accounts:[{is_current:true,primary_window_minutes:300,primary_used_percent:10}]}},'fixture',fetched_at);
+    expect(report.observed_at).toBe(observed_at); expect(report.fetched_at).toBe(fetched_at);
+    expect(report.freshness).toBe('fresh'); expect(report.providers.codex.current_account?.five_hour_window.status).toBe('known');
   });
   it.each(['Set-Content fixture.txt x','set-content -Path fixture.txt -Value x','node -e "require(\'fs\').writeFileSync(\'fixture.txt\',\'x\')"','cmd /c echo x > fixture.txt'])('denies read-only before any spawn: %s', async instruction => {
     const root=temp(); const spy=vi.spyOn(cp,'spawn').mockImplementation(() => {throw new Error('must not spawn');});
@@ -71,7 +77,7 @@ describe('R4 offline safety fixtures', () => {
     if(kind==='oversize') res.emit('data',Buffer.alloc(262145));
     if(kind==='invalid'){res.emit('data','private raw invalid payload');res.emit('end');}
     if(kind==='error') req.emit('error',new Error('private raw error'));
-    if(kind==='timeout') await vi.advanceTimersByTimeAsync(4001);
+    if(kind==='timeout') await vi.advanceTimersByTimeAsync(10001);
     await assertion; expect(spy).toHaveBeenCalledTimes(1);
   });
   it('keeps completion, failed checks, correction and independent acceptance receipts distinct', () => {

@@ -7,13 +7,14 @@ import { continuationDirectory, type ApprovedManifest } from "./continuation.js"
 import { ENGINEERING_AI_WORKSPACE_ID, ENGINEERING_AI_AUDIT_STATUS_LEDGER_RELATIVE_PATH,
   ENGINEERING_AI_AUDIT_TIMELINE_LEDGER_RELATIVE_PATH, ENGINEERING_AI_AUDIT_MIRROR_FILENAMES,
   resolveEngineeringAiAuditMirrorTarget, writeEngineeringAiAuditMirror, MAX_AUDIT_MIRROR_BYTES } from "./audit-mirror.js";
+import { sharedEnv } from "../config/env.js";
 
 /**
  * Operator-configured OneDrive mirror root (C2C_ONEDRIVE_AUDIT_ROOT). Empty by
  * default: the external mirror is disabled unless the operator opts in, and no
  * machine-local path ships in the product.
  */
-const FIXED_ROOT = process.env.C2C_ONEDRIVE_AUDIT_ROOT?.trim() ?? "";
+const FIXED_ROOT = sharedEnv("ONEDRIVE_AUDIT_ROOT")?.trim() ?? "";
 /** Invoked only under the manager's idle-writer reservation. No product task can start during collection. */
 export async function collectContinuationAudit(workspace: Workspace, stateDir: string, manifest: ApprovedManifest,
   snapshot: unknown, eventId: string, authorize: (owner: string, workspace: string, scope: string) => boolean,

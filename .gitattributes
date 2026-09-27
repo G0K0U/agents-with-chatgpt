@@ -1,0 +1,3 @@
+# The release manifest hashes source bytes. Preserve the A2C source byte for
+# byte, including existing mixed line endings in embedded multiline scripts.
+src/** -text

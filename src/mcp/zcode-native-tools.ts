@@ -28,6 +28,13 @@ import {
 } from "../execution/zcode-native.js";
 import { safeOutput } from "./zcode-tools.js";
 import type { CodexTaskManager } from "../execution/tasks.js";
+import {
+  loadZcodeSessionOwnership,
+  zcodeSessionClientId,
+  ZcodeSessionOwnershipError,
+  type ZcodeSessionOwnership,
+} from "../execution/zcode-session-ownership.js";
+import { getStateDir } from "../config/paths.js";
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
@@ -42,6 +49,7 @@ export interface ZcodeNativeToolDeps {
   taskGate: (workspaceId: string, authInfo: AuthInfo | undefined, write: boolean) => void;
   writerManagerFor: (workspaceId: string, authInfo: AuthInfo | undefined) => Pick<CodexTaskManager, "submitNative" | "resumeNative" | "getNative" | "cancelNative" | "outputNative">;
   nativeAdmissionSnapshot?: (workspaceId: string, authInfo: AuthInfo | undefined) => { queue: string; writer: string };
+  stateDir?: string;
   ok: (data: unknown) => ToolResult;
   fail: (code: string, message: string) => ToolResult;
   mapError: (error: unknown) => ToolResult;
@@ -177,7 +185,7 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
         "Dispatch a realtime native ZCode task through Z2C in an authorized governed " +
         "workspace enabled via ZCODE_NATIVE_ALLOWED_WORKSPACES. Honors the shared workspace " +
         "queue pause/freeze and writer slot. Z2C admits the task only after observing " +
-        "the sanctioned Desktop-managed binding (builtin:zai-start-plan/GLM-5.3-Flash) on the " +
+        "the sanctioned Desktop-managed binding (the required identity per the C2C compatibility manifest) on the " +
         "exact created session, and the returned task " +
         "binding is re-verified here — fails closed, never falls back to the scheduled queue. " +
         deps.untrustedNote,
@@ -196,7 +204,16 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
       try {
         resolveAuthorized(args.workspace_id, extra.authInfo, extra.sessionId);
         deps.taskGate(args.workspace_id, extra.authInfo, (args.write_scope ?? "workspace") === "workspace");
-        return ok(await deps.writerManagerFor(args.workspace_id, extra.authInfo).submitNative(args));
+        const view = await deps.writerManagerFor(args.workspace_id, extra.authInfo).submitNative(args);
+        if (view.session_id) {
+          loadZcodeSessionOwnership(deps.stateDir ?? getStateDir()).record({
+            sessionId: view.session_id,
+            workspaceId: args.workspace_id,
+            clientId: zcodeSessionClientId(extra.authInfo),
+            access: (args.write_scope ?? "workspace") === "workspace" ? "write" : "readonly",
+          });
+        }
+        return ok(view);
       } catch (err) {
         return mapErr(err);
       }
@@ -303,7 +320,11 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
       try {
         resolveAuthorized(args.workspace_id, extra.authInfo, extra.sessionId);
         deps.taskGate(args.workspace_id, extra.authInfo, true);
-        return ok(await deps.writerManagerFor(args.workspace_id, extra.authInfo).resumeNative(args));
+        const ownership = loadZcodeSessionOwnership(deps.stateDir ?? getStateDir());
+        ownership.assertCanControl(extra.authInfo, args.session_id, args.workspace_id);
+        const view = await deps.writerManagerFor(args.workspace_id, extra.authInfo).resumeNative(args);
+        ownership.touch(args.session_id);
+        return ok(view);
       } catch (err) {
         return mapErr(err);
       }

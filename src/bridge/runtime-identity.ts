@@ -49,7 +49,7 @@ export interface RuntimeIdentity {
 const MANIFEST_NAME = "build-manifest.json";
 
 /** Files whose content defines the build identity, per tree. */
-function collectFiles(root: string, out: string[]): void {
+function collectFiles(root: string, out: string[], sourceFilesOnly = false): void {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(root, { withFileTypes: true });
@@ -59,8 +59,9 @@ function collectFiles(root: string, out: string[]): void {
   for (const entry of entries) {
     const full = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      collectFiles(full, out);
-    } else if (entry.isFile() && entry.name !== MANIFEST_NAME && !entry.name.endsWith(".map")) {
+      collectFiles(full, out, sourceFilesOnly);
+    } else if (entry.isFile() && entry.name !== MANIFEST_NAME && !entry.name.endsWith(".map") &&
+      (!sourceFilesOnly || /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|json)$/.test(entry.name))) {
       out.push(full);
     }
   }
@@ -72,9 +73,18 @@ function collectFiles(root: string, out: string[]): void {
  * "missing" stays distinguishable from any real content.
  */
 export function computeTreeHash(root: string): string | null {
+  return hashTree(root, false);
+}
+
+/** Hash only deployable source, excluding local backup and scratch files. */
+export function computeSourceTreeHash(root: string): string | null {
+  return hashTree(root, true);
+}
+
+function hashTree(root: string, sourceFilesOnly: boolean): string | null {
   if (!fs.existsSync(root)) return null;
   const files: string[] = [];
-  collectFiles(root, files);
+  collectFiles(root, files, sourceFilesOnly);
   const hashed: Array<{ rel: string; digest: string }> = [];
   for (const file of files.sort()) {
     const digest = createHash("sha256").update(fs.readFileSync(file)).digest("hex");
@@ -131,8 +141,11 @@ export function resolveRuntimeIdentity(opts: RuntimeIdentityOptions): RuntimeIde
     base.buildParityDetail = "runtime tree changed after the build (or a different tree is on disk)";
   }
 
-  const sourceRoot = path.resolve(opts.sourceRoot ?? manifest.sourceRoot);
-  const sourceHashNow = computeTreeHash(sourceRoot);
+  const manifestSourceRoot = path.isAbsolute(manifest.sourceRoot)
+    ? manifest.sourceRoot // legacy manifests remain readable
+    : path.resolve(installationRoot(runtimeDir), manifest.sourceRoot);
+  const sourceRoot = path.resolve(opts.sourceRoot ?? manifestSourceRoot);
+  const sourceHashNow = computeSourceTreeHash(sourceRoot);
   base.sourceParity = sourceHashNow === null
     ? "unknown"
     : sourceHashNow === manifest.sourceHash ? "ok" : "mismatch";
@@ -142,15 +155,22 @@ export function resolveRuntimeIdentity(opts: RuntimeIdentityOptions): RuntimeIde
   return base;
 }
 
-/** Stable, human-comparable release id: version + short content hash. */
+/** Stable release id for both the emitted tree and its exact source provenance. */
 export function releaseIdFor(manifest: BuildManifest): string {
-  return `${manifest.version}-${manifest.buildHash.slice(0, 8)}`;
+  return `${manifest.version}-${manifest.buildHash.slice(0, 8)}-${manifest.sourceHash.slice(0, 8)}`;
 }
 
 /** The tree directory the currently executing module was loaded from. */
 export function currentRuntimeDir(): string {
   // dist/bridge/runtime-identity.js -> dist/ ; release layouts are the same shape.
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+}
+
+/** Installation root is stable across src, dist, and immutable releases. */
+export function installationRoot(runtimeDir = currentRuntimeDir()): string {
+  const tree = path.resolve(runtimeDir);
+  const parent = path.dirname(tree);
+  return path.basename(parent) === "releases" ? path.dirname(parent) : parent;
 }
 
 export interface ReleasePointer {

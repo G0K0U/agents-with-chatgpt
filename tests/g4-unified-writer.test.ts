@@ -110,7 +110,7 @@ describe("G4 unified native/direct provider lifecycle (offline)", () => {
     fs.rmSync(resolved, { recursive: true, force: true });
   });
   function boot() {
-    const result = new CodexTaskManager(workspace, { stateDir: state, fullAccess: true, orchestrator: "legacy",
+    const result = new CodexTaskManager(workspace, { stateDir: state, fullAccess: true,
       appServerFactory: () => codex, antigravityBackend: gemini, nativeClient: native });
     managers.push(result); return result;
   }
@@ -272,17 +272,20 @@ describe("G4 unified native/direct provider lifecycle (offline)", () => {
     await Promise.resolve(); expect(codex.starts + gemini.starts).toBe(0);
     writeWorkspaceQueuePauseState(workspace.id, true, state);
     native.tasks.get(task.task_id)!.status = "completed";
-    await manager.reconcileNativeSlot(); await Promise.resolve();
+    expect(await manager.reconcileNativeSlot()).toMatchObject({ status: "completed", released: true });
+    expect(readWorkspaceSlot(workspace.id, state)).toBeNull();
+    expect(manager.getQueueState().queuedTaskCount).toBe(2);
+    await Promise.resolve();
     expect(codex.starts + gemini.starts).toBe(0);
     manager.setQueuePaused(false);
-    await vi.waitFor(() => expect(codex.starts).toBe(1));
+    await vi.waitFor(() => expect(codex.starts).toBe(1), { timeout: 3000 });
     expect(gemini.starts).toBe(0);
-    codex.finish(); await vi.waitFor(() => expect(gemini.starts).toBe(1)); gemini.finish();
+    codex.finish(); await vi.waitFor(() => expect(gemini.starts).toBe(1), { timeout: 3000 }); gemini.finish();
     await vi.waitFor(() => expect(manager.get(second.taskId).status).toBe("completed"));
     expect(manager.get(first.taskId).status).toBe("completed");
   });
 
-  it("authorized principals share native task access, including cancel while paused", async () => {
+  it("authorized principals share task reads and cancellation, but only the owner resumes a session", async () => {
     const handlers = new Map<string, Function>();
     const writerManagerFor = vi.fn(() => manager);
     registerZcodeNativeTools({ registerTool: (name: string, _schema: unknown, handler: Function) => handlers.set(name, handler) } as any, {
@@ -306,7 +309,9 @@ describe("G4 unified native/direct provider lifecycle (offline)", () => {
     expect(native.cancelCalls).toBe(1);
     expect(manager.getQueueState().paused).toBe(true);
     manager.setQueuePaused(false);
-    expect((await invoke("resume_session", { ...input(), session_id: task.session_id }, "bob")).isError).not.toBe(true);
+    expect((await invoke("resume_session", { ...input(), session_id: task.session_id }, "bob")).isError).toBe(true);
+    expect(native.resumeCalls).toBe(0);
+    expect((await invoke("resume_session", { ...input(), session_id: task.session_id }, "alice")).isError).not.toBe(true);
     expect(native.resumeCalls).toBe(1);
     writerManagerFor.mockClear();
     for (const name of ["submit_task", "get_task", "cancel_task", "resume_session", "execution_output"]) {

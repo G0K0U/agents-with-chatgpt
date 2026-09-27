@@ -124,7 +124,7 @@ describe("C2C stabilization routing and lifecycle", () => {
       appServerFactory: ({ workspaceRoot }) => new HoldingAppServer(new Workspace(workspaceRoot).id),
     });
     workspaceId = workspace.id;
-    bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => entry.name === "c2c-bridge")!.id;
+    bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => ["a2c-bridge", "c2c-bridge"].includes(entry.name))!.id;
     // The bridge self-referential workspace id is derived from the actual
     // repository root on whatever machine runs the suite — never a constant.
     expect(bridgeWorkspaceId).toBe(new Workspace(BRIDGE_REPOSITORY_ROOT).id);
@@ -167,7 +167,7 @@ describe("C2C stabilization routing and lifecycle", () => {
       name: "workspace_info",
       arguments: { workspace_id: bridgeWorkspaceId },
     }));
-    expect(bridgeInfo).toMatchObject({ workspaceId: bridgeWorkspaceId, workspaceName: "c2c-bridge" });
+    expect(bridgeInfo).toMatchObject({ workspaceId: bridgeWorkspaceId, workspaceName: expect.stringMatching(/^(a2c-bridge|c2c-bridge)$/) });
 
     const file = jsonOf<{ content: string }>(await client.callTool({
       name: "read_file",

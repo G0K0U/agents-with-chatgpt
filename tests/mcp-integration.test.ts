@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { appendExecutionRecord, readExecutionRecords } from "../src/execution/records.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
+import type { ModelCatalogService, ModelCatalog } from "../src/execution/model-catalog.js";
 import {
   ENGINEERING_AI_AUDIT_MIRROR_FILENAME,
   ENGINEERING_AI_ONEDRIVE_FOLDER,
@@ -17,6 +18,49 @@ let mirrorRoot: string;
 let bridge: Bridge;
 let client: Client;
 let accessToken: string;
+
+/**
+ * Deterministic in-memory catalog so MCP tests never spawn real codex/agy
+ * processes. Mirrors the live service surface used by tools and admission.
+ */
+const fakeCatalogAt = new Date().toISOString();
+function fakeCatalogSection(agent: "codex" | "antigravity" | "zcode"): ModelCatalog["agents"][number] {
+  return {
+    agent,
+    source: "test-fixture",
+    runtime_version: "test-1.0.0",
+    auth_mode: "test",
+    completeness: "complete",
+    error: null,
+    observed_at: fakeCatalogAt,
+    models: agent === "codex"
+      ? [{
+          agent, provider_id: null, provider_label: null,
+          model_id: "gpt-6-astra", display_name: "GPT-6-Astra",
+          supported_efforts: [
+            { effort: "medium", description: null },
+            { effort: "max", description: null },
+          ],
+          default_effort: "medium", is_default: true,
+          input_modalities: ["text"], service_tiers: [], hidden: false,
+          deprecation: null, evidence_source: "test-fixture", observed_at: fakeCatalogAt,
+        }]
+      : [],
+  };
+}
+const fakeCatalog: ModelCatalogService = {
+  get: async (agents) => ({
+    schema_version: 1 as const,
+    catalog_revision: "test-revision",
+    fetched_at: fakeCatalogAt,
+    expires_at: new Date(Date.now() + 300_000).toISOString(),
+    freshness: "fresh" as const,
+    agents: (agents && agents.length > 0 ? agents : ["codex", "antigravity", "zcode"]).map(fakeCatalogSection),
+  }),
+  peek: () => null,
+  confirmCodexSelection: async () => ({ confirmed: true, revision: "test-revision", problem: null }),
+  modelsOf: () => [],
+} as unknown as ModelCatalogService;
 
 function textOf(result: { content?: unknown }): string {
   const content = result.content as { type: string; text: string }[];
@@ -43,6 +87,7 @@ beforeAll(async () => {
     workspaceRoot: root,
     port: 0,
     persistRuntime: false,
+    modelCatalog: fakeCatalog,
     authStoreFile: path.join(makeTmpDir("auth"), "store.json"),
     oneDriveRoot: mirrorRoot,
   });
@@ -69,12 +114,20 @@ afterAll(async () => {
 describe("MCP tools over Streamable HTTP", () => {
   it("lists the complete stabilized tool surface and exposes its routing schemas", async () => {
     const { tools } = await client.listTools();
-    // Six deprecated Omnigent tools were removed; exact native session read
-    // was added. Keep the explicit names as the contract, not just a count.
-    expect(tools).toHaveLength(28);
+    // Assert the complete native-provider tool contract (incl. the Phase-3
+    // Z2C semantic session surface forwarded by the A2C gateway).
+    expect(tools).toHaveLength(43);
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
+      "agent_activity_list",
+      "agent_model_catalog",
+      "agent_model_resolve",
+      "agent_output_read",
       "agent_route",
+      "agent_session_list",
+      "agent_session_messages",
+      "agent_session_read",
+      "agent_task_read",
       "agent_usage_status",
       "cancel_codex_task",
       "execution_output",
@@ -102,18 +155,33 @@ describe("MCP tools over Streamable HTTP", () => {
       "zcode_native_self_test",
       "zcode_native_status",
       "zcode_native_submit_task",
+      "zcode_runtime_capabilities",
+      "zcode_session_create",
+      "zcode_session_read",
+      "zcode_session_send",
+      "zcode_session_set_model",
+      "zcode_session_set_thought_level",
+      "zcode_workspace_list",
     ]);
     for (const name of ["zcode_native_read_session", "zcode_native_resume_session"]) {
       const schema = tools.find((tool) => tool.name === name)?.inputSchema;
       expect(schema?.required).toEqual(expect.arrayContaining(["workspace_id", "session_id"]));
     }
+    for (const name of ["zcode_session_create", "zcode_session_send"]) {
+      const schema = tools.find((tool) => tool.name === name)?.inputSchema;
+      expect(schema?.required).toEqual(expect.arrayContaining(["workspace_id"]));
+    }
     const submitTool = tools.find((tool) => tool.name === "submit_codex_task");
     const submitSchema = submitTool?.inputSchema as {
-      properties?: { network?: { default?: unknown; description?: string } };
+      properties?: { network?: { default?: unknown; description?: string }; model?: unknown; effort?: { description?: string } };
     } | undefined;
     expect(submitTool?.description).toContain("network=true is rejected");
     expect(submitSchema?.properties?.network?.default).toBe(false);
     expect(submitSchema?.properties?.network?.description).toContain("Must remain false");
+    // The dynamic model-routing surface: both fields must be published.
+    expect(submitSchema?.properties?.model).toBeDefined();
+    expect(submitSchema?.properties?.effort).toBeDefined();
+    expect(submitSchema?.properties?.effort?.description).toContain("UNSUPPORTED_EFFORT");
 
     const queueTool = tools.find((tool) => tool.name === "execution_queue");
     const queueSchema = queueTool?.inputSchema as {
@@ -199,7 +267,8 @@ describe("MCP tools over Streamable HTTP", () => {
   });
 
   it("routes the same authorized connector to the pre-registered bridge workspace", async () => {
-    const bridgeWorkspace = bridge.registry.listMetadata().find((entry) => entry.name === "c2c-bridge");
+    // Bootstrap workspace name: "a2c-bridge" canonical; "c2c-bridge" legacy-compatible.
+    const bridgeWorkspace = bridge.registry.listMetadata().find((entry) => entry.name === "a2c-bridge" || ["a2c-bridge", "c2c-bridge"].includes(entry.name));
     expect(bridgeWorkspace).toBeTruthy();
     const selectedId = bridgeWorkspace!.id;
 
@@ -209,7 +278,7 @@ describe("MCP tools over Streamable HTTP", () => {
       authorizedWorkspaces: { id: string; name: string; enabled: boolean; canonicalPath?: string }[];
     }>(await client.callTool({ name: "workspace_info", arguments: { workspace_id: selectedId } }));
     expect(selectedInfo.workspaceId).toBe(selectedId);
-    expect(selectedInfo.workspaceName).toBe("c2c-bridge");
+    expect(["a2c-bridge", "c2c-bridge"]).toContain(selectedInfo.workspaceName);
     expect(selectedInfo.authorizedWorkspaces.map((entry) => entry.id)).toContain(bridgeWorkspace!.id);
     expect(selectedInfo.authorizedWorkspaces.every((entry) => entry.canonicalPath === undefined)).toBe(true);
 
@@ -234,7 +303,7 @@ describe("MCP tools over Streamable HTTP", () => {
   });
 
   it("fails closed for unknown/unauthorized workspaces and absolute MCP paths", async () => {
-    const bridgeWorkspace = bridge.registry.listMetadata().find((entry) => entry.name === "c2c-bridge");
+    const bridgeWorkspace = bridge.registry.listMetadata().find((entry) => entry.name === "a2c-bridge" || ["a2c-bridge", "c2c-bridge"].includes(entry.name));
     expect(bridgeWorkspace).toBeTruthy();
 
     const unauthorized = bridge.authStore.issueTokens({

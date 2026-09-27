@@ -36,10 +36,7 @@ export class CodexTaskManagerPool {
       logger: this.opts.logger,
       stateDir: this.opts.stateDir,
       appServerFactory: this.opts.appServerFactory,
-      orchestrator: this.opts.orchestrator,
       antigravityBackend: this.opts.antigravityBackend,
-      omnigentBackend: this.opts.omnigentBackend,
-      omnigent: this.opts.omnigent,
       verificationProfileResolver: this.opts.verificationProfileResolver,
       approvalEvaluator: this.opts.approvalEvaluator,
       taskTimeoutMs: this.opts.taskTimeoutMs,
@@ -53,6 +50,7 @@ export class CodexTaskManagerPool {
       queueLimit: this.opts.queueLimit,
       sessionRegistry: this.sessionRegistry,
       continuationAuthorize: this.opts.continuationAuthorize,
+      modelCatalog: this.opts.modelCatalog,
       onTaskLifecycleEvent: this.opts.onTaskLifecycleEvent,
       restartRequiredResolver:
         this.opts.taskManagerOptions?.restartRequiredResolver ??

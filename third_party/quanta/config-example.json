@@ -1,0 +1,39 @@
+{
+  "machine_name": "your-machine-name",
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "token": "YOUR_TOKEN_HERE"
+  },
+  "peers": [],
+  "refresh_seconds": 300,
+  "labels": {
+    "codex": {},
+    "muse": "Muse Code",
+    "antigravity": "Antigravity"
+  },
+  "codex": {
+    "show_unattributed": true
+  },
+  "glm": {
+    "platform": "zai",
+    "token": "YOUR_TOKEN_HERE"
+  },
+  "deepseek": {
+    "api_key": "YOUR_TOKEN_HERE"
+  },
+  "claude": {
+    "cap_5h_tokens": 0
+  },
+  "muse": {
+    "roots": [],
+    "enabled": true
+  },
+  "antigravity": {
+    "roots": [],
+    "enabled": true
+  },
+  "hidden_sources": [],
+  "watchdog_seconds": 600,
+  "menubar_template": "AI {openai} | G{glm}"
+}

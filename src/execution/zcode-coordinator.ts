@@ -27,7 +27,6 @@
  */
 import path from "node:path";
 import {
-  ZCODE_NATIVE_EXPECTED_PROVIDER,
   ZcodeControl,
   ZcodeControlError,
   ZcodeCoordinatorStore,
@@ -35,7 +34,8 @@ import {
   type ZcodeQueueResolutionOptions,
   type ZcodeTaskView,
 } from "./zcode-control.js";
-import { loadZcodeNativeConfig, ZcodeNativeClient } from "./zcode-native.js";
+import { isAdmissibleZcodeProvider, loadZcodeNativeConfig, ZcodeNativeClient } from "./zcode-native.js";
+import { readWorkspaceQueuePauseState } from "./queue-state.js";
 import type { WorkspaceRegistry } from "../workspace/registry.js";
 
 /** Structural native lane the coordinator dispatches through. */
@@ -52,7 +52,7 @@ export interface ZcodeCoordinatorNative {
     idempotency_key?: string;
     write_scope?: "workspace" | "readonly";
     mode?: "plan" | "build" | "edit";
-  }): Promise<{
+  }, beforeDispatch?: () => void): Promise<{
     task_id: string;
     session_id: string | null;
     status: string;
@@ -80,6 +80,7 @@ export interface ZcodeCoordinatorOptions {
   pollMs?: number;
   now?: () => Date;
   logger?: { warn(message: string): void; info(message: string): void };
+  stateDir?: string;
 }
 
 interface ActiveEntry {
@@ -181,6 +182,7 @@ export class ZcodeCoordinator {
   private readonly pollMs: number;
   private readonly now: () => Date;
   private readonly logger: { warn(message: string): void; info(message: string): void };
+  private readonly stateDir?: string;
 
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
@@ -202,6 +204,7 @@ export class ZcodeCoordinator {
     this.pollMs = Math.min(60_000, Math.max(1_000, Math.floor(options.pollMs ?? 15_000)));
     this.now = options.now ?? (() => new Date());
     this.logger = options.logger ?? { warn: () => {}, info: () => {} };
+    this.stateDir = options.stateDir;
   }
 
   /** Begin the claim loop; adopts tracked/unfinished work from worker-state. */
@@ -229,6 +232,24 @@ export class ZcodeCoordinator {
     }
   }
 
+  /**
+   * Fail-closed check against the bridge-owned workspace queue pause state.
+   * Denies new claims, dispatch, and recovery redispatch while paused or when
+   * the control state is unreadable/missing/unknown.
+   */
+  private isQueuePaused(): boolean {
+    if (!this.workspaceId || typeof this.workspaceId !== "string" || !this.workspaceId.trim()) {
+      return true;
+    }
+    try {
+      const pauseState = readWorkspaceQueuePauseState(this.workspaceId, this.stateDir);
+      return pauseState.paused === true;
+    } catch {
+      // Missing, unreadable, or unknown control must fail closed.
+      return true;
+    }
+  }
+
   /** Bounded local status for tests and bridge diagnostics. */
   getStatus(): {
     running: boolean;
@@ -238,6 +259,7 @@ export class ZcodeCoordinator {
     last_error: string | null;
     native: NativeCache | null;
     within_window: boolean;
+    paused: boolean;
   } {
     return {
       running: !this.stopped && !this.standby,
@@ -247,6 +269,7 @@ export class ZcodeCoordinator {
       last_error: this.lastError,
       native: this.nativeCache,
       within_window: withinCoordinatorWindows(this.windows, this.now()),
+      paused: this.isQueuePaused(),
     };
   }
 
@@ -360,8 +383,11 @@ export class ZcodeCoordinator {
       // execution identity is proven PER TASK at admission by the governed
       // submit path (assertTaskBinding), which fails closed on any wrong
       // binding, provider, or session.
-      const providerOk = providerName === ZCODE_NATIVE_EXPECTED_PROVIDER;
-      const attested = status.available === true && providerOk;
+      const providerOk = isAdmissibleZcodeProvider(providerName);
+      const hasIdentityMismatch = (status.start_plan?.mismatches ?? []).some(
+        (m) => m.startsWith("model_id=") || m.startsWith("provider_id=") || m.startsWith("provider=")
+      );
+      const attested = status.available === true && providerOk && !hasIdentityMismatch;
       this.nativeCache = {
         available: status.available === true,
         provider: providerName,
@@ -371,7 +397,9 @@ export class ZcodeCoordinator {
           ? "native control plane unavailable"
           : !providerOk
             ? `provider=${providerName || "unknown"}`
-            : null,
+            : hasIdentityMismatch
+              ? `identity mismatch: ${(status.start_plan?.mismatches ?? []).join("; ")}`
+              : null,
         observed_at: observedAt,
         ...(this.nativeCache?.namespace_mismatch ? { namespace_mismatch: true } : {}),
       };
@@ -499,6 +527,7 @@ export class ZcodeCoordinator {
   }
 
   private async claimAndDispatch(): Promise<void> {
+    if (this.isQueuePaused()) return;
     const views = this.taskViews();
     const cancelSet = new Set(views.filter((view) => view.cancel_requested).map((view) => view.task_id));
     const completed = new Set(
@@ -507,6 +536,7 @@ export class ZcodeCoordinator {
     const activeViews = views.filter((view) => this.active.has(view.task_id));
 
     for (const view of views) {
+      if (this.isQueuePaused()) break;
       if (this.active.size >= this.maxParallel) break;
       // Interrupted recovery: a START receipt without a terminal outcome and
       // without local tracking means a previous owner died mid-flight. It is
@@ -546,20 +576,42 @@ export class ZcodeCoordinator {
   }
 
   private async dispatch(view: ZcodeTaskView, recovery: boolean): Promise<void> {
+    if (this.isQueuePaused()) {
+      throw new ZcodeControlError(
+        "ZCODE_QUEUE_PAUSED",
+        `workspace queue is paused for workspace ${this.workspaceId} (fail closed)`
+      );
+    }
     const instruction = this.control.rawInstructionFor(view.task_id);
     if (!instruction) throw new ZcodeControlError("ZCODE_TASK_UNKNOWN", `queued instruction for ${view.task_id} vanished before dispatch`);
     const writeScope = view.mode === "read" || view.mode === "verify" ? "readonly" as const : "workspace" as const;
     const mode = view.mode === "verify" ? ("plan" as const) : ("build" as const);
     const dispatchPromise = this.store.withDispatchIntent({
       task_id: view.task_id,
-      dispatch: async () =>
-        this.native!.submitTask({
+      dispatch: async () => {
+        if (this.isQueuePaused()) {
+          throw new ZcodeControlError(
+            "ZCODE_QUEUE_PAUSED",
+            `workspace queue is paused for workspace ${this.workspaceId} (fail closed)`
+          );
+        }
+        return this.native!.submitTask({
           workspace_id: this.workspaceId,
           instruction,
           idempotency_key: view.task_id,
           write_scope: writeScope,
           mode,
-        }),
+        }, () => {
+          // Native admission may await a provider probe and MCP handshake.
+          // Recheck immediately before the network mutation, after all awaits.
+          if (this.isQueuePaused()) {
+            throw new ZcodeControlError(
+              "ZCODE_QUEUE_PAUSED",
+              `workspace queue is paused for workspace ${this.workspaceId} (fail closed)`,
+            );
+          }
+        });
+      },
     });
     // The tracked promise only ever resolves; dispatch failures surface via
     // the awaited dispatchPromise below (never as an unhandled rejection).
@@ -675,7 +727,7 @@ export function lazyZcodeNativeAdapter(env: NodeJS.ProcessEnv = process.env): Zc
   };
   return {
     status: (workspaceId) => getClient().status(workspaceId),
-    submitTask: (input) => getClient().submitTask(input),
+    submitTask: (input, beforeDispatch) => getClient().submitTask(input, beforeDispatch),
     getTask: (input) => getClient().getTask(input),
     cancelTask: (input) => getClient().cancelTask(input),
   };
@@ -736,6 +788,7 @@ export function startZcodeCoordinatorFromEnvironment(wiring: ZcodeCoordinatorWir
     workspaceId,
     native: lazyZcodeNativeAdapter(env),
     windowSpec,
+    stateDir: wiring.stateDir,
     ...(maxParallel !== undefined && Number.isFinite(maxParallel) ? { maxParallel } : {}),
     ...(pollMs !== undefined && Number.isFinite(pollMs) ? { pollMs } : {}),
     logger: wiring.logger,

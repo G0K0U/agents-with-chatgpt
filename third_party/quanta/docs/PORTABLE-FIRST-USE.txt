@@ -1,0 +1,11 @@
+Quanta v0.9.4 — unsigned Windows x64 prerelease
+
+Installer: choose a folder and open Quanta from your desktop or Start menu.
+Portable ZIP: extract the whole folder, run Verify.cmd, then Quanta.exe.
+The installer includes Windows uninstall support and preserves personal settings.
+Click Q in the notification area to open the compact popup.
+Connect opens the native GLM/DeepSeek editor. Test and save validates read-only API access before storing new keys in Windows Credential Manager.
+Close all Quanta windows and quit Q before upgrading. Preserve ~/.aibar and your credentials. Re-enable optional startup after moving the app.
+This package is unsigned. Hashes verify consistency, not publisher identity.
+Mac downloads are separate: use the v0.9.0 secure2 release for Mac build 9.2.
+Project and platform guides: https://github.com/SparklingAstronaut/quanta

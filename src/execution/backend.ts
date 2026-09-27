@@ -34,6 +34,8 @@ export interface BackendExecutionRequest {
   providerSessionId?: string;
   model?: string;
   timeoutMs: number;
+  /** Set false by background janitor lanes: their attempts must not write the shared on-demand evidence. */
+  evidence?: boolean;
   onOutput?: (chunk: string) => void;
   onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
   /** Persist bridge-owned linkage before/while the remote turn runs. */
@@ -54,6 +56,10 @@ export interface BackendExecutionResult {
   phaseDurations?: Record<string, number>;
   providerSessionId?: string;
   providerTurnId?: string;
+  /** True when a dead/stale resumed session was discarded and a fresh session carried the task (G2). */
+  sessionRecovered?: boolean;
+  /** Set false by background janitor lanes: their attempts must not write the shared on-demand evidence. */
+  evidence?: boolean;
   networkReported?: boolean;
   /** False means a remote writer could still be alive; retain the workspace lease. */
   quiescent?: boolean;

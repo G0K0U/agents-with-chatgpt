@@ -1,10 +1,11 @@
 {
   "name": "codex-with-chatgpt",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "ChatGPT thinks. Codex works. Use ChatGPT as the planning brain while keeping the Codex harness.",
   "type": "module",
   "license": "MIT",
   "bin": {
+    "a2c": "./bin/a2c.js",
     "c2c": "./bin/c2c.js"
   },
   "engines": {
@@ -19,11 +20,12 @@
   },
   "packageManager": "pnpm@11.24.0",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "latest",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "commander": "^14.0.0",
     "express": "^5.1.0",
     "ignore": "^7.0.5",
-    "zod": "^3.25.0"
+    "zod": "^3.25.0",
+    "zod-to-json-schema": "^3.25.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.3",

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { Workspace } from "./manager.js";
+import { sharedEnv } from "../config/env.js";
 
 export interface SearchOptions {
   query: string;
@@ -37,15 +38,20 @@ const RG_CANDIDATES = [
 let cachedRg: string | null | undefined;
 
 export function findRipgrep(): string | null {
-  if (process.env.C2C_DISABLE_RG === "1") return null;
+  if (sharedEnv("DISABLE_RG") === "1") return null;
   if (cachedRg !== undefined) return cachedRg;
-  if (process.env.C2C_RG_PATH) {
-    cachedRg = process.env.C2C_RG_PATH;
+  const configured = sharedEnv("RG_PATH");
+  if (configured) {
+    cachedRg = configured;
     return cachedRg;
   }
   for (const candidate of RG_CANDIDATES) {
     try {
-      const result = spawnSync(candidate, ["--version"], { stdio: "ignore", timeout: 3000 });
+      const result = spawnSync(candidate, ["--version"], {
+        stdio: "ignore",
+        timeout: 3000,
+        windowsHide: true,
+      });
       if (result.status === 0) {
         cachedRg = candidate;
         return candidate;
@@ -77,7 +83,7 @@ async function searchWithRipgrep(
   args.push("--", opts.query, searchAbs);
 
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(rgBin, args, { cwd: ws.root });
+    const child = spawn(rgBin, args, { cwd: ws.root, windowsHide: true });
     const matches: SearchMatch[] = [];
     let truncated = false;
     const rl = readline.createInterface({ input: child.stdout });

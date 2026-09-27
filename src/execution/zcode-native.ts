@@ -12,7 +12,7 @@
  *    never from MCP callers. The host must be loopback and redirects are not
  *    followed (redirect: "manual").
  *  - Service identity is proven from the MCP handshake: the peer must be the
- *    "z2c-bridge" server. Anything else answering on the port (e.g. another
+ *    "z2c-service" server. Anything else answering on the port (e.g. another
  *    local service) is rejected.
  *  - Only workspace ids enabled via ZCODE_NATIVE_ALLOWED_WORKSPACES (a
  *    comma-separated operator-owned environment variable) may be forwarded.
@@ -21,7 +21,7 @@
  *  - Desktop-managed auth only: the execution identity of an accepted
  *    task is the model binding Z2C OBSERVED for that exact session at
  *    admission (native session/read). Z2C admits only observed
- *    builtin:zai-start-plan/GLM-5.3-Flash sessions, and this client re-verifies
+ *    the REQUIRED GLM identity (see ZCODE_NATIVE_REQUIRED_IDENTITY) at admission, and this client re-verifies
  *    the returned task binding before binding the task/session identity
  *    anywhere. Unobserved identity fails closed; the required identity
  *    constants are comparison targets, never evidence.
@@ -33,14 +33,13 @@
  *    fields are released.
  *  - No fallback: failures never route into the governed scheduled queue.
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { canonicalizeWorkspaceRoot } from "../workspace/identity.js";
 import { createHash } from "node:crypto";
 import { rejectCredentialLikeInstruction } from "./zcode-control.js";
+import { ZcodeSessionClient, ZcodeSessionError, type ZcodeSessionState, type ZcodeDiscoveredSession, type ZcodeWorkspaceGrant } from "./zcode-session-client.js";
 
 /**
  * Operator-owned native forwarding allowlist. Empty by default: no workspace
@@ -59,19 +58,37 @@ export function nativeAllowedWorkspaces(env: NodeJS.ProcessEnv = process.env): R
   );
 }
 
-// 2026-09-12: a fresh live Desktop session observed through the
-// desktop-agent chain reports builtin:zai-start-plan / GLM-5.3-Flash, which
-// replaces the previously required builtin:zai-coding-plan / GLM-5.3
-// comparison target. Comparison target only — never evidence; the accepted
-// binding must be OBSERVED from the exact session's own state.
+// 2026-09-17 (PRODUCT POLICY): governed ChatGPT-controlled GLM work is
+// FLASH-ONLY. The required Desktop-managed identity is
+// builtin:zai-coding-plan / GLM-5.3-Flash (the coding-plan Flash route is
+// available and live-verified on the agent; the retired start-plan route is
+// unentitled). The attestation contract itself is unchanged: the identity
+// must still be OBSERVED from the exact session's own state (native
+// session/read), never self-reported and never substituted. ZCode main-model
+// (GLM-5.3) remains available for manual/native use, never for governed C2C
+// execution, and there is no automatic main-model escalation.
 export const ZCODE_NATIVE_REQUIRED_IDENTITY = {
-  provider: "zcode-desktop", // DesktopZcodeProvider.name — the only desktop-managed provider
-  provider_id: "builtin:zai-start-plan",
+  provider: "zcode-desktop", // DesktopZcodeProvider.name — legacy default
+  provider_id: "builtin:zai-coding-plan",
   model_id: "GLM-5.3-Flash",
 } as const;
 
+/** Legacy desktop-managed provider identity. */
+export const ZCODE_NATIVE_EXPECTED_PROVIDER = "zcode-desktop";
+/** Official standalone app-server provider identity (ZCode 0.16.9+ bundled Agent). */
+export const ZCODE_OFFICIAL_EXPECTED_PROVIDER = "zcode-official";
+/** Admissible Z2C provider identities for the native/coordinator execution chain. */
+export const ZCODE_ADMISSIBLE_PROVIDERS: ReadonlySet<string> = new Set([
+  ZCODE_NATIVE_EXPECTED_PROVIDER,
+  ZCODE_OFFICIAL_EXPECTED_PROVIDER,
+]);
+
+export function isAdmissibleZcodeProvider(provider: string | null | undefined): boolean {
+  return typeof provider === "string" && ZCODE_ADMISSIBLE_PROVIDERS.has(provider);
+}
+
 /** Expected MCP server identity of the real Z2C control plane. */
-export const ZCODE_NATIVE_EXPECTED_SERVICE = "z2c-bridge";
+export const ZCODE_NATIVE_EXPECTED_SERVICE = "z2c-service";
 
 /** Upper bound for released native execution output text. */
 export const ZCODE_NATIVE_MAX_OUTPUT_CHARS = 16000;
@@ -88,6 +105,7 @@ export class ZcodeNativeError extends Error {
       | "ZCODE_NATIVE_CONFIG"
       | "ZCODE_NATIVE_UNCONFIGURED"
       | "ZCODE_NATIVE_UNAVAILABLE"
+      | "ZCODE_NATIVE_OUTCOME_UNKNOWN"
       | "ZCODE_NATIVE_UNAUTHORIZED"
       | "ZCODE_NATIVE_TIMEOUT"
       | "ZCODE_NATIVE_SERVICE_MISMATCH"
@@ -143,14 +161,33 @@ function readAuthTokenFile(path: string): string {
   }
 }
 
+function readActiveSecurityToken(path: string): string | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { secrets?: unknown } | null;
+    if (!Array.isArray(parsed?.secrets)) return undefined;
+    const active = parsed.secrets.find((entry: unknown) => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const candidate = entry as { secret?: unknown; retiredAt?: unknown };
+      return (candidate.retiredAt === undefined || candidate.retiredAt === null) &&
+        typeof candidate.secret === "string" && candidate.secret.length >= 16;
+    }) as { secret: string } | undefined;
+    return active?.secret;
+  } catch {
+    // Missing or malformed security files defer to legacy auth without exposing contents.
+    return undefined;
+  }
+}
+
 export function loadZcodeNativeConfig(env: NodeJS.ProcessEnv = process.env): ZcodeNativeConfig {
   const url = assertLoopbackHttpUrl(env.ZCODE_NATIVE_URL ?? "http://127.0.0.1:8766/mcp").toString();
-  const token = env.ZCODE_NATIVE_TOKEN
-    ? env.ZCODE_NATIVE_TOKEN
-    : readAuthTokenFile(
-        env.ZCODE_NATIVE_AUTH_FILE ??
-          join(env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "z2c", "auth.json"),
-      );
+  const authDir = join(env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "z2c");
+  const token =
+    env.ZCODE_NATIVE_AUTH_FILE !== undefined
+      ? readAuthTokenFile(env.ZCODE_NATIVE_AUTH_FILE)
+      : (readActiveSecurityToken(join(authDir, "security.json")) ??
+        (env.ZCODE_NATIVE_TOKEN
+          ? env.ZCODE_NATIVE_TOKEN
+          : readAuthTokenFile(join(authDir, "auth.json"))));
   const timeoutRaw = env.ZCODE_NATIVE_TIMEOUT_MS ? Number(env.ZCODE_NATIVE_TIMEOUT_MS) : 20000;
   if (!Number.isInteger(timeoutRaw) || timeoutRaw < 1000 || timeoutRaw > 120000) {
     throw new ZcodeNativeError("ZCODE_NATIVE_CONFIG", "ZCODE_NATIVE_TIMEOUT_MS must be 1000..120000");
@@ -211,11 +248,6 @@ interface ProviderStatusBody {
   model_binding?: unknown;
 }
 
-interface McpToolResult {
-  content?: Array<{ type?: unknown; text?: unknown }>;
-  isError?: boolean;
-}
-
 export interface SubmitNativeInput {
   idempotency_key?: string;
   workspace_id: string;
@@ -249,13 +281,19 @@ export function assertNativeIdempotency(view: ZcodeNativeTaskView, input: Submit
 }
 
 export class ZcodeNativeClient {
-  private session: Client | null = null;
+  private readonly transport: ZcodeSessionClient;
 
   constructor(private readonly config: ZcodeNativeConfig) {
     assertLoopbackHttpUrl(config.url);
     if (typeof config.token !== "string" || config.token.length < 8) {
       throw new ZcodeNativeError("ZCODE_NATIVE_UNCONFIGURED", "Z2C bearer token missing or too short");
     }
+    this.transport = new ZcodeSessionClient({
+      url: config.url,
+      apiBase: new URL(config.url).origin,
+      token: config.token,
+      requestTimeoutMs: config.requestTimeoutMs,
+    });
   }
 
   /**
@@ -263,54 +301,27 @@ export class ZcodeNativeClient {
    * payload before parsing so it can never leak into released results or
    * errors.
    *
-   * A Z2C restart invalidates the MCP session id this client holds. One
-   * re-handshake retry covers exactly that transport-level case
-   * (ZCODE_NATIVE_UNAVAILABLE). Upstream tool errors and timeouts are never
-   * retried here: the first attempt may already have executed upstream.
+   * Shares the semantic client's single-flight, generation-fenced transport.
+   * Only declared reads can reconnect once. Mutations are never replayed
+   * after dispatch, including when their response is lost.
    */
-  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  async callTool(name: string, args: Record<string, unknown>, beforeDispatch?: () => void): Promise<unknown> {
     try {
-      return await this.callToolAttempt(name, args);
+      return await this.transport.callTool(name, args, undefined, beforeDispatch);
     } catch (err) {
-      const code = err instanceof ZcodeNativeError ? err.code : "ZCODE_NATIVE_UNAVAILABLE";
-      if (code !== "ZCODE_NATIVE_UNAVAILABLE") throw err;
-      this.resetSession();
-      return await this.callToolAttempt(name, args);
-    }
-  }
-
-  private async callToolAttempt(name: string, args: Record<string, unknown>): Promise<unknown> {
-    const client = await this.ensureSession();
-    let result: unknown;
-    try {
-      result = (await client.callTool(
-        { name, arguments: args },
-        undefined,
-        { timeout: this.config.requestTimeoutMs },
-      )) as McpToolResult;
-    } catch (err) {
-      this.resetSession();
-      throw err instanceof ZcodeNativeError ? err : this.mapTransportError(err);
-    }
-    const typed = result as McpToolResult;
-    const text = (typed.content ?? [])
-      .map((part) => (typeof part.text === "string" ? part.text : ""))
-      .join("\n");
-    if (typed.isError) {
-      const cleaned = text.replaceAll(this.config.token, "[REDACTED]");
-      const sep = cleaned.indexOf(": ");
-      const looksCoded = sep > 0 && /^[A-Z][A-Z0-9_]+$/.test(cleaned.slice(0, sep));
-      throw new ZcodeNativeError(
-        "ZCODE_NATIVE_UPSTREAM",
-        looksCoded ? cleaned.slice(sep + 2) : cleaned || "Z2C tool error",
-        looksCoded ? cleaned.slice(0, sep) : undefined,
-      );
-    }
-    const scrubbed = text.replaceAll(this.config.token, "[REDACTED]");
-    try {
-      return JSON.parse(scrubbed) as unknown;
-    } catch {
-      return { text: scrubbed };
+      if (!(err instanceof ZcodeSessionError)) throw err;
+      const code = ({
+        ZCODE_SESSION_CONFIG: "ZCODE_NATIVE_CONFIG",
+        ZCODE_SESSION_UNCONFIGURED: "ZCODE_NATIVE_UNCONFIGURED",
+        ZCODE_SESSION_UNAVAILABLE: "ZCODE_NATIVE_UNAVAILABLE",
+        ZCODE_SESSION_OUTCOME_UNKNOWN: "ZCODE_NATIVE_OUTCOME_UNKNOWN",
+        ZCODE_SESSION_UNAUTHORIZED: "ZCODE_NATIVE_UNAUTHORIZED",
+        ZCODE_SESSION_TIMEOUT: "ZCODE_NATIVE_TIMEOUT",
+        ZCODE_SESSION_SERVICE_MISMATCH: "ZCODE_NATIVE_SERVICE_MISMATCH",
+        ZCODE_SESSION_WORKSPACE_FORBIDDEN: "ZCODE_NATIVE_WORKSPACE_FORBIDDEN",
+        ZCODE_SESSION_UPSTREAM: "ZCODE_NATIVE_UPSTREAM",
+      } as const)[err.code];
+      throw new ZcodeNativeError(code, err.message, err.upstreamCode);
     }
   }
 
@@ -340,7 +351,7 @@ export class ZcodeNativeClient {
     const providerStatus = typeof body.status === "string" ? body.status : String(body.status ?? "");
     const caps = body.capabilities as { ok?: unknown } | undefined;
     const capabilities_ok = caps?.ok === true;
-    const desktop_managed_auth = providerName === ZCODE_NATIVE_REQUIRED_IDENTITY.provider;
+    const desktop_managed_auth = isAdmissibleZcodeProvider(providerName);
 
     // Execution identity truth: the effective provider/model binding must be
     // OBSERVED from the control plane. Absence is UNKNOWN and never attested;
@@ -405,14 +416,13 @@ export class ZcodeNativeClient {
         throw new ZcodeNativeError("ZCODE_NATIVE_UPSTREAM", "Z2C upgrade required: durable idempotency protocol unavailable", "IDEMPOTENCY_UPGRADE_REQUIRED");
       }
     }
-    beforeDispatch?.();
     const raw = await this.callTool("submit_zcode_task", {
       workspace_id: input.workspace_id,
       instruction: input.instruction,
       ...(input.write_scope ? { write_scope: input.write_scope } : {}),
       ...(input.mode ? { mode: input.mode } : {}),
       ...(input.idempotency_key !== undefined ? { idempotency_key: input.idempotency_key } : {}),
-    });
+    }, beforeDispatch);
     // Namespace: the created task must belong to the authorized workspace and
     // carry a mapped native session id. Execution identity comes from the
     // task/session binding Z2C observed at admission (exact session/read) —
@@ -442,21 +452,50 @@ export class ZcodeNativeClient {
   async readSession(input: { workspace_id: string; session_id: string; expected_workspace_path?: string }) {
     this.assertWorkspaceAllowed(input.workspace_id);
     if (!SESSION_ID_RE.test(input.session_id)) throw new ZcodeNativeError("ZCODE_NATIVE_INSTRUCTION_REJECTED", "Invalid native session id");
-    const raw = await this.callTool("read_zcode_session", { workspace_id: input.workspace_id, session_id: input.session_id }) as Record<string, unknown>;
-    if (raw.workspace_id !== input.workspace_id || raw.session_id !== input.session_id || typeof raw.canonical_path !== "string") {
+    const raw = (await this.callTool("zcode_session_observe", {
+      workspace_id: input.workspace_id,
+      session_id: input.session_id,
+    })) as Record<string, unknown>;
+    if (raw.workspace_id !== input.workspace_id || raw.session_id !== input.session_id) {
       throw new ZcodeNativeError("ZCODE_NATIVE_NAMESPACE_MISMATCH", "Exact session namespace mismatch");
+    }
+    // Observation is deliberately available for foreign/manual sessions.
+    // The separate discovery record carries Z2C ownership; absence or a
+    // mismatched owner can never be repaired by a workspace grant fallback.
+    const discovered = (await this.callTool("zcode_session_discover", { workspace_id: input.workspace_id })) as {
+      sessions?: Array<{ session_id?: unknown; workspace_id?: unknown; workspace_path?: unknown; controlled_by_z2c?: unknown; owner_client_id?: unknown; runtime_origin?: unknown }>;
+    };
+    const match = discovered?.sessions?.find((s) => s?.session_id === input.session_id && s?.workspace_id === input.workspace_id);
+    if (!match || match.controlled_by_z2c !== true || match.runtime_origin !== "z2c" || match.owner_client_id !== "local") {
+      throw new ZcodeNativeError("ZCODE_NATIVE_NOT_ATTESTED", "Exact session is not locally owned by Z2C");
+    }
+    const canonicalPath = match.workspace_path;
+    if (typeof canonicalPath !== "string") {
+      throw new ZcodeNativeError("ZCODE_NATIVE_NAMESPACE_MISMATCH", "Exact session workspace path is unavailable");
     }
     if (input.expected_workspace_path) {
       const normalize = (p: string) => process.platform === "win32" ? resolve(p).toLowerCase() : resolve(p);
-      if (normalize(canonicalizeWorkspaceRoot(raw.canonical_path)) !== normalize(canonicalizeWorkspaceRoot(input.expected_workspace_path))) {
+      if (normalize(canonicalizeWorkspaceRoot(canonicalPath)) !== normalize(canonicalizeWorkspaceRoot(input.expected_workspace_path))) {
         throw new ZcodeNativeError("ZCODE_NATIVE_NAMESPACE_MISMATCH", "Native workspace path differs from C2C registry");
       }
     }
-    const binding = projectBinding(raw.model_binding);
-    if (binding?.provider_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id || binding?.model_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.model_id || binding.source !== "desktop-session-read" || raw.immediate_resume !== "native-session-v1") {
+    const binding = projectBinding(raw.model_binding) ?? (
+      typeof raw.provider_id === "string" && typeof raw.model_id === "string"
+        ? {
+            provider_id: raw.provider_id,
+            model_id: raw.model_id,
+            ...(typeof raw.binding_source === "string" ? { source: raw.binding_source } : {}),
+          }
+        : null
+    );
+    if (
+      !binding ||
+      binding.provider_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id ||
+      binding.model_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.model_id
+    ) {
       throw new ZcodeNativeError("ZCODE_NATIVE_NOT_ATTESTED", "Exact native session binding or immediate continuation contract unavailable");
     }
-    return { workspace_id: input.workspace_id, session_id: input.session_id, canonical_path: raw.canonical_path, model_binding: binding };
+    return { workspace_id: input.workspace_id, session_id: input.session_id, canonical_path: canonicalPath, model_binding: binding };
   }
 
   async resumeSession(input: ResumeNativeInput, beforeDispatch?: () => void): Promise<ZcodeNativeTaskView> {
@@ -466,12 +505,11 @@ export class ZcodeNativeClient {
       throw new ZcodeNativeError("ZCODE_NATIVE_INSTRUCTION_REJECTED", "session_id must match sess_<uuid>");
     }
     await this.readSession(input);
-    beforeDispatch?.();
     const raw = await this.callTool("resume_zcode_session", {
       workspace_id: input.workspace_id,
       session_id: input.session_id,
       instruction: input.instruction,
-    });
+    }, beforeDispatch);
     // The resumed task must stay bound to the mapped native session; its
     // execution identity is the binding Z2C observed for that exact session.
     const view = projectTaskView(raw, {
@@ -521,7 +559,7 @@ export class ZcodeNativeClient {
   }
 
   close(): void {
-    this.resetSession();
+    this.transport.close();
   }
 
   // ── governance gates ───────────────────────────────────────────────────────
@@ -547,54 +585,6 @@ export class ZcodeNativeClient {
     }
   }
 
-  // ── session plumbing ───────────────────────────────────────────────────────
-
-  private async ensureSession(): Promise<Client> {
-    if (this.session) return this.session;
-    const client = new Client({ name: "c2c-zcode-native", version: "0.1.0" });
-    const transport = new StreamableHTTPClientTransport(new URL(this.config.url), {
-      requestInit: {
-        headers: { Authorization: `Bearer ${this.config.token}` },
-        // Never follow a redirect away from the configured loopback endpoint.
-        redirect: "manual",
-      },
-    });
-    try {
-      await client.connect(transport);
-      // Prove the peer is really the Z2C control plane via the MCP handshake
-      // (ports are shared by other local services; identity is not inferred
-      // from the port).
-      const version = client.getServerVersion();
-      if (!version || version.name !== ZCODE_NATIVE_EXPECTED_SERVICE) {
-        throw new ZcodeNativeError(
-          "ZCODE_NATIVE_SERVICE_MISMATCH",
-          `expected ${ZCODE_NATIVE_EXPECTED_SERVICE} MCP handshake, got ${version?.name ?? "unknown"}`,
-        );
-      }
-    } catch (err) {
-      this.resetSession();
-      throw err instanceof ZcodeNativeError ? err : this.mapTransportError(err);
-    }
-    this.session = client;
-    return client;
-  }
-
-  private resetSession(): void {
-    const client = this.session;
-    this.session = null;
-    if (client) void client.close().catch(() => {});
-  }
-
-  private mapTransportError(err: unknown): ZcodeNativeError {
-    const message = err instanceof Error ? err.message : String(err);
-    if (/401|unauthorized/i.test(message)) {
-      return new ZcodeNativeError("ZCODE_NATIVE_UNAUTHORIZED", "Z2C rejected the configured bearer token");
-    }
-    if (/timed?\s?out/i.test(message)) {
-      return new ZcodeNativeError("ZCODE_NATIVE_TIMEOUT", `Z2C request timed out: ${message}`);
-    }
-    return new ZcodeNativeError("ZCODE_NATIVE_UNAVAILABLE", `native ZCode control plane unreachable: ${message}`);
-  }
 }
 
 /**
@@ -615,9 +605,12 @@ export class ZcodeNativeClient {
 const ZCODE_NATIVE_COMPATIBILITY_MANIFEST = {
   required: { ...ZCODE_NATIVE_REQUIRED_IDENTITY },
   retired: [
-    { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" },
+    // Start-plan route: revoked by the 2026-09-16 entitlement change.
+    { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3-Flash" },
     { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3" },
-    { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3-Flash" },
+    // Main model: never governed under the Flash-only product policy
+    // (manual/native ZCode use of GLM-5.3 is unaffected).
+    { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" },
   ] as ReadonlyArray<{ provider_id: string; model_id: string }>,
 } as const;
 

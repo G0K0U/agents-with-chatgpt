@@ -248,7 +248,7 @@ describe("persistent per-workspace queue pause", () => {
       workspaceRegistryFile: registryFile,
       sessionRegistryFile: sessionFile,
     });
-    const bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => entry.name === "c2c-bridge")!.id;
+    const bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => ["a2c-bridge", "c2c-bridge"].includes(entry.name))!.id;
     const ownerToken = bridge.authStore.issueTokens({
       clientId: "queue-owner",
       workspaceIds: [workspaceRoot.id, bridgeWorkspaceId],

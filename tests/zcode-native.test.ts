@@ -12,7 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -55,6 +55,10 @@ interface FakeState {
   spoofSubmitWorkspace: string | null;
   outputBody: Record<string, unknown> | null;
   submitCalls: number;
+  dropSubmitResponse: boolean;
+  discoveryOwner: string;
+  observeCalls: number;
+  readZcodeSessionCalls: number;
   resumeCalls: number;
   cancelCalls: number;
   outputCalls: number;
@@ -161,6 +165,7 @@ async function startFakeZ2c(): Promise<void> {
               request_fingerprint: nativeRequestFingerprint(args), replayed: false } } : {}),
           };
           fake.tasks.set(taskKey(workspaceId, taskId), { view });
+          if (fake.dropSubmitResponse) res.destroy();
           return { content: [{ type: "text", text: JSON.stringify(view) }] };
         },
       );
@@ -201,10 +206,43 @@ async function startFakeZ2c(): Promise<void> {
           return { content: [{ type: "text", text: JSON.stringify(fake.outputBody) }] };
         },
       );
-      mcp.registerTool("read_zcode_session", { inputSchema: { workspace_id: z.string(), session_id: z.string() } }, async args => {
-        const view = [...fake.tasks.values()].map(t => t.view).find(v => v.workspace_id === args.workspace_id && v.session_id === args.session_id);
+      mcp.registerTool("zcode_session_observe", { inputSchema: { workspace_id: z.string(), session_id: z.string() } }, async (args) => {
+        fake.observeCalls += 1;
+        const view = [...fake.tasks.values()].map((t) => t.view).find((v) => v.workspace_id === args.workspace_id && v.session_id === args.session_id);
         if (!view) return upstreamError("Z2C_BINDING_UNVERIFIED: session binding unverified for this workspace");
-        return { content: [{ type: "text", text: JSON.stringify({ ...args, canonical_path: process.cwd(), model_binding: { ...(view.model_binding as object), source: "desktop-session-read" }, immediate_resume: "native-session-v1" }) }] };
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              workspace_id: args.workspace_id,
+              session_id: args.session_id,
+              canonical_path: process.cwd(),
+              workspace_path: process.cwd(),
+              controlled_by_z2c: true,
+              runtime_origin: "z2c",
+              model_binding: { ...(view.model_binding as object), source: "desktop-session-read" },
+            }),
+          }],
+        };
+      });
+      mcp.registerTool("zcode_session_discover", { inputSchema: { workspace_id: z.string() } }, async (args) => ({
+        content: [{ type: "text", text: JSON.stringify({
+          sessions: [...fake.tasks.values()]
+            .map((t) => t.view)
+            .filter((view) => view.workspace_id === args.workspace_id && view.session_id)
+            .map((view) => ({
+              session_id: view.session_id,
+              workspace_id: view.workspace_id,
+              workspace_path: process.cwd(),
+              controlled_by_z2c: true,
+              owner_client_id: fake.discoveryOwner,
+              runtime_origin: fake.discoveryOwner === "local" ? "z2c" : "external",
+            })),
+        }) }],
+      }));
+      mcp.registerTool("read_zcode_session", { inputSchema: { workspace_id: z.string(), session_id: z.string() } }, async () => {
+        fake.readZcodeSessionCalls += 1;
+        return upstreamError("OBSOLETE_TOOL: read_zcode_session is retired and must not be called");
       });
       mcp.registerTool(
         "resume_zcode_session",
@@ -250,7 +288,7 @@ async function startFakeZ2c(): Promise<void> {
 
 function healthyFake(): void {
   fake = {
-    serverName: "z2c-bridge",
+    serverName: "z2c-service",
     providerName: ZCODE_NATIVE_REQUIRED_IDENTITY.provider,
     providerStatus: "healthy",
     capsOk: true,
@@ -262,6 +300,10 @@ function healthyFake(): void {
     spoofSubmitWorkspace: null,
     outputBody: null,
     submitCalls: 0,
+    dropSubmitResponse: false,
+    discoveryOwner: "local",
+    observeCalls: 0,
+    readZcodeSessionCalls: 0,
     durableIdempotency: true,
     submitInputs: [],
     resumeCalls: 0,
@@ -283,6 +325,9 @@ function closeFakeServer(srv: Server): Promise<void> {
 }
 
 beforeEach(async () => {
+  // The fake Z2C server uses fixture workspace ids; never rely on an
+  // operator's real forwarding allowlist being present on the test host.
+  vi.stubEnv("ZCODE_NATIVE_ALLOWED_WORKSPACES", `${C2C_WS},${ENGINEERING_AI_WS}`);
   healthyFake();
   await startFakeZ2c();
 });
@@ -294,6 +339,22 @@ afterEach(async () => {
 });
 
 describe("zcode native client (observed identity, namespace, ownership)", () => {
+  it("does not replay accepted submit when the response is lost", async () => {
+    fake.dropSubmitResponse = true;
+    await expect(client().submitTask({ workspace_id: C2C_WS, instruction: "x" }))
+      .rejects.toMatchObject({ code: "ZCODE_NATIVE_OUTCOME_UNKNOWN" });
+    expect(fake.submitCalls).toBe(1);
+    expect(fake.tasks.size).toBe(1);
+  });
+
+  it("rejects foreign discovery before native resume", async () => {
+    const submitted = await client().submitTask({ workspace_id: C2C_WS, instruction: "x" });
+    fake.discoveryOwner = "other-client";
+    await expect(client().resumeSession({ workspace_id: C2C_WS, session_id: submitted.session_id!, instruction: "continue" }))
+      .rejects.toMatchObject({ code: "ZCODE_NATIVE_NOT_ATTESTED" });
+    expect(fake.resumeCalls).toBe(0);
+  });
+
   it("re-establishes the MCP session after an upstream restart with one transport retry", async () => {
     // Simulates Z2C restarting between calls: the first tools/call hits the
     // "Server not initialized" error a fresh upstream process returns for a
@@ -322,7 +383,7 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
             jsonrpc: "2.0", id: body.id ?? null,
             result: {
               protocolVersion: "2025-03-26", capabilities: { tools: {} },
-              serverInfo: { name: "z2c-bridge", version: "0.1.0" },
+              serverInfo: { name: "z2c-service", version: "0.1.0" },
             },
           });
           return;
@@ -447,18 +508,19 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     });
   });
 
-  it("3. attests the CURRENT Desktop plan binding builtin:zai-start-plan (live-observed 2026-09-12)", async () => {
-    fake.modelBinding = { provider_id: "builtin:zai-start-plan", model_id: ZCODE_NATIVE_REQUIRED_IDENTITY.model_id };
+  it("3. attests the governed Flash-only binding builtin:zai-coding-plan/GLM-5.3-Flash (product policy 2026-09-17)", async () => {
+    fake.modelBinding = { provider_id: ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id, model_id: ZCODE_NATIVE_REQUIRED_IDENTITY.model_id };
     fake.submitBinding = { ...fake.modelBinding };
     const status = await client().status(C2C_WS);
     expect(status.start_plan?.attested).toBe(true);
-    expect(status.start_plan?.provider_id).toBe("builtin:zai-start-plan");
+    expect(status.start_plan?.provider_id).toBe("builtin:zai-coding-plan");
+    expect(status.start_plan?.model_id).toBe("GLM-5.3-Flash");
     expect(status.start_plan?.mismatches).toEqual([]);
     const view = await client().submitTask({ workspace_id: C2C_WS, instruction: "x" });
-    expect(view.model_binding).toMatchObject({ provider_id: "builtin:zai-start-plan" });
+    expect(view.model_binding).toMatchObject({ provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3-Flash" });
   });
 
-  it("4. rejects a wrong reported model binding (obsolete GLM-5.3 stays rejected)", async () => {
+  it("4. rejects the main model binding (Flash-only governed policy: no main-model escalation)", async () => {
     fake.modelBinding = { provider_id: ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id, model_id: "GLM-5.3" };
     fake.submitBinding = { ...fake.modelBinding };
     fake.bindingWorkspace = ENGINEERING_AI_WS; // admission passes; the returned binding is wrong
@@ -471,13 +533,12 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     });
   });
 
-  it("4b. rejects the RETIRED identity builtin:zai-coding-plan/GLM-5.3", async () => {
-    fake.modelBinding = { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" };
+  it("4b. rejects the RETIRED start-plan identity builtin:zai-start-plan/GLM-5.3-Flash (unentitled route)", async () => {
+    fake.modelBinding = { provider_id: "builtin:zai-start-plan", model_id: "GLM-5.3-Flash" };
     fake.submitBinding = { ...fake.modelBinding };
     const status = await client().status(C2C_WS);
     expect(status.start_plan?.attested).toBe(false);
-    expect(status.start_plan?.mismatches.join(";")).toContain("provider_id=builtin:zai-coding-plan");
-    expect(status.start_plan?.mismatches.join(";")).toContain("model_id=GLM-5.3");
+    expect(status.start_plan?.mismatches.join(";")).toContain("provider_id=builtin:zai-start-plan");
     await expect(client().submitTask({ workspace_id: C2C_WS, instruction: "x" })).rejects.toMatchObject({
       code: "ZCODE_INCOMPATIBLE_PROVIDER_VERSION",
     });
@@ -600,11 +661,22 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     const input = { workspace_id: C2C_WS, session_id: first.session_id!, instruction: "bounded canary" };
     const observed = await client().readSession(input);
     expect(observed.model_binding.model_id).toBe(ZCODE_NATIVE_REQUIRED_IDENTITY.model_id);
+    expect(fake.observeCalls).toBeGreaterThanOrEqual(1);
+    expect(fake.readZcodeSessionCalls).toBe(0);
     await expect(client().resumeSession({ ...input, expected_workspace_path: tmpdir() })).rejects.toMatchObject({ code: "ZCODE_NATIVE_NAMESPACE_MISMATCH" });
     const view = fake.tasks.get(taskKey(C2C_WS, first.task_id))!.view;
     view.model_binding = { provider_id: "other", model_id: "other" };
     await expect(client().resumeSession(input)).rejects.toMatchObject({ code: "ZCODE_NATIVE_NOT_ATTESTED" });
     expect(fake.resumeCalls).toBe(0);
+    expect(fake.readZcodeSessionCalls).toBe(0);
+  });
+
+  it("regression: read_zcode_session is never called by the native client", async () => {
+    const first = await client().submitTask({ workspace_id: C2C_WS, instruction: "read check" });
+    const observed = await client().readSession({ workspace_id: C2C_WS, session_id: first.session_id! });
+    expect(observed.session_id).toBe(first.session_id);
+    expect(fake.observeCalls).toBeGreaterThan(0);
+    expect(fake.readZcodeSessionCalls).toBe(0);
   });
 
   it("10. resumes an existing native session bound to the same sess_* id", async () => {
@@ -699,7 +771,7 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
     ).rejects.toMatchObject({ code: "ZCODE_NATIVE_NAMESPACE_MISMATCH" });
   });
 
-  it("17. rejects a service that does not present the z2c-bridge handshake", async () => {
+  it("17. rejects a service that does not present the z2c-service handshake", async () => {
     fake.serverName = "quanta-local";
     const status = await client().status(C2C_WS);
     expect(status.available).toBe(false);
@@ -751,8 +823,9 @@ describe("zcode native client (observed identity, namespace, ownership)", () => 
 });
 
 describe("zcode native tool layer (principal authorization + shared gates)", () => {
-  function buildHarness(gate: (ws: string, authInfo: unknown, write: boolean) => void) {
+  function buildHarness(gate: (ws: string, authInfo: unknown, write: boolean) => void, harnessStateDir?: string) {
     const server = new McpServer({ name: "stub-c2c", version: "0.0.0" });
+    const effectiveStateDir = harnessStateDir ?? mkdtempSync(join(tmpdir(), "zcode-native-harness-state-"));
     registerZcodeNativeTools(server, {
       requireScope: () => null,
       resolveWorkspace: (requestedId: string) => {
@@ -761,7 +834,7 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
             code: "WORKSPACE_NOT_AUTHORIZED",
           });
         }
-        return { id: requestedId };
+        return { id: requestedId, root: process.cwd() };
       },
       taskGate: gate,
       nativeAdmissionSnapshot: () => ({ queue: "a".repeat(64), writer: "b".repeat(64) }),
@@ -772,6 +845,7 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
         cancelNative: input => client().cancelTask(input),
         outputNative: input => client().executionOutput(input),
       }),
+      stateDir: effectiveStateDir,
       ok: (data: unknown) => ({ content: [{ type: "text", text: JSON.stringify(data) }] }),
       fail: (code: string, message: string) => ({
         content: [{ type: "text", text: `${code}: ${message}` }],
@@ -784,10 +858,14 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
       },
       untrustedNote: "note",
     });
-    const invoke = async (name: string, args: Record<string, unknown>) => {
+    const invoke = async (
+      name: string,
+      args: Record<string, unknown>,
+      authInfo: unknown = { clientId: "tester", scopes: [] },
+    ) => {
       const tool = (server as unknown as { _registeredTools: Record<string, { handler: (a: unknown, e: unknown) => Promise<{ content: { text: string }[]; isError?: boolean }>; inputSchema: { parse: (a: unknown) => unknown } }> })._registeredTools[name];
       const parsed = tool.inputSchema.parse(args);
-      const result = await tool.handler(parsed, { authInfo: { clientId: "tester", scopes: [] } });
+      const result = await tool.handler(parsed, { authInfo });
       const text = result.content[0]!.text;
       if (result.isError) {
         // Error texts are "<CODE>: <message>" (see the fail/mapError stubs).
@@ -797,7 +875,7 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
       }
       return { ...JSON.parse(text), isError: false };
     };
-    return { invoke };
+    return { invoke, stateDir: effectiveStateDir };
   }
 
   it("MCP self-test uses the governed manager and daemon native client and returns bounded evidence", async () => {
@@ -814,6 +892,9 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
   beforeEach(() => {
     vi.stubEnv("ZCODE_NATIVE_URL", baseUrl);
     vi.stubEnv("ZCODE_NATIVE_TOKEN", TEST_TOKEN);
+    const localAppData = join(tmpdir(), "zcode-native-mcp-harness-empty");
+    rmSync(join(localAppData, "z2c", "security.json"), { force: true });
+    vi.stubEnv("LOCALAPPDATA", localAppData);
     resetZcodeNativeClientForTests();
   });
 
@@ -897,7 +978,7 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
       text:
         "result line\n" +
         'api_key = sk-verysecretvalue123\n' +
-        "see F:\\Users\\peter\\secret\\plan.md for details\n" +
+        "see F:\\Users\\sample-user\\secret\\plan.md for details\n" +
         "G".repeat(20000),
     };
     const out = await invoke("zcode_native_execution_output", {
@@ -908,7 +989,7 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
     expect(out.isError).toBe(false);
     expect(out.text).not.toContain("sk-verysecretvalue123");
     expect(out.text).toContain("[REDACTED]");
-    expect(out.text).not.toContain("F:\\Users\\peter\\secret\\plan.md");
+    expect(out.text).not.toContain("F:\\Users\\sample-user\\secret\\plan.md");
     expect(out.text.length).toBeLessThanOrEqual(16000 + "…[truncated]".length);
     expect(out.task_id).toBe(submitted.task_id);
     expect(out.workspace_id).toBe(C2C_WS);
@@ -932,9 +1013,177 @@ describe("zcode native tool layer (principal authorization + shared gates)", () 
     expect(result.error ?? "").toBe("ZCODE_NATIVE_NAMESPACE_MISMATCH");
     expect(fake.outputCalls).toBe(0);
   });
+
+  it("25. zcode_native_resume_session rejects unowned or foreign Desktop session before mutation", async () => {
+    const { invoke } = buildHarness(() => {});
+    const foreignSessionId = `sess_${randomUUID()}`;
+    const result = await invoke("zcode_native_resume_session", {
+      workspace_id: C2C_WS,
+      session_id: foreignSessionId,
+      instruction: "mutate foreign session",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.error).toBe("ZCODE_SESSION_NOT_OWNED");
+    expect(fake.resumeCalls).toBe(0);
+  });
+
+  it("26. zcode_native_resume_session rejects resume from a different client identity", async () => {
+    const { invoke } = buildHarness(() => {});
+    const submitted = await invoke("zcode_native_submit_task", {
+      workspace_id: C2C_WS,
+      instruction: "client1 task",
+    }, { clientId: "client-1", scopes: [] });
+    expect(submitted.isError).toBe(false);
+
+    const resumed = await invoke("zcode_native_resume_session", {
+      workspace_id: C2C_WS,
+      session_id: submitted.session_id,
+      instruction: "hijack task",
+    }, { clientId: "client-2", scopes: [] });
+    expect(resumed.isError).toBe(true);
+    expect(resumed.error).toBe("ZCODE_SESSION_NOT_OWNED");
+    expect(fake.resumeCalls).toBe(0);
+  });
+
+  it("27. zcode_native_resume_session allows resuming an owned native session", async () => {
+    const { invoke } = buildHarness(() => {});
+    const submitted = await invoke("zcode_native_submit_task", {
+      workspace_id: C2C_WS,
+      instruction: "first task",
+    }, { clientId: "owner-client", scopes: [] });
+    expect(submitted.isError).toBe(false);
+    expect(submitted.session_id).toMatch(/^sess_/);
+
+    const resumed = await invoke("zcode_native_resume_session", {
+      workspace_id: C2C_WS,
+      session_id: submitted.session_id,
+      instruction: "second task",
+    }, { clientId: "owner-client", scopes: [] });
+    expect(resumed.isError).toBe(false);
+    expect(resumed.session_id).toBe(submitted.session_id);
+    expect(fake.resumeCalls).toBe(1);
+  });
 });
 
 describe("zcode native configuration guard", () => {
+  let localAppData: string;
+  let authDir: string;
+  beforeEach(() => {
+    localAppData = mkdtempSync(join(tmpdir(), "zcode-native-auth-"));
+    authDir = join(localAppData, "z2c");
+    mkdirSync(authDir);
+  });
+  afterEach(() => rmSync(localAppData, { recursive: true, force: true }));
+
+  const securityToken = "synthetic-active-secret-0123456789";
+  const legacyToken = "synthetic-legacy-token-0123456789";
+  function writeSecurity(secrets: unknown) {
+    writeFileSync(join(authDir, "security.json"), JSON.stringify({ secrets }));
+  }
+  function writeLegacy() {
+    writeFileSync(join(authDir, "auth.json"), JSON.stringify({ bearerToken: legacyToken }));
+  }
+
+  it("prioritizes explicit auth-file over default security and env token", () => {
+    writeSecurity([{ secret: securityToken }]);
+    writeLegacy();
+    const explicitFile = join(localAppData, "explicit.json");
+    const explicitToken = "synthetic-explicit-token-0123456789";
+    writeFileSync(explicitFile, JSON.stringify({ bearerToken: explicitToken }));
+    expect(
+      loadZcodeNativeConfig({
+        LOCALAPPDATA: localAppData,
+        ZCODE_NATIVE_AUTH_FILE: explicitFile,
+        ZCODE_NATIVE_TOKEN: TEST_TOKEN,
+      }).token,
+    ).toBe(explicitToken);
+    expect(() =>
+      loadZcodeNativeConfig({
+        LOCALAPPDATA: localAppData,
+        ZCODE_NATIVE_AUTH_FILE: join(authDir, "missing.json"),
+        ZCODE_NATIVE_TOKEN: TEST_TOKEN,
+      }),
+    ).toThrow("Z2C auth token not found");
+  });
+
+  it("prioritizes active security.json over stale env token when no explicit auth file", () => {
+    writeSecurity([{ secret: securityToken }]);
+    writeLegacy();
+    expect(
+      loadZcodeNativeConfig({
+        LOCALAPPDATA: localAppData,
+        ZCODE_NATIVE_TOKEN: TEST_TOKEN,
+      }).token,
+    ).toBe(securityToken);
+  });
+
+  it("falls back to env token when security.json is absent", () => {
+    writeLegacy();
+    expect(
+      loadZcodeNativeConfig({
+        LOCALAPPDATA: localAppData,
+        ZCODE_NATIVE_TOKEN: TEST_TOKEN,
+      }).token,
+    ).toBe(TEST_TOKEN);
+  });
+
+  it("uses only the exact explicit legacy auth file even when default security is valid", () => {
+    writeSecurity([{ secret: securityToken }]);
+    writeLegacy();
+    const explicitFile = join(localAppData, "explicit.json");
+    writeFileSync(explicitFile, JSON.stringify({ bearerToken: TEST_TOKEN }));
+    const env = { LOCALAPPDATA: localAppData, ZCODE_NATIVE_AUTH_FILE: explicitFile };
+    expect(loadZcodeNativeConfig(env).token).toBe(TEST_TOKEN);
+    writeFileSync(explicitFile, JSON.stringify({ secrets: [{ secret: securityToken }] }));
+    expect(() => loadZcodeNativeConfig(env)).toThrow("unrecognized Z2C auth file shape");
+    rmSync(explicitFile);
+    expect(() => loadZcodeNativeConfig(env)).toThrow("Z2C auth token not found");
+  });
+
+  it.each([undefined, null])("selects a valid active security secret with retiredAt=%s", (retiredAt) => {
+    writeLegacy();
+    writeSecurity([null, { secret: legacyToken, retiredAt: "2026-01-01" },
+      { secret: "too-short" }, { secret: 123 }, { secret: securityToken, retiredAt }]);
+    expect(loadZcodeNativeConfig({ LOCALAPPDATA: localAppData }).token).toBe(securityToken);
+  });
+
+  it("falls back to default legacy auth when security.json is missing", () => {
+    writeLegacy();
+    expect(loadZcodeNativeConfig({ LOCALAPPDATA: localAppData }).token).toBe(legacyToken);
+  });
+
+  it.each([
+    ["malformed JSON", `{"secrets":${securityToken}`],
+    ["null document", "null"],
+    ["invalid secrets shape", JSON.stringify({ secrets: securityToken })],
+    ["no active entry", JSON.stringify({ secrets: [{ secret: securityToken, retiredAt: "2026-01-01" }] })],
+    ["invalid active entries", JSON.stringify({ secrets: [null, {}, { secret: 123 }, { secret: "short" }] })],
+    ["empty secrets", JSON.stringify({ secrets: [] })],
+  ])("falls back or reports a sanitized legacy error for %s", (_name, raw) => {
+    writeFileSync(join(authDir, "security.json"), raw);
+    const env = { LOCALAPPDATA: localAppData };
+    const expectSanitizedError = (code: string) => {
+      let caught: unknown;
+      try { loadZcodeNativeConfig(env); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(ZcodeNativeError);
+      expect(caught).toMatchObject({ code });
+      expect(String(caught)).not.toContain(securityToken);
+      expect(String(caught)).not.toContain(legacyToken);
+    };
+    expectSanitizedError("ZCODE_NATIVE_UNCONFIGURED");
+    writeLegacy();
+    expect(loadZcodeNativeConfig(env).token).toBe(legacyToken);
+    writeFileSync(join(authDir, "auth.json"), `{"bearerToken":${legacyToken}`);
+    expectSanitizedError("ZCODE_NATIVE_CONFIG");
+  });
+
+  it("does not include the resolved security secret in configuration errors", () => {
+    writeSecurity([{ secret: securityToken }]);
+    const load = () => loadZcodeNativeConfig({ LOCALAPPDATA: localAppData, ZCODE_NATIVE_TIMEOUT_MS: "0" });
+    expect(load).toThrow("ZCODE_NATIVE_TIMEOUT_MS must be 1000..120000");
+    try { load(); } catch (error) { expect(String(error)).not.toContain(securityToken); }
+  });
+
   it("rejects non-loopback endpoints", () => {
     expect(() =>
       loadZcodeNativeConfig({ ZCODE_NATIVE_URL: "http://10.0.0.5:8765/mcp" } as NodeJS.ProcessEnv),

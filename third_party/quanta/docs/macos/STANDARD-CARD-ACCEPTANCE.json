@@ -1,0 +1,254 @@
+{
+  "zh": [
+    {
+      "width": 900,
+      "accounts": 1,
+      "cards": [
+        {
+          "name": "Codex",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "GLM",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "DeepSeek",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Muse",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Antigravity",
+          "height": 478,
+          "content": 660
+        }
+      ]
+    },
+    {
+      "width": 900,
+      "accounts": 3,
+      "cards": [
+        {
+          "name": "Codex",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "GLM",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "DeepSeek",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Muse",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Antigravity",
+          "height": 478,
+          "content": 660
+        }
+      ]
+    },
+    {
+      "width": 360,
+      "accounts": 1,
+      "cards": [
+        {
+          "name": "Codex",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "GLM",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "DeepSeek",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Muse",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Antigravity",
+          "height": 478,
+          "content": 693
+        }
+      ]
+    },
+    {
+      "width": 360,
+      "accounts": 3,
+      "cards": [
+        {
+          "name": "Codex",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "GLM",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "DeepSeek",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Muse",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Antigravity",
+          "height": 478,
+          "content": 693
+        }
+      ]
+    }
+  ],
+  "en": [
+    {
+      "width": 900,
+      "accounts": 1,
+      "cards": [
+        {
+          "name": "Codex",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "GLM",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "DeepSeek",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Muse",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Antigravity",
+          "height": 478,
+          "content": 680
+        }
+      ]
+    },
+    {
+      "width": 900,
+      "accounts": 3,
+      "cards": [
+        {
+          "name": "Codex",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "GLM",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "DeepSeek",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Muse",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Antigravity",
+          "height": 478,
+          "content": 680
+        }
+      ]
+    },
+    {
+      "width": 360,
+      "accounts": 1,
+      "cards": [
+        {
+          "name": "Codex",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "GLM",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "DeepSeek",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Muse",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Antigravity",
+          "height": 478,
+          "content": 753
+        }
+      ]
+    },
+    {
+      "width": 360,
+      "accounts": 3,
+      "cards": [
+        {
+          "name": "Codex",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "GLM",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "DeepSeek",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Muse",
+          "height": 478,
+          "content": 478
+        },
+        {
+          "name": "Antigravity",
+          "height": 478,
+          "content": 753
+        }
+      ]
+    }
+  ]
+}

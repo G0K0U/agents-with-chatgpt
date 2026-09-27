@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<title>Quanta</title><desc>AI 用量，一眼掌握。Layered blue Q, based on the selected A1 concept.</desc>
+<defs>
+ <linearGradient id="tile" x1="0" y1="0" x2="900" y2="1024" gradientUnits="userSpaceOnUse"><stop stop-color="#0753EB"/><stop offset=".42" stop-color="#072C95"/><stop offset="1" stop-color="#071A58"/></linearGradient>
+ <radialGradient id="shade" cx="1" cy=".06" r="1.02"><stop stop-color="#00144C" stop-opacity=".68"/><stop offset="1" stop-color="#00154D" stop-opacity="0"/></radialGradient>
+ <linearGradient id="q" x1="260" y1="220" x2="800" y2="655" gradientUnits="userSpaceOnUse"><stop stop-color="#C2F5FD"/><stop offset=".40" stop-color="#8CDCF9"/><stop offset="1" stop-color="#20A5F5"/></linearGradient>
+ <linearGradient id="right" x1="665" y1="345" x2="810" y2="770" gradientUnits="userSpaceOnUse"><stop stop-color="#0464CF"/><stop offset=".4" stop-color="#048AFA"/><stop offset="1" stop-color="#056FEB"/></linearGradient>
+ <linearGradient id="bottom" x1="190" y1="605" x2="800" y2="892" gradientUnits="userSpaceOnUse"><stop stop-color="#007CDD"/><stop offset=".4" stop-color="#078CF6"/><stop offset="1" stop-color="#08AFE9"/></linearGradient>
+ <path id="shape" d="M 785 726 A 350 350 0 1 0 644 835 L 682 873 H 855 L 648 663 A 202 202 0 1 1 681 621 Z"/>
+ <clipPath id="mark"><use href="#shape"/></clipPath>
+ <clipPath id="tileClip"><rect width="1024" height="1024" rx="183"/></clipPath>
+</defs>
+<g clip-path="url(#tileClip)"><rect width="1024" height="1024" fill="url(#tile)"/><rect width="1024" height="1024" fill="url(#shade)"/></g>
+<use href="#shape" fill="url(#q)"/>
+<g clip-path="url(#mark)">
+ <path d="M 658 378 C 720 429 785 459 859 469 L 947 802 L 783 854 L 638 618 Z" fill="url(#right)"/>
+ <path d="M 144 541 C 211 656 397 774 592 695 C 619 684 636 674 648 663 L 891 895 L 264 999 L 68 672 Z" fill="url(#bottom)"/>
+</g>
+</svg>

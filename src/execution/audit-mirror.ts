@@ -5,6 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { Workspace } from "../workspace/manager.js";
 import { appendExecutionRecord } from "./records.js";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { sharedEnv } from "../config/env.js";
 
 /**
  * The only OneDrive account folder accepted by the Engineering AI mirror,
@@ -12,7 +13,7 @@ import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../co
  * personal institution/account name ships in the product and the mirror
  * resolves no target until configured.
  */
-export const ENGINEERING_AI_ONEDRIVE_FOLDER = process.env.C2C_ONEDRIVE_FOLDER_NAME?.trim() ?? "";
+export const ENGINEERING_AI_ONEDRIVE_FOLDER = sharedEnv("ONEDRIVE_FOLDER_NAME")?.trim() ?? "";
 export const ENGINEERING_AI_AUDIT_STATUS_FILENAME = "engineering-ai-audit-status.md";
 export const ENGINEERING_AI_AUDIT_TIMELINE_FILENAME = "engineering-ai-audit-timeline.md";
 /** Legacy single-target alias retained for existing callers. */
@@ -43,7 +44,7 @@ export const ENGINEERING_AI_AUDIT_LEDGER_RELATIVE_PATH = ENGINEERING_AI_AUDIT_ST
  * ledger/mirror integrations fail closed (disabled) on machines that have
  * not opted in, and no machine-local identity ships in the product.
  */
-export const ENGINEERING_AI_WORKSPACE_ID = process.env.C2C_ENGINEERING_AI_WORKSPACE_ID?.trim() ?? "";
+export const ENGINEERING_AI_WORKSPACE_ID = sharedEnv("ENGINEERING_AI_WORKSPACE_ID")?.trim() ?? "";
 export const AUDIT_MIRROR_SCOPE = "audit_mirror.write";
 export const MAX_AUDIT_STATUS_MIRROR_BYTES = 256 * 1024;
 export const MAX_AUDIT_STATUS_MIRROR_LINES = 2_000;
@@ -410,8 +411,8 @@ export function resolveOneDriveRoot(
   const explicit = [
     configuredRoot,
     environment.ENGINEERING_AI_AUDIT_MIRROR_ROOT,
-    environment.C2C_ENGINEERING_AI_AUDIT_MIRROR_ROOT,
-    environment.C2C_ONEDRIVE_ROOT,
+    sharedEnv("ENGINEERING_AI_AUDIT_MIRROR_ROOT", environment),
+    sharedEnv("ONEDRIVE_ROOT", environment),
   ].find((candidate) => candidate?.trim());
   if (explicit) return canonicalExistingDirectory(explicit);
 

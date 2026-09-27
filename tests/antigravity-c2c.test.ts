@@ -8,6 +8,7 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { AntigravityBackend, projectAntigravityFailure } from "../src/execution/antigravity.js";
 import type { BackendExecutionRequest } from "../src/execution/backend.js";
 import { CodexTaskManager } from "../src/execution/tasks.js";
+import type { VerificationProfile } from "../src/execution/verification.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { Workspace } from "../src/workspace/manager.js";
 
@@ -15,7 +16,6 @@ vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return { ...actual, spawn: vi.fn(), execSync: vi.fn(() => Buffer.from("")) };
 });
-
 const roots: string[] = [];
 const childExits: (number | null)[] = [];
 function fixture(name = "codex-with-chatgpt") {
@@ -46,11 +46,36 @@ async function installContractChild(tool: "shell" | "native-file") {
     expect(argv).toContain("--disable-slash-commands");
     const script = `
       const { sandbox, tool } = JSON.parse(process.argv[1]);
-      if (sandbox && tool === "shell") {
-        process.stderr.write("Administrator privileges are required to set up sandboxing", () => { process.exitCode = 2; });
-      } else {
-        process.stdout.write(JSON.stringify({type:"result", result:{status:"SUCCESS", response:"fixture completed"}})+"\\n");
-      }
+      let input = "";
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", chunk => { input += chunk; });
+      process.stdin.on("end", () => {
+        const lines = input.trim().split(/\\r?\\n/).filter(l => l.trim().length > 0);
+        if (lines.length !== 1) {
+          process.stderr.write("Expected exactly one NDJSON event, got " + lines.length);
+          process.exit(1);
+        }
+        let ev;
+        try {
+          ev = JSON.parse(lines[0]);
+        } catch (err) {
+          process.stderr.write("Invalid JSON: " + err.message);
+          process.exit(1);
+        }
+        if (ev.event !== "user" || !ev.message || typeof ev.message.content !== "string") {
+          process.stderr.write("Invalid user event structure");
+          process.exit(1);
+        }
+        if (!ev.message.content.includes("Review")) {
+          process.stderr.write("Instruction validation failed");
+          process.exit(1);
+        }
+        if (sandbox && tool === "shell") {
+          process.stderr.write("Administrator privileges are required to set up sandboxing", () => { process.exitCode = 2; });
+        } else {
+          process.stdout.write(JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "fixture completed" } }) + "\\n");
+        }
+      });
     `;
     const child = actual.spawn(process.execPath, ["-e", script, JSON.stringify({ sandbox: argv.includes("--sandbox"), tool })], options);
     child.on("close", code => childExits.push(code));
@@ -59,7 +84,7 @@ async function installContractChild(tool: "shell" | "native-file") {
 }
 
 function manualChild() {
-  const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), pid: 0 });
+  const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), pid: 0 });
   vi.mocked(spawn).mockReturnValue(child as unknown as ChildProcess);
   return child;
 }
@@ -97,21 +122,25 @@ describe("G3 Antigravity full-workspace contract", () => {
     }
   });
 
-  it("requires successful session evidence beyond CLI version and rejects empty success", async () => {
+  it("reports on-demand callable without a live process; only real task evidence degrades; rejects empty success", async () => {
     const { backend, request } = fixture();
     vi.mocked(execSync).mockReturnValue(Buffer.from("1.2.3"));
-    expect(await backend.getProviderStatus()).toMatchObject({ status: "DEGRADED", cliInstalled: true, cliVersion: "1.2.3", providerReachable: false });
+    // On-demand truth: zero active sessions is NORMAL, never degraded (G3).
+    expect(await backend.getProviderStatus()).toMatchObject({ status: "AVAILABLE", readiness: "READY_ON_DEMAND", cliInstalled: true, cliVersion: "1.2.3", providerReachable: true, activeSessionsCount: 0 });
     let child = manualChild();
     let pending = backend.execute(request);
     child.emit("close", 0);
     expect(await pending).toMatchObject({ status: "failed", actualProvider: null });
-    expect((await backend.getProviderStatus()).providerReachable).toBe(false);
+    // The failed real attempt is durable evidence of a non-callable lane.
+    const degraded = await backend.getProviderStatus();
+    expect(degraded).toMatchObject({ status: "DEGRADED", readiness: "FAILED", providerReachable: false });
+    expect(degraded.notCallableReason).toMatch(/failed/i);
     child = manualChild();
     pending = backend.execute(request);
     child.stdout.write(JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "ok" } }) + "\n");
     child.emit("close", 0);
     expect((await pending).status).toBe("completed");
-    expect(await backend.getProviderStatus()).toMatchObject({ status: "AVAILABLE", providerReachable: true });
+    expect(await backend.getProviderStatus()).toMatchObject({ status: "AVAILABLE", readiness: "READY_ON_DEMAND", providerReachable: true });
     vi.mocked(execSync).mockReturnValue(Buffer.from(process.execPath));
     const status = await backend.getProviderStatus();
     expect(status.cliVersion).toBeNull();
@@ -153,7 +182,6 @@ describe("G3 Antigravity full-workspace contract", () => {
 
   it("C2C manager submits provider=gemini with the full workspace to the real backend contract", async () => {
     const { backend, root, parent } = fixture();
-    vi.stubEnv("C2C_ORCHESTRATOR", "legacy");
     await installContractChild("shell");
     const execute = vi.spyOn(backend, "execute");
     const codexFactory = vi.fn(() => { throw new Error("Provider fallback is forbidden"); });
@@ -170,11 +198,262 @@ describe("G3 Antigravity full-workspace contract", () => {
         await new Promise(resolve => setTimeout(resolve, 20));
         result = manager.get(submitted.taskId);
       }
+      expect(result.status, `task failed: ${JSON.stringify(result.error)}`).toBe("completed");
       expect(result).toMatchObject({ status: "completed", provider: "gemini" });
       expect(execute).toHaveBeenCalledOnce();
       expect(execute.mock.calls[0][0]).toMatchObject({ workspaceRoot: root, writableRoots: [root], fullAccess: true, networkEffective: true });
       expect(codexFactory).not.toHaveBeenCalled();
       expect(childExits).toEqual([0]);
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it.each([
+    { exitCode: 0, expectedStatus: "completed", expectedVerificationStatus: "passed", stdout: "verifier passed\n" },
+    { exitCode: 1, expectedStatus: "failed", expectedVerificationStatus: "failed", stdout: "verifier failed\n" },
+  ])("executes trusted verification exactly once for successful gemini turn with run_tests=true (exitCode: $exitCode)", async ({ exitCode, expectedStatus, expectedVerificationStatus, stdout }) => {
+    const { backend, root, parent } = fixture();
+    vi.spyOn(backend, "execute").mockResolvedValue({
+      status: "completed",
+      provider: "gemini",
+      providerRuntime: "antigravity-cli",
+      providerModel: "gemini-3.8-flash-high",
+      actualProvider: "antigravity",
+      actualModel: "gemini-3.8-flash-high",
+      changedFiles: [],
+      output: JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "fixture completed" } }),
+    } as any);
+
+    const execRequests: any[] = [];
+    let appServerClosed = false;
+    const fakeClient = {
+      initialize: vi.fn(async () => {}),
+      request: vi.fn(async (method: string, params: any) => {
+        if (method === "command/exec") {
+          execRequests.push(params);
+          return { exitCode, stdout, stderr: "" };
+        }
+        throw new Error(`Unexpected AppServer method: ${method}`);
+      }),
+      setNotificationHandler: vi.fn(),
+      setRequestHandler: vi.fn(),
+      close: vi.fn(async () => {
+        appServerClosed = true;
+      }),
+    };
+    const codexFactory = vi.fn((opts) => {
+      expect(opts.networkAccess).toBe(false);
+      return fakeClient as any;
+    });
+
+    const workspace = new Workspace(root);
+    const trustedProfile: VerificationProfile = {
+      id: "trusted-verifier",
+      workspaceId: workspace.id,
+      executable: "node",
+      argv: ["--version"],
+      cwd: "workspace",
+      timeoutMs: 5_000,
+      network: false,
+      sandbox: "readOnly",
+      summaryKind: "generic",
+    };
+
+    const manager = new CodexTaskManager(workspace, {
+      stateDir: path.join(parent, "manager-state"),
+      fullAccess: true,
+      antigravityBackend: backend,
+      appServerFactory: codexFactory,
+      verificationProfileResolver: () => trustedProfile,
+    });
+
+    try {
+      const submitted = manager.submit({
+        workspace_id: workspace.id,
+        provider: "gemini",
+        model: "gemini-3.8-flash-high",
+        instruction: "Implement feature and verify",
+        write_scope: [root],
+        network: true,
+        run_tests: true,
+      });
+
+      let result = manager.get(submitted.taskId);
+      for (let i = 0; i < 200 && ["queued", "running"].includes(result.status); i++) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        result = manager.get(submitted.taskId);
+      }
+
+      expect(result.status).toBe(expectedStatus);
+      expect(result.provider).toBe("gemini");
+      expect(execRequests).toHaveLength(1);
+      expect(execRequests[0]).toMatchObject({
+        command: ["node", "--version"],
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
+      });
+      expect(codexFactory).toHaveBeenCalledTimes(1);
+      expect(appServerClosed).toBe(true);
+      expect(result.verification).toMatchObject({
+        status: expectedVerificationStatus,
+        exitCode,
+        network: false,
+        profileId: "trusted-verifier",
+      });
+      if (exitCode === 0) {
+        expect(result.tests).toBe("verification passed");
+        expect(result.exitStatus).toBe("ok");
+      } else {
+        expect(result.error?.code).toBe("VERIFICATION_EXECUTION_FAILED");
+        expect(result.exitStatus).toBe("failed");
+      }
+      expect(result.actionEvidence).toMatchObject({
+        turnCompleted: true,
+      });
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it("fails with VERIFICATION_TIMEOUT when gemini verification exceeds timeout", async () => {
+    const { backend, root, parent } = fixture();
+    vi.spyOn(backend, "execute").mockResolvedValue({
+      status: "completed",
+      provider: "gemini",
+      providerRuntime: "antigravity-cli",
+      providerModel: "gemini-3.8-flash-high",
+      actualProvider: "antigravity",
+      actualModel: "gemini-3.8-flash-high",
+      changedFiles: [],
+      output: JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "fixture completed" } }),
+    } as any);
+
+    const fakeClient = {
+      initialize: vi.fn(async () => {}),
+      request: vi.fn(async (method: string) => {
+        if (method === "command/exec") {
+          return new Promise(() => {}); // never resolves
+        }
+        throw new Error(`Unexpected AppServer method: ${method}`);
+      }),
+      setNotificationHandler: vi.fn(),
+      setRequestHandler: vi.fn(),
+      close: vi.fn(async () => {}),
+    };
+    const codexFactory = vi.fn(() => fakeClient as any);
+
+    const workspace = new Workspace(root);
+    const trustedProfile: VerificationProfile = {
+      id: "trusted-verifier",
+      workspaceId: workspace.id,
+      executable: "node",
+      argv: ["--version"],
+      cwd: "workspace",
+      timeoutMs: 1_000,
+      network: false,
+      sandbox: "readOnly",
+      summaryKind: "generic",
+    };
+
+    const manager = new CodexTaskManager(workspace, {
+      stateDir: path.join(parent, "manager-state"),
+      fullAccess: true,
+      antigravityBackend: backend,
+      appServerFactory: codexFactory,
+      verificationProfileResolver: () => trustedProfile,
+      verificationTimeoutMs: 100,
+    });
+
+    try {
+      const submitted = manager.submit({
+        workspace_id: workspace.id,
+        provider: "gemini",
+        model: "gemini-3.8-flash-high",
+        instruction: "Implement feature and verify",
+        write_scope: [root],
+        network: true,
+        run_tests: true,
+      });
+
+      let result = manager.get(submitted.taskId);
+      for (let i = 0; i < 200 && ["queued", "running"].includes(result.status); i++) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        result = manager.get(submitted.taskId);
+      }
+
+      expect(result.status).toBe("failed");
+      expect(result.exitStatus).toBe("timeout");
+      expect(result.error?.code).toBe("VERIFICATION_TIMEOUT");
+      expect(result.verification).toMatchObject({
+        status: "timed_out",
+        network: false,
+      });
+      expect(result.tests).toBe("verification timed out");
+    } finally {
+      await manager.close();
+    }
+  });
+
+  it("does not execute verification when gemini turn fails", async () => {
+    const { backend, root, parent } = fixture();
+    vi.spyOn(backend, "execute").mockResolvedValue({
+      status: "failed",
+      provider: "gemini",
+      providerRuntime: "antigravity-cli",
+      providerModel: "gemini-3.8-flash-high",
+      actualProvider: null,
+      actualModel: "UNKNOWN",
+      changedFiles: [],
+      error: { code: "ANTIGRAVITY_SESSION_START_FAILED", message: "Gemini execution failed" },
+      output: "",
+    } as any);
+
+    const codexFactory = vi.fn(() => {
+      throw new Error("Codex factory should not be called when gemini turn fails");
+    });
+
+    const workspace = new Workspace(root);
+    const trustedProfile: VerificationProfile = {
+      id: "trusted-verifier",
+      workspaceId: workspace.id,
+      executable: "node",
+      argv: ["--version"],
+      cwd: "workspace",
+      timeoutMs: 5_000,
+      network: false,
+      sandbox: "readOnly",
+      summaryKind: "generic",
+    };
+
+    const manager = new CodexTaskManager(workspace, {
+      stateDir: path.join(parent, "manager-state"),
+      fullAccess: true,
+      antigravityBackend: backend,
+      appServerFactory: codexFactory,
+      verificationProfileResolver: () => trustedProfile,
+    });
+
+    try {
+      const submitted = manager.submit({
+        workspace_id: workspace.id,
+        provider: "gemini",
+        model: "gemini-3.8-flash-high",
+        instruction: "Implement feature and verify",
+        write_scope: [root],
+        network: true,
+        run_tests: true,
+      });
+
+      let result = manager.get(submitted.taskId);
+      for (let i = 0; i < 200 && ["queued", "running"].includes(result.status); i++) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        result = manager.get(submitted.taskId);
+      }
+
+      expect(result.status).toBe("failed");
+      expect(result.error?.code).toBe("ANTIGRAVITY_SESSION_START_FAILED");
+      expect(codexFactory).not.toHaveBeenCalled();
+      expect(result.verification).toBeNull();
     } finally {
       await manager.close();
     }
@@ -430,5 +709,161 @@ describe("owner full-access permission contract", () => {
     expect(result.status).toBe(fullAccess ? "completed" : "failed");
     if (!fullAccess) expect(result.error?.code).toBe("WRITE_SCOPE_VIOLATION");
     expect(fs.readFileSync(target, "utf8")).toBe("before-after");
+  });
+});
+
+describe("AGY stream-input bootstrap lifecycle and regression safety", () => {
+  it("regression: absent or null child.stdin fails closed with ANTIGRAVITY_SESSION_START_FAILED", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    (child as any).stdin = null;
+    const pending = backend.execute(request);
+    child.emit("close", 1);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("ANTIGRAVITY_SESSION_START_FAILED");
+  });
+
+  it("regression: stdin write error before init causes bounded safe failure without leaking diagnostics", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const pending = backend.execute(request);
+    child.stdin.emit("error", new Error("EPIPE secret-path-token"));
+    child.emit("close", 1);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("ANTIGRAVITY_SESSION_START_FAILED");
+    expect(JSON.stringify(result)).not.toContain("secret-path-token");
+  });
+
+  it("regression: stdin write error after init fails closed and session id alone is not ignored", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const pending = backend.execute(request);
+    child.stdout.write(JSON.stringify({ event: "init", conversation_id: "conv-session-123" }) + "\n");
+    child.stdin.emit("error", new Error("EPIPE after init secret-data"));
+    child.emit("close", 1);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("ANTIGRAVITY_SESSION_START_FAILED");
+    expect(JSON.stringify(result)).not.toContain("secret-data");
+  });
+
+  it("regression: writes exactly one user event and closes stdin (EOF)", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const receivedChunks: string[] = [];
+    let stdinEnded = false;
+    child.stdin.setEncoding("utf8");
+    child.stdin.on("data", (chunk: string) => {
+      receivedChunks.push(chunk);
+    });
+    child.stdin.on("end", () => {
+      stdinEnded = true;
+      child.stdout.write(JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "done" } }) + "\n");
+      child.emit("close", 0);
+    });
+    const result = await backend.execute(request);
+    expect(result.status).toBe("completed");
+    expect(stdinEnded).toBe(true);
+    const fullInput = receivedChunks.join("");
+    const lines = fullInput.trim().split(/\r?\n/).filter(l => l.trim().length > 0);
+    expect(lines.length).toBe(1);
+    const parsed = JSON.parse(lines[0]);
+    expect(parsed).toEqual({
+      event: "user",
+      message: { content: request.instruction },
+    });
+  });
+
+  it("regression: retains continuation argv and stream-json flags when resuming conversation", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const pending = backend.execute({ ...request, providerSessionId: "session-continuation-789" });
+    child.stdout.write(JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "resumed" } }) + "\n");
+    child.emit("close", 0);
+    const result = await pending;
+    expect(result.status).toBe("completed");
+    expect(spawn).toHaveBeenCalledTimes(1);
+    const spawnArgs = vi.mocked(spawn).mock.calls[0][1] as string[];
+    expect(spawnArgs).toContain("--conversation");
+    expect(spawnArgs[spawnArgs.indexOf("--conversation") + 1]).toBe("session-continuation-789");
+    expect(spawnArgs).toContain("--input-format");
+    expect(spawnArgs[spawnArgs.indexOf("--input-format") + 1]).toBe("stream-json");
+    expect(spawnArgs).toContain("--output-format");
+    expect(spawnArgs[spawnArgs.indexOf("--output-format") + 1]).toBe("stream-json");
+  });
+
+  it("regression: late stdin error after result is absorbed safely without failing task", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const pending = backend.execute(request);
+    child.stdout.write(JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "all good" } }) + "\n");
+    child.stdin.emit("error", new Error("Late EPIPE"));
+    child.emit("close", 0);
+    const result = await pending;
+    expect(result.status).toBe("completed");
+    expect(result.output).toBe("all good");
+  });
+
+  it("regression: unknown terminal status fails closed rather than invent success", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const pending = backend.execute(request);
+    child.stdout.write(JSON.stringify({ type: "result", result: { status: "MYSTERY_STATUS" } }) + "\n");
+    child.emit("close", 0);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("ANTIGRAVITY_EXECUTION_ERROR");
+    expect(result.error?.message).toBe("Antigravity task reported unknown terminal status");
+  });
+
+  it("regression: unknown terminal status does not leak malicious long status string or secrets", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const pending = backend.execute(request);
+    const maliciousStatus = "SECRET_TOKEN_" + "A".repeat(5000) + "_CONFIDENTIAL_KEY_12345";
+    child.stdout.write(JSON.stringify({ type: "result", result: { status: maliciousStatus } }) + "\n");
+    child.emit("close", 0);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("ANTIGRAVITY_EXECUTION_ERROR");
+    expect(result.error?.message).toBe("Antigravity task reported unknown terminal status");
+    expect(JSON.stringify(result)).not.toContain("SECRET_TOKEN");
+    expect(JSON.stringify(result)).not.toContain("CONFIDENTIAL_KEY");
+    expect(JSON.stringify(result)).not.toContain("AAAA");
+  });
+
+  it("regression: late stdin error after close for failed/no-result process does not re-terminate PID or mutate result", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const terminateSpy = vi.spyOn(backend as any, "terminateProcess");
+    const pending = backend.execute(request);
+    child.emit("close", 1);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("ANTIGRAVITY_SESSION_START_FAILED");
+    const terminateCalls = terminateSpy.mock.calls.length;
+
+    // Multiple late stdin error events after child close
+    child.stdin.emit("error", new Error("Late EPIPE 1"));
+    child.stdin.emit("error", new Error("Late EPIPE 2"));
+
+    // No throw, no additional terminateProcess calls, no mutation of result
+    expect(terminateSpy).toHaveBeenCalledTimes(terminateCalls);
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("ANTIGRAVITY_SESSION_START_FAILED");
+  });
+
+  it("regression: asynchronous spawn error safely handled with SPAWN_FAILED", async () => {
+    const { backend, request } = fixture();
+    const child = manualChild();
+    const pending = backend.execute(request);
+    child.emit("error", new Error("spawn ENOENT confidential-path"));
+    child.emit("close", -1);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("SPAWN_FAILED");
+    expect(JSON.stringify(result)).not.toContain("confidential-path");
   });
 });

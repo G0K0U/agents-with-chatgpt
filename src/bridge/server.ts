@@ -1,6 +1,6 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import type { Server } from "node:http";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,11 +13,11 @@ import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { CodexTaskManagerPool } from "../execution/pool.js";
+import { ModelCatalogService } from "../execution/model-catalog.js";
+import { zcodeSessionClient } from "../mcp/zcode-session-tools.js";
 import { EngineeringAiAuditMaintainer } from "../execution/audit-maintenance.js";
 import { startZcodeCoordinatorFromEnvironment, type ZcodeCoordinator } from "../execution/zcode-coordinator.js";
 import { installApprovedManifest, manifestSchema } from "../execution/continuation.js";
-import { executionOrchestrator, type ExecutionOrchestrator } from "../execution/orchestrator.js";
-import type { OmnigentBackendOptions } from "../execution/omnigent.js";
 import { C2CSessionRegistry } from "../session/registry.js";
 import type { AppServerFactory } from "../execution/app-server.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
@@ -39,7 +39,7 @@ import {
 } from "./state-owner.js";
 import type { BridgeProcessInspector } from "./runtime.js";
 
-function tunnelForWorkspace(workspaceId: string, logger: Logger, stateDir: string): TunnelProvider {
+function tunnelForWorkspace(workspaceId: string, logger: Logger, stateDir: string, expectedReleaseId?: string): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId, stateDir));
   if (binding) {
     return new CloudflaredNamedTunnel({
@@ -47,8 +47,10 @@ function tunnelForWorkspace(workspaceId: string, logger: Logger, stateDir: strin
       tunnelName: binding.tunnelName,
       tunnelId: binding.tunnelId,
       hostname: binding.hostname,
+      management: binding.management,
       logger,
       stateDir,
+      expectedReleaseId,
     });
   }
   return new CloudflaredQuickTunnel(logger);
@@ -71,9 +73,6 @@ export interface BridgeOptions {
   accessTokenTtlMs?: number;
   /** Test seam; production uses the fixed official `codex app-server --stdio` client. */
   appServerFactory?: AppServerFactory;
-  /** Local-only orchestration configuration; absent keeps legacy behavior. */
-  orchestrator?: ExecutionOrchestrator;
-  omnigent?: Omit<OmnigentBackendOptions, "stateDir">;
   /** Local full filesystem/process deployment; it is also the capability that may authorize task network opt-in. */
   fullAccess?: boolean;
   /** Local-only configured root of the named OneDrive account used by the fixed audit mirror. */
@@ -93,6 +92,8 @@ export interface BridgeOptions {
   auditMaintainer?: EngineeringAiAuditMaintainer;
   /** Start the C2C-owned ZCode scheduled-queue coordinator (default: enabled). */
   zcodeCoordinator?: boolean;
+  /** Test seam; production constructs the live catalog over real backends. */
+  modelCatalog?: ModelCatalogService;
 }
 
 export interface Bridge {
@@ -108,6 +109,7 @@ export interface Bridge {
   authStore: AuthStore;
   pairing: PairingManager;
   tunnel: TunnelProvider;
+  instanceId: string;
   getPublicBaseUrl(): string | null;
   localBaseUrl(): string;
   close(): Promise<void>;
@@ -151,13 +153,13 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   const bridgeRoot = new Workspace(BRIDGE_REPOSITORY_ROOT);
   const bootstrapEntries = [
     {
-      name: workspace.id === bridgeRoot.id ? "c2c-bridge" : workspace.name,
+      name: workspace.id === bridgeRoot.id ? "a2c-bridge" : workspace.name,
       canonicalPath: workspace.root,
       id: workspace.id,
     },
   ];
   if (bridgeRoot.id !== workspace.id) {
-    bootstrapEntries.push({ name: "c2c-bridge", canonicalPath: bridgeRoot.root, id: bridgeRoot.id });
+    bootstrapEntries.push({ name: "a2c-bridge", canonicalPath: bridgeRoot.root, id: bridgeRoot.id });
   }
   registry.bootstrap(bootstrapEntries);
   const authorizedWorkspaceIds = registry.enabledIds().filter((workspaceId) => {
@@ -201,7 +203,16 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     writeAuthStatePointer(stateOwner);
   }
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
-  const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger, stateDir);
+  // Resolve the executing build before binding a public route, so external
+  // observation can prove that both sides serve this exact release.
+  let runtimeIdentity: RuntimeIdentity | null = null;
+  try {
+    runtimeIdentity = resolveRuntimeIdentity({ runtimeDir: currentRuntimeDir() });
+  } catch (error) {
+    logger.warn(`Runtime identity resolution failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const tunnel = opts.tunnelProvider ?? tunnelForWorkspace(workspace.id, logger, stateDir, runtimeIdentity?.releaseId ?? undefined);
+  const instanceId = randomUUID();
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
   const sessions = new C2CSessionRegistry({ file: opts.sessionRegistryFile, stateDir });
 
@@ -224,15 +235,24 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     }
   }
 
+  // Live account-scoped model catalog shared by the whole bridge lifetime.
+  // Reuses the loopback Z2C semantic transport for the zcode section; the
+  // codex/agy sections use the same executables and auth paths as execution.
+  const modelCatalog = opts.modelCatalog ?? new ModelCatalogService({
+    logger,
+    workspaceRoot: bridgeRoot.root,
+    stateDir,
+    zcodeModelCatalog: () => zcodeSessionClient().modelCatalog(),
+  });
+
   const taskManagers = new CodexTaskManagerPool(registry, sessions, {
     logger,
     stateDir,
     appServerFactory: opts.appServerFactory,
-    orchestrator: executionOrchestrator(opts.orchestrator),
-    omnigent: opts.omnigent,
     bridgeWorkspaceId: bridgeRoot.id,
     fullAccess: opts.fullAccess,
     maxQueueSize: opts.maxQueueSize,
+    modelCatalog,
     onTaskLifecycleEvent: (event) => {
       auditMaintainer?.notifyEvent(event);
     },
@@ -299,14 +319,6 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   // Deterministic runtime identity: which source tree produced the code this
   // process is executing, and whether that code still matches the trees on
   // disk. Computed once at startup; surfaces drift instead of hiding it.
-  let runtimeIdentity: RuntimeIdentity | null = null;
-  try {
-    runtimeIdentity = resolveRuntimeIdentity({ runtimeDir: currentRuntimeDir() });
-  } catch (error) {
-    logger.warn(
-      `Runtime identity resolution failed: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
   const releaseSummary = runtimeIdentity?.manifest
     ? {
         version: runtimeIdentity.manifest.version,
@@ -332,9 +344,11 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   // ---- Health (public but minimal) ---------------------------------------
 
   app.get("/health", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
     res.json({
       service: SERVICE_NAME,
       version: VERSION,
+      instanceId,
       workspaceId: workspace.id,
       workspaceCount: authorizedWorkspaceIds.length,
       status: "ok",
@@ -369,6 +383,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
       authorizedWorkspaceIds,
       fullAccess: opts.fullAccess,
       oneDriveRoot: opts.oneDriveRoot,
+      modelCatalog,
     }),
     logger
   );
@@ -427,10 +442,17 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     } catch { res.status(400).json({ message: "Continuation approval or local verification failed; inspect protected evidence" }); }
   });
 
-  app.get("/admin/info", adminGuard, (_req, res) => {
+  app.get("/admin/info", adminGuard, async (req, res) => {
+    // Explicitly requested local-admin observation refresh. The external
+    // provider's doctor only probes the fixed route and current loopback
+    // origin; it never starts or takes ownership of cloudflared.
+    if (req.query.observe === "1" && tunnel.status().management === "external") {
+      await tunnel.doctor(port).catch(() => undefined);
+    }
     res.json({
       service: SERVICE_NAME,
       version: VERSION,
+      instanceId,
       workspaceId: workspace.id,
       workspaceName: workspace.name,
       workspaceRoot: workspace.root,
@@ -586,6 +608,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     authStore,
     pairing,
     tunnel,
+    instanceId,
     getPublicBaseUrl: () => publicBaseUrl,
     localBaseUrl: () => `http://${host}:${port}`,
     close: shutdown,
