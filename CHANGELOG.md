@@ -7,6 +7,9 @@ pre-1.0 releases with a minor bump per feature release; tags follow `vX.Y.Z`.
 
 ### Release closure fixes (2026-09-27)
 
+- Installation now requires Node.js 22 or newer, matching the pinned pnpm 11
+  toolchain. CI verifies the Windows release source on Node 22 and 24 with a
+  canonical temporary directory.
 - Codex catalog and task execution now resolve the same persisted runtime
   override, including when task setup supplies a partial environment. The
   historical GPT-6 Sol/max rejection came from different Codex executable
@@ -29,7 +32,7 @@ pre-1.0 releases with a minor bump per feature release; tags follow `vX.Y.Z`.
 
 - **One-command local deployment for a fresh clone.**
   `node scripts\deploy.mjs` (Windows) / `node scripts/deploy.mjs` (macOS/Linux)
-  checks prerequisites (Node.js ≥ 20, git, pnpm via corepack), installs
+  checks prerequisites (Node.js ≥ 22, git, pnpm via corepack), installs
   dependencies, builds, builds the optional in-repo Z2C companion when
   present, then hands off to the new `a2c deploy` command. The flow is
   idempotent — re-running it is always safe.

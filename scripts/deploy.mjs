@@ -6,7 +6,7 @@
  *   POSIX:    node scripts/deploy.mjs
  *
  * What it does (idempotent — safe to re-run at any time):
- *   1. checks prerequisites (Node.js >= 20, git, pnpm via corepack)
+ *   1. checks prerequisites (Node.js >= 22, git, pnpm via corepack)
  *   2. installs dependencies (pnpm install --frozen-lockfile)
  *   3. builds (pnpm build)
  *   4. installs and builds the bundled Z2C companion
@@ -64,7 +64,7 @@ const skipBuild = args.includes("--skip-build");
 const steps = [];
 const startedAt = Date.now();
 
-step("node >= 20", checkNode(), `found Node.js ${process.versions.node}; install the LTS from https://nodejs.org and re-run`);
+step("node >= 22", checkNode(), `found Node.js ${process.versions.node}; install the LTS from https://nodejs.org and re-run`);
 step("git on PATH", commandWorks("git", ["--version"]), "git not found — needed for update/redeploy (https://git-scm.com)");
 const pnpm = resolvePnpm();
 step("pnpm available", Boolean(pnpm.command), pnpm.detail);
@@ -128,7 +128,7 @@ function run(command, args_, prefix, label, cwd = repoRoot) {
 
 function checkNode() {
   const major = parseInt(process.versions.node.split(".")[0], 10);
-  return major >= 20;
+  return major >= 22;
 }
 
 function commandWorks(command, args_) {

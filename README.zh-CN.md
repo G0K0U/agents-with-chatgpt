@@ -66,7 +66,7 @@ ChatGPT 通过 OAuth MCP 连接按需读取代码，并通过本地、经过身�
 
 | 组件 | 是否由 C2C 安装器安装 | 说明 |
 |---|---|---|
-| Node.js ≥ 20、Git、pnpm | 是（winget / corepack，用户级） | |
+| Node.js ≥ 22、Git、pnpm | 是（winget / corepack，用户级） | |
 | Codex CLI + 登录 | 否——自行安装并登录 | 检测到即激活 |
 | Antigravity (AGY) CLI | 否——自行安装并登录 | `%LOCALAPPDATA%\agy\bin` |
 | ZCode Desktop + Z.AI 订阅 | 否——自行安装并登录 | GLM Flash 通道 |
@@ -84,7 +84,7 @@ node scripts\deploy.mjs
 ```
 
 macOS / Linux 使用 `node scripts/deploy.mjs`。该命令**可重复执行**（幂等），
-自动完成所有本地步骤：前置检查（Node.js ≥ 20、git、经 corepack 的 pnpm）、
+自动完成所有本地步骤：前置检查（Node.js ≥ 22、git、经 corepack 的 pnpm）、
 安装依赖、构建（含可选的内置 Z2C 伴随组件）、初始化安全本地状态、启动本地
 Bridge 并做健康验证（本地 MCP 未带令牌时必须返回 401，证明 OAuth 生效），
 最后打印简明的成功摘要和下一步动作。常用参数：`--workspace <path>` 为某个
@@ -131,7 +131,7 @@ Agent（Codex），然后去倒杯咖啡：
 请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
 所有事情你自己做：
 
-1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
+1. 环境自检：需要 git 和 Node.js ≥ 22，缺什么就自动安装
   （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
 2. 下载：把 https://github.com/G0K0U/agents-with-chatgpt 克隆到
    ~/codex-with-chatgpt（已存在就 git pull 更新）。
@@ -245,7 +245,7 @@ c2c sandbox-allow   # 把设置目录加入 Codex 白名单
 c2c status / doctor / pair / unpair / logs / stop
 ```
 
-要求：Node.js >= 20、git；公网连接需要 `cloudflared`（自动检测）。
+要求：Node.js >= 22、git；公网连接需要 `cloudflared`（自动检测）。
 
 文档：[架构](docs/architecture.md) · [协议](docs/protocol.md) ·
 [安全](docs/security.md) · [故障排查](docs/troubleshooting.md)

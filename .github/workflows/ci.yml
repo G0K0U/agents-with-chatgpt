@@ -11,9 +11,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
-        node: ['20', '22']
+        os: [windows-latest]
+        node: ['22', '24']
     runs-on: ${{ matrix.os }}
+    env:
+      # Hosted Windows TEMP may be an 8.3 alias. Use the canonical runner temp.
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

@@ -1,7 +1,7 @@
 # Local release and operations
 
 This guide describes the current A2C and bundled Z2C source distribution.
-Node.js 20 or newer, pnpm 11.24.0 (A2C), and npm 11.17.0 (Z2C) are used by
+Node.js 22 or newer, pnpm 11.24.0 (A2C), and npm 11.17.0 (Z2C) are used by
 the recorded Windows candidate gate. The lockfiles are required for repeatable
 installation. ZCode, Codex, AGY, and their account logins are separate user
 prerequisites; the installer does not modify their installations or sessions.

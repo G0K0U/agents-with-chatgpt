@@ -683,7 +683,7 @@ program
 
     // Node
     const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
-    report.node = { ok: nodeMajor >= 20, detail: `v${process.versions.node}` };
+    report.node = { ok: nodeMajor >= 22, detail: `v${process.versions.node}` };
 
     // Codex sandbox writable_roots (so later chats do not need elevation)
     if (opts.fix) {

@@ -94,7 +94,7 @@ or deploy with `--autostart`. The logon task runs the LKG-aware supervisor
 ```powershell
 pnpm typecheck
 pnpm build
-pnpm test                            # full suite; CI runs Windows + Ubuntu, Node 20/22
+pnpm test                            # full suite; CI runs Windows, Node 22/24
 ```
 
 Focused: `pnpm exec vitest run tests/deploy.test.ts tests/release-lifecycle.test.ts`.
@@ -107,7 +107,7 @@ is only expected after the human completes the tunnel step. See
 
 ## Repo conventions
 
-- Package manager: pnpm (corepack-pinned). Node >= 20. TypeScript, ESM,
+- Package manager: pnpm (corepack-pinned). Node >= 22. TypeScript, ESM,
   vitest; tests import `../src/...` directly and use `tests/helpers.ts`
   fixtures (`makeTmpDir`, `isolateStateDir`, `makeGitRepo`).
 - Releases: branch `release/vX.Y.Z`, tag `vX.Y.Z`, `CHANGELOG.md` entry, and a

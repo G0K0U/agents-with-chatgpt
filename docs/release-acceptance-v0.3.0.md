@@ -1,8 +1,9 @@
 # Release acceptance — v0.3.0
 
-This record covers the frozen v0.3.0 source candidate. The support matrix
-defines the tested platforms and provider scope. Operational deployment and
-GitHub publication are separate gates, recorded in the release report and PR.
+This record covers the v0.3.0 source and the earlier exact-build canary.
+CI remediation changes the emitted tree; the final build and live canary
+identities are recorded in the release notes. The support matrix defines the
+tested platforms and provider scope.
 
 ## Source and real execution evidence
 
@@ -13,7 +14,7 @@ GitHub publication are separate gates, recorded in the release report and PR.
   commit installation repeats these checks.
 - The patched Quanta source passed 4 synthetic sampling tests. Windows build
   dependencies are pinned in `third_party/quanta/requirements-windows-build.txt`.
-- A real A2C OAuth/MCP canary on the frozen A2C source and emitted tree
+- A real A2C OAuth/MCP canary on the earlier frozen A2C source and emitted tree
   completed as task `c2c_069edfbb9fea`. Requested, resolved, dispatched and
   native turn context all reported `gpt-6-sol` with `max` effort. Its final
   output matched the requested short nonce; no workspace files changed. The
@@ -21,8 +22,9 @@ GitHub publication are separate gates, recorded in the release report and PR.
   `0a72ac1b4dcf2c3f0833815ec56620a46818a0ba1714e66d4f3b07d64ca57a45`;
   the A2C source hash was
   `3883a16eadc87c6eb73299ce9cc40c60ae33fe20df0a0e23e29a9310199571fb`.
-  Final clean-commit build identity is checked against these values before
-  claiming that this canary covers the release.
+  The published build has a different source/build identity. Its separate
+  exact-build canary must be checked in the release notes before making a
+  stable support claim.
 - Synthetic regressions cover provider-specific sample times, expired and
   missing samples, current Codex account selection, failed refresh and
   retention of old timestamps, quota units, weekly exhaustion, and unknown

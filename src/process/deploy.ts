@@ -127,9 +127,9 @@ function checkNode(): DeployCheck {
   const major = parseInt(process.versions.node.split(".")[0], 10);
   return {
     id: "node",
-    ok: major >= 20,
+    ok: major >= 22,
     fatal: true,
-    detail: `v${process.versions.node}${major >= 20 ? "" : " (Node.js >= 20 required: https://nodejs.org)"}`,
+    detail: `v${process.versions.node}${major >= 22 ? "" : " (Node.js >= 22 required: https://nodejs.org)"}`,
   };
 }
 

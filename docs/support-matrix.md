@@ -1,9 +1,10 @@
 # Platform and provider support matrix
 
 This matrix describes the 0.3.0 source candidate. A model's presence in a
-catalog is not proof that a task completed with it. The local GPT-6 canary
-below verifies this candidate's exact A2C emitted tree; model availability
-can differ across accounts and runtimes.
+catalog is not proof that a task completed with it. A completed local GPT-6
+canary verified an earlier emitted tree. Consult the release notes for the
+exact-build canary of the published commit; this matrix alone does not certify
+a changed build. Model availability can differ across accounts and runtimes.
 
 See the [v0.3.0 acceptance record](release-acceptance-v0.3.0.md) for the
 source test counts and the scope of the live canary.
@@ -13,12 +14,12 @@ source test counts and the scope of the live canary.
 | Windows 11 x64 | Source and local control-plane tests passed | Development-machine verification; independent Windows Sandbox/VM install not yet claimed. |
 | Windows Server / LTSC | NOT_TESTED | — |
 | macOS | NOT_TESTED | Code paths exist. |
-| Linux | NOT_TESTED for native providers | CI source checks do not prove a live provider. |
+| Linux | NOT_TESTED for native providers | This release's CI gate runs on Windows; Linux is not certified. |
 | Windows on ARM | NOT_TESTED | — |
 
 | Provider or feature | State | Limit |
 | --- | --- | --- |
-| Codex App Server | GPT-6 Sol/max local A2C canary completed on build `0a72ac1b4dcf…`; task `c2c_069edfbb9fea` | Requested, resolved and dispatched model/effort matched; native context matched, final nonce was captured, and no files changed. A2C uses the same configured runtime for catalog and execution. No silent fallback. This does not certify every account or the current ChatGPT connector. |
+| Codex App Server | GPT-6 Sol/max local A2C canary completed on earlier build `0a72ac1b4dcf…`; task `c2c_069edfbb9fea`. Exact-build acceptance for the published commit is recorded in its release notes. | Requested, resolved and dispatched model/effort matched; native context matched, final nonce was captured, and no files changed. A2C uses the same configured runtime for catalog and execution. No silent fallback. This does not certify every account or the current ChatGPT connector. |
 | Antigravity / Gemini | Source-tested; earlier local Gemini canaries completed | Requires installed, signed-in AGY. Those earlier results are not evidence for this candidate build. |
 | ZCode / Z2C official semantic service | 196 synthetic/contract tests passed in the candidate source | Governed lane requires observed `builtin:zai-coding-plan / GLM-5.3-Flash / max`; earlier live native results are historical. No new GLM turn is implied. |
 | Quanta usage telemetry | Optional; freshness contract source-tested | Use the patched [Quanta 0.9.4+a2c.1 source](../third_party/quanta/PATCH-INFO.md) for provider-specific sample times. Older or absent Quanta yields unknown quota; manual execution remains available subject to its own provider checks. |

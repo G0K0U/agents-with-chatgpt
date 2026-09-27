@@ -28,7 +28,7 @@ if (-not $node) {
     if (Test-Path $candidate) { $node = $candidate; break }
   }
 }
-if (-not $node -or -not (Test-Path $node)) { throw 'node.exe could not be located; install Node.js 20+ first.' }
+if (-not $node -or -not (Test-Path $node)) { throw 'node.exe could not be located; install Node.js 22+ first.' }
 
 $action = New-ScheduledTaskAction -Execute $node `
   -Argument "`"$cli`" supervisor run --workspace `"$workspace`" --state-dir `"$stateDir`"" `
