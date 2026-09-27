@@ -9,7 +9,7 @@
  *     unmanaged detection never kills or duplicates)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Supervisor, recoveryDelayMs, type SupervisorDeps, type SupervisorProbes } from "../src/supervisor/supervisor.js";
@@ -442,16 +442,29 @@ describe("R1.1 registration layout compatibility", () => {
 
 
 it("serializes concurrent supervisors and fences non-owner release", async () => {
-  const deps = { repoRoot: root, stateDir, workspaceRoot: root };
+  // A Vitest worker need not be visible to the host process inspector. Supply
+  // the current worker identity so this test exercises the actual lock race.
+  const originalArgv = [...process.argv];
+  process.argv[1] = path.resolve("tests/supervisor.test.ts");
+  const deps = { repoRoot: root, stateDir, workspaceRoot: root,
+    processInspector: () => ({ list: () => [{ pid: process.pid,
+      executable: realpathSync.native(process.execPath), commandLine: "synthetic vitest worker",
+      listeningPorts: [], processStartIdentity: "synthetic-current-worker" }] }) };
   const first = new Supervisor(deps), second = new Supervisor(deps);
-  const results = await Promise.all([first.acquireLock(), second.acquireLock()]);
-  expect(results.filter(Boolean)).toHaveLength(1);
-  const owner = results[0] ? first : second;
-  const loser = results[0] ? second : first;
-  loser.releaseLock();
-  expect(existsSync(path.join(stateDir, "supervisor/supervisor.lock"))).toBe(true);
-  owner.releaseLock();
-  expect(existsSync(path.join(stateDir, "supervisor/supervisor.lock"))).toBe(false);
+  try {
+    const results = await Promise.all([first.acquireLock(), second.acquireLock()]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const owner = results[0] ? first : second;
+    const loser = results[0] ? second : first;
+    loser.releaseLock();
+    expect(existsSync(path.join(stateDir, "supervisor/supervisor.lock"))).toBe(true);
+    owner.releaseLock();
+    expect(existsSync(path.join(stateDir, "supervisor/supervisor.lock"))).toBe(false);
+  } finally {
+    first.releaseLock();
+    second.releaseLock();
+    process.argv.splice(0, process.argv.length, ...originalArgv);
+  }
 });
 
 
