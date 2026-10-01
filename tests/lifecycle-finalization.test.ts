@@ -11,7 +11,7 @@ import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { appendExecutionRecord, readExecutionRecords } from "../src/execution/records.js";
 import { C2CSessionRegistry } from "../src/session/registry.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { cleanup, fakeCodexCatalog, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 interface TaskIdentity {
   taskId: string;
@@ -134,6 +134,7 @@ describe("C2C live task finalization truth", () => {
       authStoreFile: `${makeTmpDir("lifecycle-finalization-auth")}\\store.json`,
       fullAccess: false,
       appServerFactory: () => fake,
+      modelCatalog: fakeCodexCatalog(root),
     });
     const token = bridge.authStore.issueTokens({
       clientId: "lifecycle-owner",

@@ -15,7 +15,7 @@ import { BRIDGE_REPOSITORY_ROOT } from "../src/execution/verification.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
-import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { cleanup, fakeCodexCatalog, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 class HoldingAppServer implements AppServerClient {
   private notificationHandler: ((notification: AppServerNotification) => void | Promise<void>) | null = null;
@@ -122,6 +122,7 @@ describe("C2C stabilization routing and lifecycle", () => {
       workspaceRegistryFile,
       fullAccess: false,
       appServerFactory: ({ workspaceRoot }) => new HoldingAppServer(new Workspace(workspaceRoot).id),
+      modelCatalog: fakeCodexCatalog(root),
     });
     workspaceId = workspace.id;
     bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => ["a2c-bridge", "c2c-bridge"].includes(entry.name))!.id;
