@@ -245,6 +245,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "Append the smoke marker to the existing fixture.",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     const result = await waitForTerminal(manager, submitted.taskId);
@@ -304,6 +305,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "Append the smoke marker to the fixture.",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     const result = await waitForTerminal(manager, submitted.taskId);
@@ -325,6 +327,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "Attempt a change outside the declared directory.",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     const result = await waitForTerminal(manager, submitted.taskId);
@@ -363,6 +366,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "change the fixture",
       write_scope: ["tests"],
+      network: false,
     };
     expect(() => manager.submit({ ...base, workspace_id: "wrong-workspace" })).toThrowError(TaskError);
     expect(() => manager.submit({ ...base, instruction: { text: "no" } })).toThrowError(/instruction/);
@@ -379,21 +383,41 @@ describe("controlled Codex task execution", () => {
     expect(() => manager.submit({ ...base, profile: "developer-research" })).toThrowError(/Unsupported task field/);
   });
 
-  it("keeps network offline by default and accepts an explicit opt-in only in full-access mode", () => {
-    const ordinary = validateCodexTask(workspace, {
+  it("defaults omitted network to online, honors explicit offline, and gates opt-in by mode", () => {
+    try {
+      validateCodexTask(workspace, {
+        workspace_id: workspace.id,
+        instruction: "ordinary task",
+        write_scope: ["tests"],
+      });
+      expect.unreachable("omitted network (online default) must be rejected without full access");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "NETWORK_NOT_ALLOWED" });
+    }
+
+    const explicitOffline = validateCodexTask(workspace, {
       workspace_id: workspace.id,
-      instruction: "ordinary task",
+      instruction: "explicit offline task",
       write_scope: ["tests"],
+      network: false,
     });
-    expect(ordinary.network).toBe(false);
+    expect(explicitOffline.network).toBe(false);
 
     const fullAccessDefault = validateCodexTask(workspace, {
       workspace_id: workspace.id,
-      instruction: "full-access task with the safe default",
+      instruction: "full-access task with the online default",
       write_scope: ["tests"],
     }, { fullAccess: true });
     expect(fullAccessDefault.fullAccess).toBe(true);
-    expect(fullAccessDefault.network).toBe(false);
+    expect(fullAccessDefault.network).toBe(true);
+
+    const fullAccessOptOut = validateCodexTask(workspace, {
+      workspace_id: workspace.id,
+      instruction: "full-access task with explicit offline",
+      write_scope: ["tests"],
+      network: false,
+    }, { fullAccess: true });
+    expect(fullAccessOptOut.network).toBe(false);
 
     const fullAccessOptIn = validateCodexTask(workspace, {
       workspace_id: workspace.id,
@@ -421,6 +445,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "continue the ordinary coding task",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     }, { ownerId: "owner", sessionId: session.id });
     expect(continued.network).toBe(false);
@@ -569,6 +594,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "wait for cancellation",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     for (
@@ -591,6 +617,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "hold for approval checks",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     for (
@@ -747,6 +774,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "wait for approval timeout",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     for (let i = 0; i < 100 && !manager.get(submitted.taskId).turnId; i++) {
@@ -776,6 +804,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "run the local verification",
       write_scope: ["tests"],
+      network: false,
       run_tests: true,
     });
 
@@ -805,6 +834,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "make a controlled change and verify it",
       write_scope: ["tests"],
+      network: false,
       run_tests: true,
     });
     const result = await waitForTerminal(manager, submitted.taskId);
@@ -830,6 +860,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "wait forever",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     const result = await waitForTerminal(manager, submitted.taskId);
@@ -852,6 +883,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "wait for a cancellation race",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     for (let i = 0; i < 100 && !manager.get(submitted.taskId).turnId; i++) {
@@ -874,6 +906,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "hold for permission checks",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     for (let i = 0; i < 100 && !manager.get(submitted.taskId).turnId; i++) {
@@ -956,7 +989,7 @@ describe("controlled Codex task execution", () => {
     expect(result.restartRequired).toBe(true);
   });
 
-  it("preserves omitted network metadata with a fake transport (native launcher rejects this combination)", async () => {
+  it("preserves an explicit offline decision through the fake transport", async () => {
     await manager.close();
     fake = new FakeAppServer(undefined, true);
     manager = new CodexTaskManager(workspace, {
@@ -967,6 +1000,7 @@ describe("controlled Codex task execution", () => {
       workspace_id: workspace.id,
       instruction: "perform an ordinary offline full-access task",
       write_scope: ["."],
+      network: false,
       run_tests: false,
     });
     const result = await waitForTerminal(manager, submitted.taskId);
@@ -1303,6 +1337,7 @@ describe("controlled Codex task execution", () => {
         workspace_id: workspace.id,
         instruction: `repeat isolated task ${i}`,
         write_scope: ["tests"],
+        network: false,
         run_tests: false,
       });
       await waitForTerminal(manager, submitted.taskId);

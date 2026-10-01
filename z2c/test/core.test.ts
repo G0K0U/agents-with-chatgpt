@@ -48,6 +48,7 @@ class FakeProvider implements AgentProvider {
   startAttempts = 0;
   createdSessions: string[] = [];
   stoppedSessions: string[] = [];
+  executionGrants: ProviderSendOptions["executionGrant"][] = [];
   sentInstructions: Array<{ sessionId: string; instruction: string }> = [];
   outputs = new Map<string, string>();
   /** Observed binding per session id; created sessions default to the required identity. */
@@ -66,6 +67,10 @@ class FakeProvider implements AgentProvider {
    */
   planEvidence: boolean | null = true;
   thoughtEvidence: string | null = "max";
+  /** When true, the fake attestation omits availability evidence (not proven). */
+  unadvertisedModels = false;
+  /** Custom advertised reasoning levels for the observed model (official lane). */
+  advertisedLevels: string[] | null = null;
 
   async readSessionState(
     sessionId: string,
@@ -83,6 +88,7 @@ class FakeProvider implements AgentProvider {
     runtimeVersion: string | null;
     status: string | null;
     observedAt: string;
+    availableModels?: Array<{ providerId: string | null; modelId: string; reasoningLevels: string[]; reasoningDefaultLevel: string | null }>;
   } | null> {
     if (this.sessionWorkspaces.get(sessionId) !== workspace.workspaceKey) return null;
     const binding = this.sessionBindings.get(sessionId);
@@ -98,8 +104,20 @@ class FakeProvider implements AgentProvider {
       planEnabled: this.planEvidence,
       bindingSource: binding.source,
       runtimeVersion: this.providerVersion,
-      status: "idle",
+      status: this.statusSequence
+        ? this.statusSequence[Math.min(this.statusSequenceIndex++, this.statusSequence.length - 1)]!
+        : "idle",
       observedAt: new Date().toISOString(),
+      // The runtime's own per-model advertisement from the same snapshot:
+      // the observed model is advertised with its reasoning levels.
+      ...(this.unadvertisedModels ? {} : {
+        availableModels: [{
+          providerId: binding.provider_id,
+          modelId: binding.model_id,
+          reasoningLevels: this.advertisedLevels ?? ["low", "high", "max"],
+          reasoningDefaultLevel: this.advertisedLevels?.[1] ?? "max",
+        }],
+      }),
     };
   }
 
@@ -171,7 +189,17 @@ class FakeProvider implements AgentProvider {
     if (binding) this.sessionBindings.set(sessionId, { ...binding, model_id: change.modelId ?? binding.model_id });
     return { provider_id: binding?.provider_id ?? "", model_id: change.modelId ?? binding?.model_id ?? "", thoughtLevel: null };
   }
+  /** When set, the NEXT send throws -32010 once (stale-busy simulation). */
+  throwBusyOnce = false;
+  /** Statuses returned by readSessionState across successive calls (cycled). */
+  statusSequence: string[] | null = null;
+  private statusSequenceIndex = 0;
   async send(options: ProviderSendOptions): Promise<ProviderRunHandle> {
+    if (this.throwBusyOnce) {
+      this.throwBusyOnce = false;
+      throw new Error("ZCode Protocol error -32010: A prompt is already running for this session");
+    }
+    this.executionGrants.push(options.executionGrant);
     this.sentInstructions.push({ sessionId: options.sessionId, instruction: options.instruction });
     const completion = new Promise<ProviderTurnResult>((resolve) => {
       setTimeout(() => resolve({ status: "completed" }), this.turnDelayMs);
@@ -551,7 +579,7 @@ describe("submit binding gate (two-phase: exact session then observed binding)",
     assert.equal(h.provider.sentInstructions.length, 0);
   });
 
-  it("rejects wrong observed provider or model before any governed instruction send", async () => {
+  it("rejects wrong observed provider routes before any governed instruction send", async () => {
     const h = buildHarness();
     h.provider.nextBinding = { provider_id: "custom:z2c", model_id: "GLM-5.3-Flash" };
     await assert.rejects(
@@ -563,7 +591,7 @@ describe("submit binding gate (two-phase: exact session then observed binding)",
       () => h.engine.submitTask({ workspace_id: "z2c-test", instruction: "y" }),
       (e: unknown) => (e as TaskEngineError).code === "BINDING_UNVERIFIED",
     );
-    h.provider.nextBinding = { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" }; // main model: never governed
+    h.provider.nextBinding = { provider_id: "manual:desktop", model_id: "GLM-5.3" }; // unknown route: never governed
     await assert.rejects(
       async () => h.engine.submitTask({ workspace_id: "z2c-test", instruction: "z" }),
       (e: unknown) => (e as TaskEngineError).code === "BINDING_UNVERIFIED",
@@ -597,28 +625,44 @@ describe("submit binding gate (two-phase: exact session then observed binding)",
     assert.equal(h.provider.sentInstructions.length, 0);
   });
 
-  it("fails closed when a freshly created session reports the main model and the provider cannot switch (Flash-only policy)", async () => {
+  it("admits the observed advertised default when no explicit identity is requested (catalog-driven policy)", async () => {
     const h = buildHarness();
-    h.provider.nextBinding = { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" }; // Desktop default = main
-    await assert.rejects(
-      async () => h.engine.submitTask({ workspace_id: "z2c-test", instruction: "x" }),
-      (e: unknown) => (e as TaskEngineError).code === "BINDING_UNVERIFIED",
-    );
-    assert.equal(h.store.data.tasks.length, 0);
-    assert.equal(h.provider.sentInstructions.length, 0);
+    // Desktop default = the coding-plan route's own current model. Under the
+    // catalog-driven policy there is no single-model constant: the observed
+    // binding on an admissible route is governed evidence.
+    h.provider.nextBinding = { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" };
+    const view = await h.engine.submitTask({ workspace_id: "z2c-test", instruction: "x" });
+    assert.equal(view.model_binding?.model_id, "GLM-5.3");
+    assert.equal(await waitTaskTerminal(h.engine, view.task_id), "completed");
+    assert.equal(h.provider.sentInstructions.length, 1);
   });
 
-  it("applies the requested native model on the SAME session inside createSession before admission", async () => {
+  it("applies an EXPLICIT requested native model on the SAME session inside createSession before admission", async () => {
     const h = buildHarness();
     h.provider.usesDesktopManagedAuth = true; // native-auth capability (official lane)
     h.provider.supportsModelSwitch = true;
     h.provider.nextBinding = { provider_id: "builtin:zai-coding-plan", model_id: "GLM-5.3" }; // runtime default = main
-    const view = await h.engine.submitTask({ workspace_id: "z2c-test", instruction: "flash-only work" });
-    // The engine requested the governed identity at create time; the provider
-    // applied it on the same session, so admission sees Flash.
+    const view = await h.engine.submitTask({ workspace_id: "z2c-test", instruction: "flash work", model_id: "GLM-5.3-Flash" });
+    // The engine forwarded the EXPLICIT request at create time; the provider
+    // applied it on the same session, so admission observes exactly the request.
     assert.deepEqual(h.provider.modelSwitchCalls, [{ sessionId: view.session_id, modelId: "GLM-5.3-Flash" }]);
     assert.equal(h.provider.sessionBindings.get(view.session_id)?.model_id, "GLM-5.3-Flash");
+    assert.equal(view.model_binding?.model_id, "GLM-5.3-Flash");
+    assert.equal(view.requested_model_id, "GLM-5.3-Flash");
     assert.equal(await waitTaskTerminal(h.engine, view.task_id), "completed");
+  });
+
+  it("fails closed when an explicit model request is not what the session observed (no silent substitution)", async () => {
+    const h = buildHarness();
+    h.provider.usesDesktopManagedAuth = true;
+    // Provider cannot switch: the session stays on the runtime default while
+    // the caller explicitly requested Flash — mismatch must reject.
+    await assert.rejects(
+      () => h.engine.submitTask({ workspace_id: "z2c-test", instruction: "x", model_id: "GLM-5.3-Flash" }),
+      (e: unknown) => (e as TaskEngineError).code === "BINDING_UNVERIFIED",
+    );
+    assert.equal(h.provider.sentInstructions.length, 0);
+    assert.equal(h.store.data.tasks.length, 0);
   });
 
   it("accepts submit when the exact session reports the required binding", async () => {
@@ -645,10 +689,50 @@ describe("submit binding gate (two-phase: exact session then observed binding)",
     assert.equal(h.provider.sentInstructions.length, 1);
   });
 
-  it("rejects an official session whose observed thought level is below max", async () => {
+  it("accepts an official session at any advertised thought level (no max-only rule)", async () => {
     const h = buildHarness();
     h.provider.name = "zcode-official";
     h.provider.thoughtEvidence = "high";
+    const originalCreate = h.provider.createSession.bind(h.provider);
+    h.provider.createSession = async (ws, options) => {
+      const id = await originalCreate(ws, options);
+      const binding = h.provider.sessionBindings.get(id);
+      if (binding) h.provider.sessionBindings.set(id, { ...binding, source: "official-session-read" });
+      return id;
+    };
+    const view = await h.engine.submitTask({ workspace_id: "z2c-test", instruction: "x" });
+    assert.equal(view.model_binding?.model_id, REQUIRED_START_PLAN_MODEL_ID);
+    await waitTaskTerminal(h.engine, view.task_id);
+  });
+
+  it("settles a transient -32010 on the governed lane via authoritative runtime evidence and retries once", async () => {
+    const h = buildHarness();
+    h.provider.throwBusyOnce = true;
+    h.provider.statusSequence = ["running", "idle"]; // first settle poll: still busy; second: idle
+    const view = await h.engine.submitTask({ workspace_id: "z2c-test", instruction: "busy settle" });
+    assert.equal(await waitTaskTerminal(h.engine, view.task_id), "completed");
+    assert.equal(h.provider.sentInstructions.length, 1, "exactly one user turn was sent");
+    const failed = h.store.data.tasks.find((t) => t.taskId === view.task_id);
+    assert.equal(failed?.status, "completed");
+  });
+
+  it("fails closed with SESSION_BUSY when the runtime stays busy through the settle budget", async () => {
+    const h = buildHarness();
+    h.provider.throwBusyOnce = true;
+    h.provider.statusSequence = ["running", "running", "running", "running"]; // never idle
+    (h.engine as unknown as { cfg: { busySettleMs?: number } }).cfg.busySettleMs = 800;
+    const view = await h.engine.submitTask({ workspace_id: "z2c-test", instruction: "stuck busy" });
+    // The pump runs asynchronously: the settle failure lands on the task record.
+    assert.equal(await waitTaskTerminal(h.engine, view.task_id), "failed");
+    const failed = h.store.data.tasks.find((t) => t.taskId === view.task_id);
+    assert.match(String(failed?.exitStatus ?? "") + String(failed && "status" in failed ? failed.status : ""), /failed/);
+  });
+
+  it("fails closed when an official session's observed model is not advertised by the same snapshot", async () => {
+    const h = buildHarness();
+    h.provider.name = "zcode-official";
+    h.provider.usesDesktopManagedAuth = true;
+    h.provider.unadvertisedModels = true; // snapshot carries no availability evidence
     const originalCreate = h.provider.createSession.bind(h.provider);
     h.provider.createSession = async (ws, options) => {
       const id = await originalCreate(ws, options);
@@ -933,9 +1017,182 @@ describe("immediate native continuation", () => {
     assert.equal(result.session_id, sid); assert.equal(result.model_binding.model_id, REQUIRED_START_PLAN_MODEL_ID);
     await waitTaskTerminal(h.engine, result.task_id);
     assert.equal(h.provider.sentInstructions.length, 1);
-    h.provider.sessionBindings.get(sid)!.model_id = "wrong-model";
+    // Catalog-driven policy: a changed (still admissible-route) model is read
+    // back honestly — there is no single-model constant to violate. A RETIRED
+    // provider route is rejected regardless of model.
+    h.provider.sessionBindings.get(sid)!.model_id = "another-advertised-model";
+    const changed = JSON.parse((await call("read_zcode_session", input)).content[0].text);
+    assert.equal(changed.model_binding.model_id, "another-advertised-model");
+    h.provider.sessionBindings.get(sid)!.provider_id = "builtin:zai-start-plan";
     assert.equal((await call("read_zcode_session", input)).isError, true);
     assert.equal((await call("resume_zcode_session", input)).isError, true);
     assert.equal(h.provider.sentInstructions.length, 1);
+  });
+});
+
+
+it("propagates only the admitted workspace/write scope at dispatch", async () => {
+  const { engine, provider, workspaces } = buildHarness();
+  for (const write_scope of ["workspace", "readonly"] as const) {
+    const task = await engine.submitTask({ workspace_id: "z2c-test", instruction: "permission propagation", write_scope });
+    assert.equal(await waitTaskTerminal(engine, task.task_id), "completed");
+    assert.deepEqual(provider.executionGrants.at(-1), {
+      workspacePath: workspaces.get("z2c-test").canonicalPath, write: write_scope === "workspace",
+      mode: write_scope === "workspace" ? "machine-local-development" : "workspace",
+    });
+  }
+});
+
+
+describe("entitlement admission fails closed", () => {
+  for (const entitlement_plan of ["START", "INDIVIDUAL"] as const) {
+    it(`rejects ${entitlement_plan} submit and resume before provider calls or persistence`, async () => {
+      const h = buildHarness();
+      try {
+        for (const resume_session_id of [undefined, "sess_00000000-0000-0000-0000-000000000001"]) {
+          await assert.rejects(h.engine.submitTask({ workspace_id: "z2c-test", instruction: "OK", entitlement_plan, resume_session_id }), { code: "ENTITLEMENT_UNAVAILABLE" });
+        }
+        assert.equal(h.provider.sessions, 0);
+        assert.equal(h.provider.sentInstructions.length, 0);
+        assert.equal(h.store.data.tasks.length, 0);
+      } finally { rmSync(h.dir, { recursive: true, force: true }); }
+    });
+  }
+  it("DEFAULT executes with unknown billing evidence and resumes without inventing evidence", async () => {
+    const h = buildHarness();
+    try {
+      const task = await h.engine.submitTask({ workspace_id: "z2c-test", instruction: "OK", entitlement_plan: "DEFAULT" });
+      await waitTaskTerminal(h.engine, task.task_id);
+      assert.deepEqual(task.entitlement, { requested: "DEFAULT", observed: null, access_mode: null, source: "unavailable" });
+      const resumed = await h.engine.submitTask({ workspace_id: "z2c-test", instruction: "OK", resume_session_id: task.session_id! });
+      await waitTaskTerminal(h.engine, resumed.task_id);
+      assert.equal(resumed.session_id, task.session_id);
+      // A persisted pin must never be erased by omission/DEFAULT on resume.
+      h.store.data.tasks[0]!.entitlementPlan = "START";
+      await assert.rejects(h.engine.submitTask({ workspace_id: "z2c-test", instruction: "OK", resume_session_id: task.session_id! }), { code: "ENTITLEMENT_UNAVAILABLE" });
+      assert.equal(h.provider.sentInstructions.length, 2);
+    } finally { rmSync(h.dir, { recursive: true, force: true }); }
+  });
+});
+
+
+it("rechecks persisted entitlement at queued dispatch without fallback", async () => {
+  const h = buildHarness();
+  try {
+    h.engine.pauseQueue("z2c-test");
+    const task = await h.engine.submitTask({ workspace_id: "z2c-test", instruction: "OK" });
+    h.store.data.tasks.find(t => t.taskId === task.task_id)!.entitlementPlan = "INDIVIDUAL";
+    h.engine.resumeQueue("z2c-test");
+    assert.equal(await waitTaskTerminal(h.engine, task.task_id), "failed");
+    assert.equal(h.provider.sentInstructions.length, 0);
+  } finally { rmSync(h.dir, { recursive: true, force: true }); }
+});
+
+
+describe("individual plan chat admission (2026-10-01 BINDING_UNVERIFIED repair)", () => {
+  const registryReadback = (plan: "START" | "INDIVIDUAL") => ({
+    requested: plan,
+    observed: plan,
+    access_mode: plan === "START" ? "start-plan" : "individual-coding-plan",
+    source: "provider-registry",
+  });
+
+  function withEntitlementReadback(
+    h: ReturnType<typeof buildHarness>,
+    entitlement: Record<string, unknown> | null,
+  ): void {
+    const readState = h.provider.readSessionState.bind(h.provider);
+    h.provider.readSessionState = async (session, workspace) => {
+      const attestation = await readState(session, workspace);
+      return (attestation ? { ...attestation, entitlement } : attestation) as Awaited<ReturnType<typeof readState>>;
+    };
+  }
+
+  it("admits INDIVIDUAL GLM-5.3/max and GLM-5.3-Flash/max observed on the individual account route", async () => {
+    for (const model of ["GLM-5.3", "GLM-5.3-Flash"]) {
+      const h = buildHarness();
+      try {
+        h.provider.entitlementSelection = { entitlementSelection: true };
+        h.provider.nextBinding = { provider_id: "account:zai-individual-coding-plan", model_id: model };
+        withEntitlementReadback(h, registryReadback("INDIVIDUAL"));
+        const view = await h.engine.submitTask({
+          workspace_id: "z2c-test", instruction: `individual-${model}-max`,
+          model_id: model, thought_level: "max", entitlement_plan: "INDIVIDUAL",
+        });
+        assert.match(view.task_id, /^z2c_/);
+        assert.equal(await waitTaskTerminal(h.engine, view.task_id), "completed");
+      } finally { rmSync(h.dir, { recursive: true, force: true }); }
+    }
+  });
+
+  it("still admits START/max observed on the start account route (regression guard)", async () => {
+    const h = buildHarness();
+    try {
+      h.provider.entitlementSelection = { entitlementSelection: true };
+      h.provider.nextBinding = { provider_id: "account:zai-start-plan", model_id: "GLM-5.3-Flash" };
+      withEntitlementReadback(h, registryReadback("START"));
+      const view = await h.engine.submitTask({
+        workspace_id: "z2c-test", instruction: "start-flash-max",
+        model_id: "GLM-5.3-Flash", thought_level: "max", entitlement_plan: "START",
+      });
+      assert.equal(await waitTaskTerminal(h.engine, view.task_id), "completed");
+    } finally { rmSync(h.dir, { recursive: true, force: true }); }
+  });
+
+  it("rejects forged or inconsistent INDIVIDUAL bindings with a specific reason", async () => {
+    const individualRoute = { provider_id: "account:zai-individual-coding-plan", model_id: "GLM-5.3" };
+    const submit = (h: ReturnType<typeof buildHarness>) => h.engine.submitTask({
+      workspace_id: "z2c-test", instruction: "chat-individual",
+      model_id: "GLM-5.3", thought_level: "max", entitlement_plan: "INDIVIDUAL",
+    });
+    const expectRejected = async (h: ReturnType<typeof buildHarness>) => {
+      await assert.rejects(
+        submit(h),
+        (e: unknown) => e instanceof TaskEngineError && e.code === "BINDING_UNVERIFIED" && /attesting INDIVIDUAL/.test(e.message),
+      );
+      assert.equal(h.provider.sentInstructions.length, 0);
+      assert.equal(h.store.data.tasks.length, 0);
+    };
+
+    // Forged evidence: the readback must come from the runtime's own registry.
+    {
+      const h = buildHarness();
+      try {
+        h.provider.entitlementSelection = { entitlementSelection: true };
+        h.provider.nextBinding = individualRoute;
+        withEntitlementReadback(h, { requested: "INDIVIDUAL", observed: "INDIVIDUAL", access_mode: "individual-coding-plan", source: "control-plane-reported" });
+        await expectRejected(h);
+      } finally { rmSync(h.dir, { recursive: true, force: true }); }
+    }
+    // Inconsistent: the session attests START while INDIVIDUAL was requested.
+    {
+      const h = buildHarness();
+      try {
+        h.provider.entitlementSelection = { entitlementSelection: true };
+        h.provider.nextBinding = individualRoute;
+        withEntitlementReadback(h, registryReadback("START"));
+        await expectRejected(h);
+      } finally { rmSync(h.dir, { recursive: true, force: true }); }
+    }
+    // Hybrid route: an attested INDIVIDUAL must not open the start account route.
+    {
+      const h = buildHarness();
+      try {
+        h.provider.entitlementSelection = { entitlementSelection: true };
+        h.provider.nextBinding = { provider_id: "account:zai-start-plan", model_id: "GLM-5.3-Flash" };
+        withEntitlementReadback(h, registryReadback("INDIVIDUAL"));
+        await expectRejected(h);
+      } finally { rmSync(h.dir, { recursive: true, force: true }); }
+    }
+    // Unproven: no registry readback at all.
+    {
+      const h = buildHarness();
+      try {
+        h.provider.entitlementSelection = { entitlementSelection: true };
+        h.provider.nextBinding = individualRoute;
+        withEntitlementReadback(h, null);
+        await expectRejected(h);
+      } finally { rmSync(h.dir, { recursive: true, force: true }); }
+    }
   });
 });

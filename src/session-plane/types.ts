@@ -1,14 +1,14 @@
 /**
  * Provider-neutral shared session/activity plane — public record shapes.
  *
- * One projection joins all agent providers (codex, gemini/antigravity, zcode)
+ * One projection joins all agent providers (codex, gemini/antigravity, zcode, dsh)
  * and both origins (created through A2C vs. native/Desktop/manual runtime
  * sessions discovered through their local runtime surfaces). OBSERVE and
  * CONTROL are separate capabilities: these records describe visibility only;
  * control stays owner-bound in each provider's own enforcement path.
  */
 
-export type AgentProviderName = "codex" | "gemini" | "zcode";
+export type AgentProviderName = "codex" | "gemini" | "zcode" | "dsh";
 
 /**
  * Where a session was created:
@@ -69,8 +69,12 @@ export interface AgentSessionRecord {
   /**
    * Honest live-read evidence for zcode sessions. A cached projection that
    * failed to refresh live is never disguised as a live success.
+   *   "stale-runtime" — the session is discovery-listed but not live-readable
+   *   in the current runtime generation (legacy/pre-restart or closed); the
+   *   projection keeps last-known metadata until the session is explicitly
+   *   resumed. Not an error and never auto-migrated.
    */
-  live_read_status?: "ok" | "error" | "skipped" | "stale-cache";
+  live_read_status?: "ok" | "error" | "skipped" | "stale-cache" | "stale-runtime";
   messages_readable?: boolean | null;
   last_live_error?: string | null;
 }
@@ -106,6 +110,8 @@ export interface AgentTaskView {
   provider: AgentProviderName | null;
   providerSessionId: string | null;
   model: string | null;
+  effort?: string | null;
+  selectionScope?: string | null;
   status: string;
   exitStatus: string | null;
   submittedAt: string | null;
@@ -124,6 +130,9 @@ export interface AgentTaskView {
     changedFiles: number;
     finalOutputCaptured: boolean;
   } | null;
+  nativeEvidence?: { terminalSeq: number | null; terminalReason: string | null;
+    toolCalls: number; toolResults: number; servedModel?: string | null;
+    servedEffort?: string | null; servedProvider?: string | null } | null;
   verification: {
     status: string | null;
     exitCode: number | null;

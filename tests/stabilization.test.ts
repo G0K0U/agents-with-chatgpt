@@ -15,7 +15,7 @@ import { BRIDGE_REPOSITORY_ROOT } from "../src/execution/verification.js";
 import { saveExecutionOutput } from "../src/execution/output.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
-import { cleanup, fakeCodexCatalog, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 class HoldingAppServer implements AppServerClient {
   private notificationHandler: ((notification: AppServerNotification) => void | Promise<void>) | null = null;
@@ -122,7 +122,6 @@ describe("C2C stabilization routing and lifecycle", () => {
       workspaceRegistryFile,
       fullAccess: false,
       appServerFactory: ({ workspaceRoot }) => new HoldingAppServer(new Workspace(workspaceRoot).id),
-      modelCatalog: fakeCodexCatalog(root),
     });
     workspaceId = workspace.id;
     bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => ["a2c-bridge", "c2c-bridge"].includes(entry.name))!.id;
@@ -207,6 +206,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: workspaceId,
         instruction: "hold the fixture workspace writer",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));
@@ -218,6 +218,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: workspaceId,
         instruction: "remain queued until the first fixture task is cancelled",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));
@@ -267,6 +268,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: remoteWorkspaceId,
         instruction: "hold the non-default bridge workspace writer",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));
@@ -278,6 +280,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: remoteWorkspaceId,
         instruction: "remain queued in the non-default workspace",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));
@@ -304,6 +307,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: workspaceId,
         instruction: "seed a task for the unauthorized workspace regression",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));

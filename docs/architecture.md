@@ -82,10 +82,12 @@ release through stale `dist/` output.
 workspace/owner/session checks → fixed official `codex app-server --stdio`
 client → `thread/start` → `turn/start` → one compatible execution record. The
 CLI's full-access deployment sends `danger-full-access` and
-`approvalPolicy: never`; `networkAccess` is the task's effective `network` flag,
-which defaults to false and can be true only after local full-access capability
-authorization. The Codex child therefore inherits the bridge process's OS
-permissions while network remains opt-in. The public MCP surface still exposes only the task lifecycle;
+`approvalPolicy: never`; `networkAccess` is the task's effective `network`
+value, which defaults to online when the field is omitted, is forced offline
+by an explicit `network: false`, and is rejected outright
+(`NETWORK_NOT_ALLOWED`) in deployments without full-access capability. The
+Codex child therefore inherits the bridge process's OS
+permissions; network use is bounded by the task's effective flag. The public MCP surface still exposes only the task lifecycle;
 `get_codex_task` exposes sanitized task metadata and ChatGPT reviews the
 resulting `execution_summary`, `execution_output`, `test_status` and `git_diff`
 data through the existing tools.

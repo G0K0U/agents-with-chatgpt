@@ -1,9 +1,11 @@
+import { type EntitlementPlan, requireSupportedEntitlement, unobservedEntitlement } from "../providers/entitlement.js";
 import type { AgentProvider, SessionStateAttestation } from "../providers/types.js";
 import { assertGovernedAttestation, AttestationError } from "../authz/attestation.js";
 import { loadWorkspaceGrants, GrantError, type WorkspaceAccess, type WorkspaceGrants } from "../authz/grants.js";
 import { loadSessionOwnership, OwnershipError, type OwnedSession, type SessionOwnership } from "../authz/ownership.js";
 import { LOCAL_PRINCIPAL, type Principal } from "../authz/pairing.js";
 import { canonicalizeWorkspacePath, isSubPath } from "../core/workspaces/registry.js";
+import { classifyObservationError, isLaneLevelObservationError } from "./observation-errors.js";
 import type { AuditSink } from "../util/log.js";
 
 /**
@@ -27,6 +29,7 @@ export class SessionServiceError extends Error {
 }
 
 export interface SanitizedSessionState {
+  entitlement?: ReturnType<typeof unobservedEntitlement>;
   session_id: string;
   workspace_id: string;
   provider_id: string | null;
@@ -55,6 +58,9 @@ function sanitize(att: SessionStateAttestation, workspaceId: string): SanitizedS
     provider_id: att.providerId,
     model_id: att.modelId,
     thought_level: att.thoughtLevel,
+    // Registry-backed entitlement readback when the runtime published it;
+    // unproven otherwise. Never credentials, never provider-id inference.
+    entitlement: att.entitlement ?? unobservedEntitlement(),
     collaboration_mode: att.collaborationMode,
     plan_enabled: att.planEnabled,
     runtime_version: att.runtimeVersion,
@@ -85,6 +91,7 @@ async function attestedState(
 }
 
 export interface SessionCreateRequest {
+  entitlement_plan?: EntitlementPlan;
   workspace_id: string;
   access: WorkspaceAccess;
   model?: string;
@@ -150,10 +157,28 @@ export class SessionService {
    * Positive evidence that the immediately preceding turn for this exact session
    * reached a terminal/completed state through this live service's provider completion path.
    * Required by Mandatory Safety Gate 2A before stale-busy (-32010) recovery is permitted.
+   * Runtime-generation scoped: a provider respawn invalidates it (see providerGeneration).
    */
   private readonly priorTurnCompletedSessions = new Set<string>();
+  /** Last seen provider runtime generation; a change clears in-memory turn evidence. */
+  private providerGeneration: number | null = null;
 
   constructor(private readonly deps: SessionServiceDeps) {}
+
+  /**
+   * Runtime-generation fence (E.8): in-memory turn evidence is only valid for
+   * the runtime generation that produced it. After a provider respawn the
+   * evidence is dropped; recovery then relies on authoritative runtime reads
+   * alone (see the transient-busy path in send()).
+   */
+  private invalidateEvidenceOnRuntimeChange(): void {
+    const generation = this.deps.provider.runtimeGeneration;
+    if (generation === undefined) return;
+    if (this.providerGeneration !== null && this.providerGeneration !== generation) {
+      this.priorTurnCompletedSessions.clear();
+    }
+    this.providerGeneration = generation;
+  }
 
   private wsRef(workspaceId: string): { wsRef: { workspacePath: string; workspaceKey: string }; workspaceId: string } {
     const grant = this.deps.grants.getActive(workspaceId);
@@ -167,12 +192,14 @@ export class SessionService {
 
   async createSession(principal: Principal, req: SessionCreateRequest): Promise<SanitizedSessionState> {
     requireOfficialSessionService(this.deps);
+    requireSupportedEntitlement(req.entitlement_plan, this.deps.provider.entitlementSelection ?? null);
     const access = req.access ?? "readonly";
     const { wsRef, workspaceId } = this.wsRef(req.workspace_id);
     // Grant check with the access the session will run under.
     this.deps.grants.authorizeAccess(workspaceId, access);
     const sessionId = await this.deps.provider.createSession(wsRef, {
       readonly: access === "readonly",
+      entitlementPlan: req.entitlement_plan,
       ...(req.model ? { modelId: req.model } : {}),
       ...(req.thought_level ? { thoughtLevel: req.thought_level } : {}),
       ...(req.provider ? { providerId: req.provider } : {}),
@@ -190,12 +217,13 @@ export class SessionService {
     }
   }
 
-  async resumeSession(principal: Principal, req: { workspace_id: string; session_id: string; access: WorkspaceAccess }): Promise<SanitizedSessionState> {
+  async resumeSession(principal: Principal, req: { workspace_id: string; session_id: string; access: WorkspaceAccess; entitlement_plan?: EntitlementPlan }): Promise<SanitizedSessionState> {
     requireOfficialSessionService(this.deps);
     const { wsRef, workspaceId } = this.wsRef(req.workspace_id);
     this.deps.grants.authorizeAccess(workspaceId, req.access);
     this.owned(principal, req.session_id, req.access);
-    await this.deps.provider.resumeSession(wsRef, req.session_id, { readonly: req.access === "readonly" });
+    requireSupportedEntitlement(req.entitlement_plan, this.deps.provider.entitlementSelection ?? null);
+    await this.deps.provider.resumeSession(wsRef, req.session_id, { readonly: req.access === "readonly", entitlementPlan: req.entitlement_plan });
     const att = await attestedState(this.deps, req.session_id, wsRef, req.access === "readonly");
     this.deps.ownership.touch(req.session_id);
     this.priorTurnCompletedSessions.delete(req.session_id);
@@ -213,7 +241,8 @@ export class SessionService {
     return sanitize(att, workspaceId);
   }
 
-  async send(principal: Principal, req: { workspace_id: string; session_id: string; instruction: string; timeout_ms?: number }): Promise<{ state: SanitizedSessionState; output: string; turn: string }> {
+  async send(principal: Principal, req: { workspace_id: string; session_id: string; instruction: string; timeout_ms?: number; entitlement_plan?: EntitlementPlan }): Promise<{ state: SanitizedSessionState; output: string; turn: string }> {
+    requireSupportedEntitlement(req.entitlement_plan, this.deps.provider.entitlementSelection ?? null);
     requireOfficialSessionService(this.deps);
     const { wsRef, workspaceId } = this.wsRef(req.workspace_id);
     // Sending TEXT into a readonly session is allowed — the agent-layer plan
@@ -224,6 +253,7 @@ export class SessionService {
     // The grant must permit the session's OWN access mode on every send.
     this.deps.grants.authorizeAccess(workspaceId, owned.accessMode);
     // Consume synchronously before any await: only this send may use the evidence.
+    this.invalidateEvidenceOnRuntimeChange();
     const priorTurnCompleted = this.priorTurnCompletedSessions.delete(req.session_id);
     const att = await attestedState(this.deps, req.session_id, wsRef, owned.accessMode === "readonly");
     void att;
@@ -240,6 +270,12 @@ export class SessionService {
     for (;;) {
       try {
         handle = await this.deps.provider.send({
+          executionGrant: {
+            workspacePath: wsRef.workspacePath,
+            write: owned.accessMode === "write",
+            mode: owned.accessMode === "write" ? "machine-local-development" : "workspace",
+          },
+          entitlementPlan: req.entitlement_plan,
           sessionId: req.session_id,
           instruction: req.instruction,
           inputId: `z2csess-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -257,24 +293,33 @@ export class SessionService {
         // Bounded settle window exhausted (or non-transient error).
         // Mandatory Safety Gate 1: Never call stopSession merely because -32010 occurred.
         // Mandatory Safety Gate 2: Recovery allowed ONLY if BOTH:
-        //   A. this live service has positive evidence that the immediately preceding turn
-        //      for the exact same session reached a terminal/completed state through the provider completion path; AND
-        //   B. a fresh authoritative readSessionState for that exact session reports a non-running terminal/idle state.
-        if (transient && priorTurnCompleted) {
+        //   A. positive evidence that the immediately preceding turn for the exact same
+        //      session reached a terminal/completed state — in-process completion evidence,
+        //      OR authoritative runtime evidence (the runtime itself reports the session
+        //      idle AND the session carries prior assistant history, which survives a
+        //      service restart and covers the restart-during-busy case); AND
+        //   B. a fresh authoritative readSessionState for that exact session reports a
+        //      non-running terminal/idle state.
+        if (transient) {
           let freshState: SessionStateAttestation | null = null;
           try {
             freshState = await this.deps.provider.readSessionState!(req.session_id, wsRef);
           } catch {
             freshState = null;
           }
+          // Authoritative prior-turn evidence: the runtime's own status is idle
+          // (no prompt running) and the session has assistant history (a turn
+          // did complete before). marker>0 was snapshotted BEFORE this send.
+          const runtimePriorTurn = freshState?.status === "idle" && marker > 0;
           // Native session state uses exactly "idle"; all other values fail closed.
-          if (freshState?.status === "idle") {
+          if (freshState?.status === "idle" && (priorTurnCompleted || runtimePriorTurn)) {
             // Qualified stale-busy!
             // Evidence was already consumed at send entry, before the state read.
             this.deps.audit.record("warn", "session.stale_busy_recovered", {
               sessionId: req.session_id,
               workspaceId,
               status: freshState?.status ?? null,
+              evidence: priorTurnCompleted ? "in_process" : "runtime",
             });
             // Gate 4: On qualified stale-busy only: invoke provider.stopSession(sessionId) once,
             // re-read/settle if needed, then retry the original send once. Preserve session id and history/context.
@@ -282,6 +327,12 @@ export class SessionService {
             await this.deps.provider.stopSession(req.session_id);
             try {
               handle = await this.deps.provider.send({
+                executionGrant: {
+                  workspacePath: wsRef.workspacePath,
+                  write: owned.accessMode === "write",
+                  mode: owned.accessMode === "write" ? "machine-local-development" : "workspace",
+                },
+          entitlementPlan: req.entitlement_plan,
                 sessionId: req.session_id,
                 instruction: req.instruction,
                 inputId: `z2csess-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -452,6 +503,58 @@ export class SessionService {
   }
 
   /**
+   * Map a failed exact-session read to its honest observation denial, using
+   * the shared observation-error classifier:
+   *   - provable LANE failures (transport/timeout/permission/protocol) stay
+   *     SESSION_READ_UNAVAILABLE/503 — a downed lane is never disguised as a
+   *     session answer;
+   *   - "session-not-active" (e.g. a session from an earlier runtime
+   *     generation) becomes SESSION_NOT_ACTIVE/410: the CURRENT runtime could
+   *     not read this session and the state must be re-verified. This claims
+   *     nothing else — in particular it does NOT promise that a resume will
+   *     succeed;
+   *   - everything else fails closed to the historical session-level
+   *     SESSION_NOT_FOUND/404: a proven "not found/not associated" keeps the
+   *     established message, while an UNCLASSIFIABLE failure gets a neutral
+   *     message that does not assert a workspace mismatch the read never
+   *     proved.
+   * Messages are bounded and credential-free by construction.
+   */
+  private sessionReadError(sessionId: string, error: unknown): SessionServiceError {
+    const message = String((error as Error)?.message ?? error);
+    const klass = classifyObservationError(message);
+    const shortId = sessionId.slice(0, 12);
+    if (klass === "session-not-active") {
+      return new SessionServiceError(
+        `session ${shortId} is not readable in the current runtime; re-verify the session before relying on it`,
+        "SESSION_NOT_ACTIVE",
+        410,
+      );
+    }
+    if (isLaneLevelObservationError(message)) {
+      return new SessionServiceError(
+        `session state read is temporarily unavailable (lane failure, not a session answer)`,
+        "SESSION_READ_UNAVAILABLE",
+        503,
+      );
+    }
+    if (klass === "session-not-found") {
+      return new SessionServiceError(
+        `session ${shortId} is not associated with this workspace`,
+        "SESSION_NOT_FOUND",
+        404,
+      );
+    }
+    // Unclassifiable failure: fail closed to the session-level denial shape,
+    // but claim only what the failed read proved — nothing.
+    return new SessionServiceError(
+      `session ${shortId} could not be confirmed in this runtime (session read failed)`,
+      "SESSION_NOT_FOUND",
+      404,
+    );
+  }
+
+  /**
    * Discover native sessions per authorized workspace via `session/list`,
    * canonical-root filtered: a reported session is only listed when its
    * observed workspace path canonicalizes INSIDE the matching grant. Sessions
@@ -515,6 +618,16 @@ export class SessionService {
    * legal without satisfying the governed-execution policy, so observation
    * reports the OBSERVED identity with null (unproven) fields rather than
    * failing — policy gates control, not observation.
+   *
+   * Legacy sessions: a session persisted by an earlier app-server generation
+   * fails the exact-session read until it is explicitly resumed. That denial
+   * stays a session-level SESSION_NOT_ACTIVE (410) — an honest statement that
+   * the CURRENT runtime cannot read the session and its state must be
+   * re-verified; it makes no promise that a resume will succeed (the caller
+   * decides whether to resume — observation never attaches sessions
+   * implicitly). Only provable LANE failures (transport/timeout/permission/
+   * protocol) surface as SESSION_READ_UNAVAILABLE so a downed lane is never
+   * disguised as a session answer.
    */
   async observe(principal: Principal, req: { workspace_id: string; session_id: string }): Promise<SanitizedSessionState> {
     this.requireLocalOperator(principal, "observation");
@@ -524,12 +637,8 @@ export class SessionService {
     let att: SessionStateAttestation;
     try {
       att = await this.deps.provider.readSessionState!(req.session_id, wsRef);
-    } catch {
-      throw new SessionServiceError(
-        `session ${req.session_id.slice(0, 12)} is not associated with this workspace`,
-        "SESSION_NOT_FOUND",
-        404,
-      );
+    } catch (error) {
+      throw this.sessionReadError(req.session_id, error);
     }
     const grantCanonical = canonicalizeWorkspacePath(wsRef.workspacePath);
     const attCanonical = att.workspacePath ? canonicalizeWorkspacePath(att.workspacePath) : null;
@@ -548,7 +657,8 @@ export class SessionService {
    * authorized workspace (local operator only). The read is bound to the
    * authorized workspace through the provider's workspace-checked session
    * state read BEFORE any message is returned, so a session id from outside
-   * the approved roots can never leak its content.
+   * the approved roots can never leak its content. Error classes mirror
+   * observe(): session-level denial vs. lane-level unavailability.
    */
   async observeMessages(principal: Principal, req: { workspace_id: string; session_id: string; limit?: number }): Promise<Array<Record<string, unknown>>> {
     this.requireLocalOperator(principal, "message observation");
@@ -559,12 +669,8 @@ export class SessionService {
     let att: SessionStateAttestation;
     try {
       att = await this.deps.provider.readSessionState!(req.session_id, wsRef);
-    } catch {
-      throw new SessionServiceError(
-        `session ${req.session_id.slice(0, 12)} is not associated with this workspace`,
-        "SESSION_NOT_FOUND",
-        404,
-      );
+    } catch (error) {
+      throw this.sessionReadError(req.session_id, error);
     }
     const grantCanonical = canonicalizeWorkspacePath(wsRef.workspacePath);
     const attCanonical = att.workspacePath ? canonicalizeWorkspacePath(att.workspacePath) : null;

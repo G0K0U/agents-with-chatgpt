@@ -86,6 +86,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "test instruction",
       write_scope: ["src"],
+      network: false,
       provider: "gemini",
     });
     expect(validated.provider).toBe("gemini");
@@ -97,6 +98,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "test instruction",
       write_scope: ["src"],
+      network: false,
     });
     expect(validated.provider).toBe("codex");
   });
@@ -107,6 +109,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "test instruction",
       write_scope: ["src"],
+      network: false,
       provider: "codex",
     });
     expect(validated.provider).toBe("codex");
@@ -443,6 +446,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "Add a comment",
       write_scope: ["src"],
+      network: false,
     };
     const validated = validateCodexTask(workspace, input);
     expect(validated.provider).toBe("codex");
@@ -455,6 +459,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "Claude sonnet test",
       write_scope: ["src"],
+      network: false,
       provider: "gemini",
       model: "claude-sonnet-4-6",
     });
@@ -482,6 +487,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "Model on codex test",
       write_scope: ["src"],
+      network: false,
       provider: "codex",
       model: "gpt-6-astra",
     });
@@ -506,6 +512,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Task 1",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "claude-sonnet-4-6",
@@ -517,6 +524,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Task 2 continuation",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
     }, { ownerId: "user-1", sessionId: first.sessionId! });
@@ -538,6 +546,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Task 1",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "claude-sonnet-4-6",
@@ -549,6 +558,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Task 2 switch model",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "gemini-3.8-pro-high",
@@ -565,6 +575,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Do something without session",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
     });
@@ -628,6 +639,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Check model identity separation",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "gemini-3.8-pro-high",
@@ -666,6 +678,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Check lifecycle",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "gemini-3.8-flash-high",
@@ -718,6 +731,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Check onIdentity timing",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
     });

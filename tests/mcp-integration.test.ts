@@ -114,9 +114,9 @@ afterAll(async () => {
 describe("MCP tools over Streamable HTTP", () => {
   it("lists the complete stabilized tool surface and exposes its routing schemas", async () => {
     const { tools } = await client.listTools();
-    // Assert the complete native-provider tool contract (incl. the Phase-3
-    // Z2C semantic session surface forwarded by the A2C gateway).
-    expect(tools).toHaveLength(43);
+    // Assert the complete native-provider tool contract, including the
+    // Z2C semantic session and DSH native session surfaces.
+    expect(tools).toHaveLength(63);
     const names = tools.map((tool) => tool.name).sort();
     expect(names).toEqual([
       "agent_activity_list",
@@ -130,6 +130,20 @@ describe("MCP tools over Streamable HTTP", () => {
       "agent_task_read",
       "agent_usage_status",
       "cancel_codex_task",
+      "dsh_model_catalog",
+      "dsh_runtime_capabilities",
+      "dsh_session_attach",
+      "dsh_session_create",
+      "dsh_session_list",
+      "dsh_session_read",
+      "dsh_session_select_model",
+      "dsh_session_send",
+      "dsh_task_cancel",
+      "dsh_task_events",
+      "dsh_task_output",
+      "dsh_task_read",
+      "dsh_task_submit",
+      "dsh_workspace_list",
       "execution_output",
       "execution_queue",
       "execution_summary",
@@ -137,6 +151,12 @@ describe("MCP tools over Streamable HTTP", () => {
       "git_diff",
       "git_status",
       "list_directory",
+      "orchestrator_audit_claim",
+      "orchestrator_audit_submit",
+      "orchestrator_run_create",
+      "orchestrator_run_pause",
+      "orchestrator_run_read",
+      "orchestrator_run_resume",
       "read_file",
       "search_workspace",
       "submit_codex_task",
@@ -171,12 +191,32 @@ describe("MCP tools over Streamable HTTP", () => {
       const schema = tools.find((tool) => tool.name === name)?.inputSchema;
       expect(schema?.required).toEqual(expect.arrayContaining(["workspace_id"]));
     }
+    // Public plan-selection surface: the native submit/resume schemas must
+    // publish the exact entitlement enum, or explicit START/INDIVIDUAL
+    // requests could be silently stripped before the fail-closed gates.
+    for (const name of ["zcode_native_submit_task", "zcode_native_resume_session"]) {
+      const nativeSchema = tools.find((tool) => tool.name === name)?.inputSchema as {
+        properties?: { entitlement_plan?: { enum?: string[] } };
+      } | undefined;
+      expect(nativeSchema?.properties?.entitlement_plan?.enum).toEqual(["DEFAULT", "START", "INDIVIDUAL"]);
+    }
+    for (const name of ["dsh_session_create", "dsh_session_send", "dsh_task_cancel", "dsh_task_submit"]) {
+      const schema = tools.find((tool) => tool.name === name)?.inputSchema;
+      expect(schema?.required).toEqual(expect.arrayContaining(["workspace_id"]));
+    }
+    const dshSubmit = tools.find((tool) => tool.name === "dsh_task_submit")?.inputSchema;
+    expect(dshSubmit?.required).toEqual(expect.arrayContaining([
+      "provider", "workspace_id", "request_id", "model", "effort", "instruction",
+    ]));
+    const sharedList = tools.find((tool) => tool.name === "agent_session_list")?.inputSchema as
+      { properties?: { provider?: { enum?: string[] } } } | undefined;
+    expect(sharedList?.properties?.provider?.enum).toContain("dsh");
     const submitTool = tools.find((tool) => tool.name === "submit_codex_task");
     const submitSchema = submitTool?.inputSchema as {
       properties?: { network?: { default?: unknown; description?: string }; model?: unknown; effort?: { description?: string } };
     } | undefined;
     expect(submitTool?.description).toContain("network=true is rejected");
-    expect(submitSchema?.properties?.network?.default).toBe(false);
+    expect(submitSchema?.properties?.network?.default).toBe(true);
     expect(submitSchema?.properties?.network?.description).toContain("Must remain false");
     // The dynamic model-routing surface: both fields must be published.
     expect(submitSchema?.properties?.model).toBeDefined();
@@ -493,6 +533,15 @@ describe("MCP tools over Streamable HTTP", () => {
       });
       expect(nativeDenied.isError).toBe(true);
       expect(textOf(nativeDenied)).toContain("INSUFFICIENT_SCOPE");
+    }
+    for (const [name, args] of [
+      ["dsh_runtime_capabilities", {}],
+      ["dsh_session_create", { workspace_id: bridge.workspace.id, request_id: "scope-test-0001" }],
+      ["dsh_task_cancel", { workspace_id: bridge.workspace.id, task_id: `c2c_dsh_${"a".repeat(24)}` }],
+    ] as const) {
+      const dshDenied = await limitedClient.callTool({ name, arguments: args });
+      expect(dshDenied.isError).toBe(true);
+      expect(textOf(dshDenied)).toContain("INSUFFICIENT_SCOPE");
     }
     const denied = await limitedClient.callTool({ name: "git_diff", arguments: {} });
     expect(denied.isError).toBe(true);

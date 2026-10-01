@@ -19,6 +19,7 @@ import type {
 import type { SameSessionModelUpdate, SameSessionModelUpdateResult } from "../types.js";
 import { ZcodeProcess } from "./process.js";
 import { ZcodeProtocol, ZcodeProtocolError } from "./protocol.js";
+import { permitsDevelopmentOperation } from "./permissions.js";
 
 const REQUIRED_METHODS = ["session/create", "session/send", "session/list", "session/stop"] as const;
 
@@ -50,6 +51,7 @@ export class DesktopZCodeProvider implements AgentProvider {
   private protocol: ZcodeProtocol | null = null;
   private turnWaiters = new Map<string, (result: ProviderTurnResult) => void>();
   private desktopAliveCheck = false;
+  private executionGrants = new Map<string, NonNullable<ProviderSendOptions["executionGrant"]>>();
 
   constructor(private readonly cfg: Z2cConfig) {}
 
@@ -136,6 +138,7 @@ export class DesktopZCodeProvider implements AgentProvider {
         waiter({ status: "failed", detail: "desktop agent connection closed mid-turn" });
       }
       this.turnWaiters.clear();
+      this.executionGrants.clear();
     });
     socket.on("error", () => { /* handled by close */ });
 
@@ -145,7 +148,7 @@ export class DesktopZCodeProvider implements AgentProvider {
         socket.write(JSON.stringify(msg) + "\n");
       },
       on: (event: string, listener: (...args: unknown[]) => void) => emitter.on(event, listener),
-    } as unknown as ZcodeProcess);
+    } as unknown as ZcodeProcess, (params) => permitsDevelopmentOperation(params, this.executionGrants));
     this.protocol.on("notification", (rec: { method: string; params: unknown }) =>
       this.onNotification(rec.method, rec.params),
     );
@@ -253,6 +256,7 @@ export class DesktopZCodeProvider implements AgentProvider {
   }
 
   async stop(): Promise<void> {
+    this.executionGrants.clear();
     this.socket?.destroy();
     this.socket = null;
     this.protocol = null;
@@ -320,36 +324,30 @@ export class DesktopZCodeProvider implements AgentProvider {
     }));
   }
 
-  async createSession(workspace: ProviderWorkspaceRef, options?: { readonly?: boolean }): Promise<string> {
+  async createSession(workspace: ProviderWorkspaceRef, options?: { readonly?: boolean; modelId?: string; thoughtLevel?: string; providerId?: string }): Promise<string> {
     const proto = await this.ensureConnected(workspace);
-    // Desktop-managed auth: no provider registry is pushed by Z2C. The Desktop
-    // host owns the provider registry and mints all model credentials.
-    // Governed session modes (this lane has no interactive approver, so an
-    // unattended approval ask would stall the turn silently):
-    //  - readonly submissions run in plan mode — the agent layer itself
-    //    rejects mutating tools;
-    //  - workspace-write sessions run in edit mode — file edits inside the
-    //    authorized workspace are auto-approved, arbitrary commands still ask.
-    const requiredModel = {
-      providerId: "zai-api",
-      modelId: "GLM-5.3-Flash",
-    } as const;
-
-    const sessionParams = options?.readonly
-      ? {
-          workspace: this.desktopWorkspace(workspace),
-          mode: "plan",
-          persistence: "immediate",
-          model: requiredModel,
-          thoughtLevel: "max",
-        }
-      : {
-          workspace: this.desktopWorkspace(workspace),
-          mode: "edit",
-          persistence: "immediate",
-          model: requiredModel,
-          thoughtLevel: "max",
-        };
+    // Dynamic model selection: use explicitly requested model, or fall back to
+    // the config default (GLM-5.3 + max when advertised). The runtime resolves
+    // entitlement and Z2C attests the observed binding.
+    const sessionParams = {
+      workspace: this.desktopWorkspace(workspace),
+      mode: options?.readonly ? "plan" : "edit",
+      persistence: "immediate" as const,
+      ...(options?.modelId || options?.providerId
+        ? {
+            model: {
+              providerId: options?.providerId ?? "zai-api",
+              modelId: options?.modelId ?? this.cfg.requestedModelId,
+            },
+          }
+        : {
+            model: {
+              providerId: "zai-api",
+              modelId: this.cfg.requestedModelId,
+            },
+          }),
+      thoughtLevel: options?.thoughtLevel ?? this.cfg.requestedThoughtLevel,
+    };
     const res = (await proto.request(
       "session/create",
       sessionParams,
@@ -372,15 +370,30 @@ export class DesktopZCodeProvider implements AgentProvider {
 
   async send(options: ProviderSendOptions): Promise<ProviderRunHandle> {
     const proto = this.requireConnection();
+    if (this.turnWaiters.has(options.sessionId)) throw new Error("A prompt is already running for this session");
+    if (options.executionGrant && (!this.registration ||
+        canonicalizeWorkspacePath(options.executionGrant.workspacePath) !== canonicalizeWorkspacePath(this.registration.workspace))) {
+      throw new Error("Desktop execution grant does not match the connected workspace");
+    }
+    await proto.request("z2c/claimTurn", { sessionId: options.sessionId, timeoutMs: Math.min(options.timeoutMs, 900000) }, 10000);
+    if (options.executionGrant) this.executionGrants.set(options.sessionId, { ...options.executionGrant });
+    let timeoutTimer: NodeJS.Timeout;
     const completion = new Promise<ProviderTurnResult>((resolve) => {
       this.turnWaiters.set(options.sessionId, resolve);
-      setTimeout(() => {
+      timeoutTimer = setTimeout(() => {
         if (this.turnWaiters.get(options.sessionId) === resolve) {
           this.turnWaiters.delete(options.sessionId);
           resolve({ status: "failed", detail: "turn timeout" });
         }
       }, options.timeoutMs);
+      timeoutTimer.unref();
     });
+    const release = () => {
+      clearTimeout(timeoutTimer);
+      this.executionGrants.delete(options.sessionId);
+      void proto.request("z2c/releaseTurn", { sessionId: options.sessionId }, 5000).catch(() => undefined);
+    };
+    void completion.finally(release);
     try {
       await proto.request(
         "session/send",
@@ -389,12 +402,14 @@ export class DesktopZCodeProvider implements AgentProvider {
       );
     } catch (err) {
       this.turnWaiters.delete(options.sessionId);
+      release();
       throw err;
     }
     return { sessionId: options.sessionId, completion };
   }
 
   async stopSession(sessionId: string): Promise<void> {
+    this.executionGrants.delete(sessionId);
     const proto = this.requireConnection();
     await proto.request("session/stop", { sessionId }, 20000);
   }

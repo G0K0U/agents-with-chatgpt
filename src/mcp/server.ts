@@ -22,7 +22,9 @@ import { C2CSessionRegistry, SessionRegistryError, type C2CSession } from "../se
 import { registerZcodeTools } from "./zcode-tools.js";
 import { registerZcodeNativeTools } from "./zcode-native-tools.js";
 import { registerZcodeSessionTools } from "./zcode-session-tools.js";
+import { registerOrchestratorTools } from "./orchestrator-tools.js";
 import { registerAgentPlaneTools } from "./agent-plane-tools.js";
+import { registerDshNativeTools } from "./dsh-native-tools.js";
 import { registerQuantaTools } from "./quanta-tools.js";
 import { registerModelCatalogTools } from "./model-catalog-tools.js";
 import { bridgeCodexPreference, resolveCodexExecutionSelection } from "../execution/model-catalog.js";
@@ -828,7 +830,10 @@ export function createMcpServer(ctx: McpContext): McpServer {
         const selected = resolveWorkspace(args.workspace_id, extra.authInfo);
         const manager = taskManagerFor(selected);
         const access = taskAccess(extra.authInfo, selected);
-        if (args.action === "status") return ok(manager.getQueueState(access));
+        if (args.action === "status") {
+          await manager.reconcileNativeSlot();
+          return ok(manager.getQueueState(access));
+        }
         return ok(manager.setQueuePaused(args.action === "pause", access));
       } catch (error) {
         return mapError(error);
@@ -1081,11 +1086,11 @@ export function createMcpServer(ctx: McpContext): McpServer {
           ? `Submit one coding task to the local Codex App Server with the selected full filesystem/process deployment mode. `
           : `Submit one bounded coding task to the local Codex App Server. The task is limited to `) +
         (ctx.fullAccess
-          ? `The fixed task lifecycle remains the only execution surface; network access is opt-in per task. `
+          ? `The fixed task lifecycle remains the only execution surface; network access is allowed by default (omit or set network=true). Set network=false to force offline. `
           : `the declared existing workspace directories, uses workspace-write sandboxing, and has ` +
             `network access disabled. This does not expose a shell or generic command tool. ` ) +
         (ctx.fullAccess
-          ? `Omitted or false network keeps the coding turn offline; set network=true only when the local full-access deployment is explicitly authorized for network use. `
+          ? `Omitting network or setting true keeps the coding turn online; set network=false to force offline execution. `
           : `Network access is disabled for ordinary C2C coding tasks, so network=true is rejected. ` ) +
         `${UNTRUSTED_NOTE}`,
       inputSchema: z
@@ -1100,8 +1105,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
             .describe(ctx.fullAccess
               ? "Existing directories or absolute directories supplied to the full-access local task"
               : "Existing workspace-relative directories Codex may modify"),
-          network: z.boolean().default(false).describe(ctx.fullAccess
-            ? "Opt in to network access for this task; omitted or false remains offline"
+          network: z.boolean().default(true).describe(ctx.fullAccess
+            ? "Network access for this task; defaults to true (online). Set false to force offline."
             : "Must remain false; this deployment does not permit network access"),
           provider: z.enum(["codex", "gemini"]).optional().default("codex").describe("Execution backend provider; defaults to codex"),
           model: z.string().max(64).optional().describe(
@@ -1327,6 +1332,31 @@ export function createMcpServer(ctx: McpContext): McpServer {
   // native/Desktop-originated ZCode sessions via the Z2C discovery surface —
   // with workspace-authorized observation. Control stays owner-bound in the
   // provider-specific tools above; these tools are read-only by construction.
+  registerDshNativeTools(server, {
+    requireScope,
+    resolveWorkspace: (requestedId, authInfo, sessionId) => resolveWorkspace(requestedId, authInfo, sessionId),
+    visibleWorkspaces: (authInfo) => {
+      if (!registry) return [{ workspaceId: workspace.id, canonicalPath: workspace.root }];
+      const authorized = authInfo ? authWorkspaceIds(authInfo, ctx) : (ctx.authorizedWorkspaceIds ?? [...registry.enabledIds()]);
+      return authorized.flatMap((id) => {
+        try {
+          const w = registry.getWorkspace(id);
+          return [{ workspaceId: w.id, canonicalPath: w.root }];
+        } catch { return []; }
+      });
+    },
+    stateDir: ctx.stateDir,
+    ok,
+    fail,
+    mapError,
+    untrustedNote: UNTRUSTED_NOTE,
+  });
+
+  registerOrchestratorTools(server, {
+    requireScope, ok, mapError,
+    resolve: (workspaceId, auth) => taskManagerFor(resolveWorkspace(workspaceId, auth)).orchestrator,
+  });
+
   registerAgentPlaneTools(server, {
     requireScope,
     visibleWorkspaces: (authInfo) => {

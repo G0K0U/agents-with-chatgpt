@@ -161,6 +161,7 @@ describe("operator verification registry", () => {
         workspace_id: workspace.id,
         instruction: "trivial task with verification",
         write_scope: ["tests"],
+        network: false,
         run_tests: true,
       });
       // The submit path resolved the operator profile: the task was accepted
@@ -190,6 +191,7 @@ describe("operator verification registry", () => {
         workspace_id: workspace.id,
         instruction: "try to escalate",
         write_scope: ["tests"],
+        network: false,
         run_tests: true,
       });
       expect(submitted.status).toBe("failed");

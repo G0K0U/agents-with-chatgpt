@@ -13,7 +13,8 @@ import { buildZ2cService, buildMcpServer, runAsPrincipal } from "../src/service/
 import { existingService, cleanupOrphanChildren } from "../src/service/main.js";
 import { parseSessionSettingsCatalog } from "../src/providers/zcode/official.js";
 import type { SessionSnapshot } from "../src/providers/zcode/official.js";
-import type { AgentProvider, SessionStateAttestation } from "../src/providers/types.js";
+import type { AgentProvider, SessionStateAttestation, ProviderSendOptions } from "../src/providers/types.js";
+import { permitsDevelopmentOperation } from "../src/providers/zcode/permissions.js";
 import type { TaskEngine } from "../src/core/tasks/engine.js";
 import { FileAuditLog } from "../src/util/log.js";
 
@@ -28,6 +29,9 @@ const ATTESTATION: Omit<SessionStateAttestation, "sessionId" | "workspaceKey" | 
   runtimeVersion: "0.16.9",
   status: "idle",
   observedAt: "test",
+  // The runtime's own advertisement for the observed model (catalog evidence
+  // required by the 2026-09-28 catalog-driven admission policy).
+  availableModels: [{ providerId: "zai-api", modelId: "GLM-5.3-Flash", reasoningLevels: ["low", "high", "max"], reasoningDefaultLevel: "max" }],
 };
 
 class FakeOfficialProvider {
@@ -40,6 +44,7 @@ class FakeOfficialProvider {
   childPid = 424242;
   sessionPlan = new Map<string, boolean>();
   closed = new Set<string>();
+  sends: ProviderSendOptions[] = [];
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   async createSession(ws: { workspaceKey: string }, options?: { readonly?: boolean }): Promise<string> {
@@ -60,7 +65,8 @@ class FakeOfficialProvider {
       planEnabled: this.sessionPlan.get(sessionId) ?? false,
     };
   }
-  async send(opts: { sessionId: string }): Promise<{ sessionId: string; completion: Promise<{ status: string }> }> {
+  async send(opts: ProviderSendOptions): Promise<{ sessionId: string; completion: Promise<{ status: string }> }> {
+    this.sends.push(opts);
     return { sessionId: opts.sessionId, completion: Promise.resolve({ status: "completed" }) };
   }
   async snapshotAssistantMarker(): Promise<number> { return 0; }
@@ -207,6 +213,36 @@ describe("workspace authorization", () => {
 
 // ── session ownership + semantic service ────────────────────────────────────
 describe("session ownership and the semantic SessionService", () => {
+  it("Individual sends grant arbitrary local tools only to authorized write sessions", async () => {
+    const h = buildSessions(tempDir());
+    try {
+      const grant = h.grants.authorize(h.wsPath, { write: true });
+      for (const access of ["write", "readonly"] as const) {
+        const state = await h.sessions.createSession(LOCAL_PRINCIPAL, { workspace_id: grant.workspaceId, access });
+        await h.sessions.send(LOCAL_PRINCIPAL, { workspace_id: grant.workspaceId, session_id: state.session_id, instruction: "check" });
+        const dispatch = h.provider.sends.at(-1)!.executionGrant!;
+        assert.equal(dispatch.write, access === "write");
+        assert.equal(dispatch.mode, access === "write" ? "machine-local-development" : "workspace");
+        const active = new Map([[state.session_id, dispatch]]);
+        for (const [toolName, input] of [
+          ["Read", { file_path: join(h.dir, "source.ts") }],
+          ["Write", { file_path: join(h.dir, "source.ts"), content: "test" }],
+          ["Edit", { file_path: join(h.dir, "source.ts"), old_string: "a", new_string: "b" }],
+          ["Glob", { path: h.dir, pattern: "*" }],
+          ["Grep", { path: h.dir, pattern: "test" }],
+          ["Bash", { command: `git -C "${h.dir}" status` }],
+          ["Bash", { command: `pnpm --dir "${h.dir}" --version` }],
+          ["Bash", { command: `powershell -NoProfile -Command 'Get-ChildItem -LiteralPath "${h.dir}"'` }],
+        ] as const) {
+          assert.equal(permitsDevelopmentOperation({ sessionId: state.session_id, requestId: "r", toolCallId: "t", toolName, input,
+            riskLevel: "medium", options: [{ optionId: "allow_once", kind: "allow_once", response: { decision: "allow" } }] }, active), access === "write", toolName);
+        }
+      }
+    } finally {
+      rmSync(h.dir, { recursive: true, force: true });
+      rmSync(h.wsPath, { recursive: true, force: true });
+    }
+  });
   it("create attests identity and records ownership; readonly sessions require plan", async () => {
     const h = buildSessions(tempDir());
     const grant = h.grants.authorize(h.wsPath, { write: true });
@@ -573,15 +609,45 @@ describe("local service HTTP surface", () => {
     assert.deepEqual(catalog.models[0], {
       provider_id: "zai-api", model_id: "GLM-5.3-Flash", label: "GLM-5.3-Flash",
       reasoning_levels: ["medium", "max"], reasoning_default_level: "max",
+      // No access evidence on the entry → null, never a fabricated plan.
+      access_mode: null,
     });
     // Missing identity is NOT filled from the current selection.
     assert.equal(catalog.models[1].provider_id, null);
     assert.deepEqual(catalog.models[1].reasoning_levels, []);
+    assert.equal(catalog.models[1].access_mode, null);
     assert.equal(catalog.current?.model_id, "GLM-5.3-Flash");
+    assert.equal(catalog.current?.access_mode, null);
     // Both `[{value}]` and `string[]` spellings normalize to string[].
     assert.deepEqual(catalog.current_model_thought_levels, ["high", "max"]);
     // No settings at all → null (no fabricated evidence).
     assert.equal(parseSessionSettingsCatalog("sess_q", "2026-09-26T00:00:00.000Z", { settings: {} } as unknown as SessionSnapshot), null);
+  });
+
+  it("parseSessionSettingsCatalog passes access_mode through per source field and never invents a plan", () => {
+    const native = {
+      settings: {
+        model: {
+          current: { providerId: "account:zai-start-plan", modelId: "GLM-5.3-Flash", accessMode: "start-plan" },
+          available: [
+            { providerId: "account:zai-start-plan", modelId: "GLM-5.3-Flash", accessMode: "start-plan" },
+            // accountAccess.mode is the fallback source when accessMode is absent.
+            { ref: { providerId: "zai-api", modelId: "GLM-5.3-Flash" }, accountAccess: { mode: "individual-coding-plan" } },
+            // Both present: accessMode is the source of truth, no merging.
+            { modelId: "glm-dual", accessMode: "start-plan", accountAccess: { mode: "individual-coding-plan" } },
+            // Unrecognized spelling stays verbatim — an observed fact, never remapped to a known plan.
+            { modelId: "glm-experimental", accessMode: "team-experimental" },
+          ],
+        },
+      },
+    } as unknown as SessionSnapshot;
+    const catalog = parseSessionSettingsCatalog("sess_a", "2026-10-01T00:00:00.000Z", native);
+    assert.ok(catalog);
+    assert.equal(catalog.current?.access_mode, "start-plan");
+    assert.deepEqual(
+      catalog.models.map((m) => m.access_mode),
+      ["start-plan", "individual-coding-plan", "start-plan", "team-experimental"],
+    );
   });
 
   it("governed compatibility tools deny paired clients before reaching the task engine", async () => {
@@ -615,6 +681,34 @@ describe("local service HTTP surface", () => {
       assert.equal(result.isError, true, `${name} must reject foreign principal`);
     }
     assert.equal(calls, 0);
+  });
+
+  it("provider_status relays the observed entitlement capability and never invents true", async () => {
+    const dir = tempDir();
+    const engine = { getQueue: () => ({ paused: false, activeTask: null, queuedTaskCount: 0 }) } as unknown as TaskEngine;
+    const invoke = async (provider: AgentProvider): Promise<Record<string, unknown>> => {
+      const server = buildMcpServer({
+        cfg: { host: "127.0.0.1", port: 0 }, provider, engine,
+        sessions: new SessionService({ provider, grants: loadWorkspaceGrants(dir), ownership: loadSessionOwnership(dir), audit: new FileAuditLog(join(dir, "audit")) }),
+        security: loadOrCreateSecurity(dir), pairing: loadPairing(dir),
+        grants: loadWorkspaceGrants(dir), ownership: loadSessionOwnership(dir), audit: new FileAuditLog(join(dir, "audit")),
+      });
+      const registered = (server as unknown as { _registeredTools: Record<string, { handler: (args: Record<string, unknown>) => Promise<{ content: Array<{ type: string; text: string }> }> }> })._registeredTools;
+      const result = await runAsPrincipal(LOCAL_PRINCIPAL, () => registered["provider_status"]!.handler({ workspace_id: "ws" }));
+      return JSON.parse(result.content[0].text) as Record<string, unknown>;
+    };
+
+    // Observed true is relayed verbatim — exactly what the runtime advertised.
+    const supported = await invoke(Object.assign(new FakeOfficialProvider(), { entitlementSelection: { entitlementSelection: true } }) as unknown as AgentProvider);
+    assert.deepEqual(supported.entitlement_capability, { entitlementSelection: true });
+
+    // Observed false stays false — never promoted to true.
+    const unsupported = await invoke(Object.assign(new FakeOfficialProvider(), { entitlementSelection: { entitlementSelection: false } }) as unknown as AgentProvider);
+    assert.deepEqual(unsupported.entitlement_capability, { entitlementSelection: false });
+
+    // Absent provider support stays null (fail closed), never fabricated.
+    const absent = await invoke(new FakeOfficialProvider() as unknown as AgentProvider);
+    assert.equal(absent.entitlement_capability, null);
   });
 
   it("sanitized outputs never contain credential-ish fields", async () => {

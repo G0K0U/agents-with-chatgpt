@@ -371,7 +371,11 @@ export function evaluateRoute(
     "Connection mode = Desktop-managed GLM (required identity per compatibility manifest) " +
     "(observed 2026-09-12 through the live desktop-agent chain; quota evidence for this route " +
     "remains separate). This observation covers only this route and " +
-    "does not establish exhaustion of all GLM pipelines.]";
+    "does not establish exhaustion of all GLM pipelines." +
+    (glmInfo.health === "exhausted" || glm5h?.remaining_percent === 0
+      ? " When GLM is exhausted, user-specified Gemini 3.8 Flash (High) (gemini-3.8-flash-high) is the recommended candidate for selection (selection recommendation only; no extra tasks are executed autonomously)."
+      : "") +
+    "]";
 
   const reasoning =
     (preferred ? "Caller preferred " + preferred + ". " : "") +
@@ -392,5 +396,116 @@ export function evaluateRoute(
     reasoning,
     blocked_reason: null,
     quota_context: quotaContext,
+  };
+}
+
+export function evaluateGlmFailoverCandidate(telemetry: QuantaTelemetryReport): {
+  recommended_provider: "gemini";
+  recommended_model: string;
+  quota_pool_id: string;
+  suggestion_only: true;
+  auto_execute: false;
+  reason: string;
+} | null {
+  const glmRaw = telemetry.providers?.glm;
+  const glm5h = glmRaw?.five_hour_window;
+  const glmAvailable = glmRaw?.status === "available";
+  const glmInfo = evaluatePoolWindows(glm5h, glmRaw?.weekly_window, glmAvailable);
+
+  if (glmInfo.health !== "exhausted" && glm5h?.remaining_percent !== 0) {
+    return null;
+  }
+
+  return {
+    recommended_provider: "gemini",
+    recommended_model: DEFAULT_GEMINI_MODEL, // "gemini-3.8-flash-high"
+    quota_pool_id: "antigravity:gemini",
+    suggestion_only: true,
+    auto_execute: false,
+    reason: "GLM quota is exhausted; next candidate recommendation is user-specified Gemini 3.8 Flash (High) (gemini-3.8-flash-high). Selection recommendation only; no extra tasks are executed autonomously.",
+  };
+}
+
+export function recommendFailoverRoute(
+  telemetry: QuantaTelemetryReport,
+  failed: { provider: string; model?: string; poolId?: string; reason?: string }
+): {
+  decision: "route" | "blocked";
+  recommended_provider: "codex" | "gemini" | null;
+  recommended_model: string | null;
+  quota_pool_id: string | null;
+  same_pool_retry_blocked: boolean;
+  suggestion_only: boolean;
+  auto_execute: boolean;
+  reason: string;
+} {
+  const failedPool = failed.poolId ?? (
+    failed.model && /claude|gpt/i.test(failed.model) ? "antigravity:claude_gpt_shared"
+    : failed.model && /gemini/i.test(failed.model) ? "antigravity:gemini"
+    : failed.provider === "codex" ? "codex:primary"
+    : failed.provider === "glm" ? "glm"
+    : undefined
+  );
+
+  const isSharedClaudeGpt = failedPool === "antigravity:claude_gpt_shared";
+  const isGlm = failed.provider === "glm" || failedPool === "glm";
+
+  // When GLM is exhausted: user-specified Gemini 3.8 Flash High is the next candidate,
+  // presented strictly as a selection suggestion without autonomous execution.
+  if (isGlm) {
+    const glmCand = evaluateGlmFailoverCandidate(telemetry);
+    if (glmCand) {
+      return {
+        decision: "route",
+        recommended_provider: glmCand.recommended_provider,
+        recommended_model: glmCand.recommended_model,
+        quota_pool_id: glmCand.quota_pool_id,
+        same_pool_retry_blocked: false,
+        suggestion_only: true,
+        auto_execute: false,
+        reason: glmCand.reason,
+      };
+    }
+  }
+
+  // When Claude & GPT shared pool is exhausted: do NOT retry with another model in that same pool
+  // (e.g. switching from Claude to GPT inside antigravity:claude_gpt_shared is blocked).
+  if (isSharedClaudeGpt && (failed.reason === "QUOTA_EXHAUSTED" || failed.reason === "ANTIGRAVITY_QUOTA_EXHAUSTED")) {
+    const decision = evaluateRoute(telemetry, { task_type: "coding" });
+    if (decision.quota_pool_id === "antigravity:claude_gpt_shared" || decision.decision === "blocked") {
+      return {
+        decision: "blocked",
+        recommended_provider: null,
+        recommended_model: null,
+        quota_pool_id: null,
+        same_pool_retry_blocked: true,
+        suggestion_only: true,
+        auto_execute: false,
+        reason: "Claude and GPT share the exact same quota pool (antigravity:claude_gpt_shared); switching models within the exhausted pool is blocked to prevent blind retry. No alternate healthy quota pool is eligible (" + decision.reasoning + ").",
+      };
+    }
+    return {
+      decision: decision.decision,
+      recommended_provider: decision.recommended_provider,
+      recommended_model: decision.recommended_model,
+      quota_pool_id: decision.quota_pool_id,
+      same_pool_retry_blocked: true,
+      suggestion_only: true,
+      auto_execute: false,
+      reason: "Failover away from exhausted shared Claude/GPT pool: selected " + decision.recommended_provider + " (" + decision.recommended_model + ") on pool " + decision.quota_pool_id + ". Same-pool blind retry is blocked.",
+    };
+  }
+
+  // Default route evaluation
+  const decision = evaluateRoute(telemetry, { task_type: "coding" });
+  return {
+    decision: decision.decision,
+    recommended_provider: decision.recommended_provider,
+    recommended_model: decision.recommended_model,
+    quota_pool_id: decision.quota_pool_id,
+    same_pool_retry_blocked: false,
+    suggestion_only: true,
+    auto_execute: false,
+    reason: decision.reasoning,
   };
 }

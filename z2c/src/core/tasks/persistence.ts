@@ -115,6 +115,18 @@ export class Persistence {
     return t;
   }
 
+  /**
+   * Persist an output reference on an already-terminal (or terminal-bound)
+   * task without touching status/completion fields — used by the failure
+   * path that saves partial checkpoint output.
+   */
+  attachOutput(taskId: string, outputId: string): void {
+    const t = this.findTask(taskId);
+    if (!t) throw new Error(`task not found: ${taskId}`);
+    t.outputId = outputId;
+    this.save();
+  }
+
   getOrCreateQueue(workspaceId: string): QueueState {
     let q = this.state.queues[workspaceId];
     if (!q) {

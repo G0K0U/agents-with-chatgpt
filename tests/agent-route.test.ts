@@ -4,6 +4,8 @@ import {
   evaluateRoute,
   calculateHealthFromRemaining,
   evaluatePoolWindows,
+  evaluateGlmFailoverCandidate,
+  recommendFailoverRoute,
   type AgentRouteTaskType,
   type AgentRouteRiskLevel,
   type AgentRoutePreferredProvider,
@@ -463,6 +465,93 @@ describe("Policy-Governed Agent Router (agent_route)", () => {
       expect(result.health).toBe("critical");
       expect(result.isExhausted).toBe(false);
       expect(result.isHealthy).toBe(false);
+    });
+  });
+
+  describe("Quota exhaustion failover and recommendation policy", () => {
+    it("Claude and GPT shared pool does NOT blind retry within the exhausted pool", () => {
+      // Shared pool is exhausted (0%), but Codex and Gemini pools are healthy
+      const telemetry = createMockTelemetry({
+        claudeGpt5h: 0,
+        codex5h: 80,
+        gemini5h: 90,
+      });
+
+      const failover = recommendFailoverRoute(telemetry, {
+        provider: "gemini",
+        model: "claude-opus-4-6-thinking",
+        poolId: "antigravity:claude_gpt_shared",
+        reason: "QUOTA_EXHAUSTED",
+      });
+
+      expect(failover.same_pool_retry_blocked).toBe(true);
+      expect(failover.suggestion_only).toBe(true);
+      expect(failover.auto_execute).toBe(false);
+      // Must NOT recommend any Claude or GPT model from the exhausted shared pool
+      expect(failover.quota_pool_id).not.toBe("antigravity:claude_gpt_shared");
+      expect(failover.recommended_model).not.toMatch(/claude|gpt/i);
+      expect(failover.decision).toBe("route");
+    });
+
+    it("blocks routing if all other pools are unavailable and does not retry within exhausted shared pool", () => {
+      // Shared pool exhausted, Codex unavailable, Gemini exhausted
+      const telemetry = createMockTelemetry({
+        claudeGpt5h: 0,
+        gemini5h: 0,
+      });
+      telemetry.providers.codex.status = "unavailable";
+
+      const failover = recommendFailoverRoute(telemetry, {
+        provider: "gemini",
+        model: "claude-sonnet-4-6",
+        poolId: "antigravity:claude_gpt_shared",
+        reason: "QUOTA_EXHAUSTED",
+      });
+
+      expect(failover.decision).toBe("blocked");
+      expect(failover.same_pool_retry_blocked).toBe(true);
+      expect(failover.recommended_provider).toBeNull();
+      expect(failover.recommended_model).toBeNull();
+      expect(failover.reason).toContain("blocked to prevent blind retry");
+    });
+
+    it("GLM exhausted next candidate is user-specified Gemini 3.8 Flash (High) as recommendation only", () => {
+      // GLM 5h exhausted
+      const telemetry = createMockTelemetry({ glm5h: 0 });
+
+      // Direct GLM candidate evaluation
+      const candidate = evaluateGlmFailoverCandidate(telemetry);
+      expect(candidate).not.toBeNull();
+      expect(candidate!.recommended_provider).toBe("gemini");
+      expect(candidate!.recommended_model).toBe("gemini-3.8-flash-high");
+      expect(candidate!.quota_pool_id).toBe("antigravity:gemini");
+      expect(candidate!.suggestion_only).toBe(true);
+      expect(candidate!.auto_execute).toBe(false);
+      expect(candidate!.reason).toContain("gemini-3.8-flash-high");
+      expect(candidate!.reason).toContain("Selection recommendation only; no extra tasks are executed autonomously");
+
+      // Through recommendFailoverRoute
+      const failover = recommendFailoverRoute(telemetry, {
+        provider: "glm",
+        poolId: "glm",
+        reason: "QUOTA_EXHAUSTED",
+      });
+      expect(failover.decision).toBe("route");
+      expect(failover.recommended_provider).toBe("gemini");
+      expect(failover.recommended_model).toBe("gemini-3.8-flash-high");
+      expect(failover.quota_pool_id).toBe("antigravity:gemini");
+      expect(failover.suggestion_only).toBe(true);
+      expect(failover.auto_execute).toBe(false);
+
+      // In evaluateRoute note
+      const route = evaluateRoute(telemetry, { task_type: "coding" });
+      expect(route.reasoning).toContain("When GLM is exhausted, user-specified Gemini 3.8 Flash (High) (gemini-3.8-flash-high) is the recommended candidate for selection (selection recommendation only; no extra tasks are executed autonomously).");
+    });
+
+    it("GLM failover candidate is null when GLM has quota headroom", () => {
+      const telemetry = createMockTelemetry({ glm5h: 80 });
+      const candidate = evaluateGlmFailoverCandidate(telemetry);
+      expect(candidate).toBeNull();
     });
   });
 });

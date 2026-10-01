@@ -5,7 +5,14 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
-import { AntigravityBackend, projectAntigravityFailure } from "../src/execution/antigravity.js";
+import {
+  AntigravityBackend,
+  projectAntigravityFailure,
+  canonicalizeAntigravityModel,
+  extractAntigravityFailureDetails,
+  parseAntigravityDuration,
+  resolveAntigravityModelEvidence,
+} from "../src/execution/antigravity.js";
 import type { BackendExecutionRequest } from "../src/execution/backend.js";
 import { CodexTaskManager } from "../src/execution/tasks.js";
 import type { VerificationProfile } from "../src/execution/verification.js";
@@ -542,6 +549,42 @@ describe("G3 Antigravity full-workspace contract", () => {
     expect(projectAntigravityFailure("exit code 2 token=fixture-secret")).toBe("CLI_EXIT_UNCLASSIFIED");
     expect(projectAntigravityFailure("unknown flag: --private=fixture-secret")).toBe("INVALID_ARGUMENTS");
     expect(projectAntigravityFailure("workspace does not exist: private-path")).toBe("WORKSPACE_UNAVAILABLE");
+  });
+
+  it("classifies real-world quota wording without misreading auth errors", () => {
+    expect(projectAntigravityFailure("quota exhausted for today, resets in 5h 30m")).toBe("QUOTA_EXHAUSTED");
+    expect(projectAntigravityFailure("You have reached your usage limit")).toBe("QUOTA_EXHAUSTED");
+    expect(projectAntigravityFailure("Account usage limit exceeded, please retry later")).toBe("QUOTA_EXHAUSTED");
+    expect(projectAntigravityFailure("insufficient_quota: You exceeded your current quota")).toBe("QUOTA_EXHAUSTED");
+    expect(projectAntigravityFailure("HTTP 429: too many requests")).toBe("RATE_LIMITED");
+    expect(projectAntigravityFailure("fatal error: panic: runtime error")).toBe("CRASH");
+    // Auth evidence wins even when the message also mentions quota/limits.
+    expect(projectAntigravityFailure("authentication failed: usage limit exceeded")).toBe("AUTH_ERROR");
+    expect(projectAntigravityFailure("unauthorized: quota exhausted")).toBe("AUTH_ERROR");
+    // Model identity dominates a combined model+quota sentence (test parity).
+    expect(projectAntigravityFailure("model gemini-unknown not found or quota exhausted")).toBe("MODEL_UNAVAILABLE");
+  });
+
+  it("model evidence comes from real artifacts; unknown effort stays null, never a status string", () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-g3-test-"));
+    roots.push(parent);
+    // Protocol echo of a base model id keeps the decimal version and leaves effort unset.
+    expect(resolveAntigravityModelEvidence({ protocolModel: "gemini-3.8-flash", isolatedHome: parent }))
+      .toMatchObject({ modelId: "gemini-3.8-flash", effort: null, effortStatus: "unverified" });
+    expect(resolveAntigravityModelEvidence({ protocolModel: "gemini-3.8-flash-high", isolatedHome: parent }))
+      .toMatchObject({ modelId: "gemini-3.8-flash-high", effort: "high", effortStatus: "verified" });
+    // CLI log lines: full label keeps the decimal version; a base-model line must not invent effort.
+    const logDir = path.join(parent, ".gemini", "antigravity-cli", "log");
+    fs.mkdirSync(logDir, { recursive: true });
+    const fullLabelLog = path.join(logDir, "cli-1.log");
+    fs.writeFileSync(fullLabelLog, 'Propagating selected model override to backend: label="Gemini 3.8 Flash High"\n');
+    const stale = new Date(Date.now() - 60_000);
+    fs.utimesSync(fullLabelLog, stale, stale);
+    fs.writeFileSync(path.join(logDir, "cli-2.log"), 'Print mode: starting (model="gemini-3.8-flash")\n');
+    expect(resolveAntigravityModelEvidence({ isolatedHome: parent }))
+      .toMatchObject({ modelId: "gemini-3.8-flash", effort: null, effortStatus: "unverified", evidenceSource: "cli_log" });
+    expect(resolveAntigravityModelEvidence({ isolatedHome: parent, startedAt: Date.now() - 120_000, protocolModel: null }))
+      .toMatchObject({ modelId: "gemini-3.8-flash", effort: null, effortStatus: "unverified", evidenceSource: "cli_log" });
   });
 
   it("isolated config serializes only policy and scrubs synthetic bridge credentials", () => {

@@ -39,13 +39,41 @@ export interface NotificationRecord {
 
 export type ClientRequestPolicy = "answer" | "reject";
 
+/**
+ * Sanitized observability record for one permission callback decision. The
+ * callback IS the policy: decisions here are policy auto-decisions, never a
+ * human verdict, and no UI delivery status exists on this surface. Correlation
+ * fields are bounded protocol identifiers — never command contents or other
+ * provider input.
+ */
+export interface PermissionDecisionRecord {
+  allowed: boolean;
+  /** Structured policy denial reason code; null when allowed or unclassified. */
+  reason: string | null;
+  /** Always "policy": this layer never asks a human and never reports UI delivery. */
+  source: "policy";
+  correlation: {
+    sessionId: string | null;
+    requestId: string | null;
+    toolCallId: string | null;
+    toolName: string | null;
+    riskLevel: string | null;
+  };
+  at: string;
+}
+
+/** Permission callbacks may return a bare boolean or a decision with a reason code. */
+export type PermissionCallbackResult = boolean | { allowed: boolean; reason?: string | null };
+
+function boundedCorrelationField(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value.slice(0, 80) : null;
+}
+
 const RUNTIME_PREFERENCES_DEFAULTS = {
   nativeSearchEnhancementsEnabled: false,
   memoryEnabled: false,
-  // Governed unattended lanes: NEVER auto-resolve interactions. Auto-resolution
-  // was observed live to auto-approve ExitPlanMode — silently exiting readonly
-  // plan mode mid-turn. Ask/permission resolution is a local-user decision
-  // (docs/z2c-permission-model.md); anything unattended resolves to deny/timeout.
+  // Never auto-resolve questions or ExitPlanMode. Tool permissions use the
+  // separate explicit turn-scoped policy below, never native blanket approval.
   askUserQuestionAutoResolutionEnabled: false,
 };
 
@@ -66,7 +94,7 @@ export class ZcodeProtocol extends EventEmitter {
   readonly unanswerableClientRequests: Array<{ id: string; method: string }> = [];
   private sentMethods: string[] = [];
 
-  constructor(private readonly process: ProtocolTransport) {
+  constructor(private readonly process: ProtocolTransport, private readonly permission?: (params: unknown) => PermissionCallbackResult) {
     super();
     process.on("message", (msg: unknown) => this.onMessage(msg));
     process.on("malformed", (line: string) => this.emit("malformed", line));
@@ -112,6 +140,7 @@ export class ZcodeProtocol extends EventEmitter {
       //  - interaction/requestProviderRuntimeHeaders: confirms that provider auth
       //    headers are managed (ours come from the child's own env var); the
       //    bridge never supplies or relays credentials.
+      // Tool permissions require an explicit turn-scoped policy callback.
       // Everything else is rejected (fail closed) and recorded.
       if (m.method === "session/requestRuntimePreferences") {
         this.process.write({ id, result: RUNTIME_PREFERENCES_DEFAULTS });
@@ -119,6 +148,36 @@ export class ZcodeProtocol extends EventEmitter {
       }
       if (m.method === "interaction/requestProviderRuntimeHeaders") {
         this.process.write({ id, result: { headersApplied: true } });
+        return;
+      }
+      if (m.method === "interaction/requestPermission") {
+        let allowed = false;
+        let reason: string | null = null;
+        try {
+          const decision = this.permission?.(m.params);
+          if (typeof decision === "boolean") allowed = decision;
+          else if (decision && typeof decision === "object") {
+            allowed = decision.allowed === true;
+            reason = typeof decision.reason === "string" && decision.reason.length > 0 ? decision.reason : null;
+          }
+        } catch { /* deny */ reason = "callback-error"; }
+        // Never echo provider input, reasons, options, or credential material
+        // on the wire; the wire decision stays the bare allow/deny boolean.
+        this.process.write({ id, result: { decision: allowed ? "allow" : "deny" } });
+        const params = (m.params && typeof m.params === "object" ? m.params : {}) as Record<string, unknown>;
+        this.emit("permission-decision", {
+          allowed,
+          reason: allowed ? null : reason,
+          source: "policy",
+          correlation: {
+            sessionId: boundedCorrelationField(params.sessionId),
+            requestId: boundedCorrelationField(params.requestId),
+            toolCallId: boundedCorrelationField(params.toolCallId),
+            toolName: boundedCorrelationField(params.toolName),
+            riskLevel: boundedCorrelationField(params.riskLevel),
+          },
+          at: new Date().toISOString(),
+        } satisfies PermissionDecisionRecord);
         return;
       }
       this.unanswerableClientRequests.push({ id: String(id), method: m.method });

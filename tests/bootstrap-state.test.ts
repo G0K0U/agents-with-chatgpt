@@ -113,6 +113,7 @@ describe("Codex bootstrap task/session/slot state", () => {
       workspace_id: workspace.id,
       instruction: "persist before acknowledgement",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
 
@@ -130,6 +131,7 @@ describe("Codex bootstrap task/session/slot state", () => {
       workspace_id: workspace.id,
       instruction: "cancel immediately after submit",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     const cancelled = await manager.cancel(submitted.taskId);
@@ -151,6 +153,7 @@ describe("Codex bootstrap task/session/slot state", () => {
       workspace_id: workspace.id,
       instruction: "create a terminal task for restart reconciliation",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     await waitForTerminal(manager, submitted.taskId);
@@ -169,6 +172,7 @@ describe("Codex bootstrap task/session/slot state", () => {
       workspace_id: workspace.id,
       instruction: "release the writer slot at terminal",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     const terminal = await waitForTerminal(manager, submitted.taskId);
@@ -508,6 +512,7 @@ describe("Codex bootstrap task/session/slot state", () => {
       workspace_id: workspace.id,
       instruction: "hold the writer so the next task is queued",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     for (let i = 0; i < 100; i++) {
@@ -520,6 +525,7 @@ describe("Codex bootstrap task/session/slot state", () => {
       workspace_id: workspace.id,
       instruction: "resume this queued task after the controlled restart",
       write_scope: ["tests"],
+      network: false,
       run_tests: false,
     });
     expect(manager.get(queued.taskId)).toMatchObject({ status: "queued", queuePosition: expect.any(Number) });

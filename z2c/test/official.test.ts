@@ -88,6 +88,10 @@ describe("ZcodeOfficialProvider (official open-source app-server contract)", () 
       assert.match(sessionId, /^sess_[0-9a-f-]{36}$/);
       const att = await h.provider.readSessionState(sessionId, h.workspace);
       assert.equal(att.sessionId, sessionId);
+      // Session-plane readback with no runtime entitlement evidence: the
+      // request side stays UNPROVEN (null) — "DEFAULT" would fabricate a
+      // request fact; the task plane attests concrete plans separately.
+      assert.deepEqual(att.entitlement, { requested: null, observed: null, access_mode: null, source: "unavailable" });
       assert.equal(att.workspaceKey, h.workspace.workspaceKey);
       assert.equal(att.workspacePath, h.workspace.workspacePath);
       assert.equal(att.providerId, "zai-api"); // resolved from ZCode's own state (same-provider request), never hardcoded
@@ -136,12 +140,12 @@ describe("ZcodeOfficialProvider (official open-source app-server contract)", () 
     }
   });
 
-  it("fails closed when the requested thought level is not supported", async () => {
+  it("fails closed when the requested thought level is not advertised for the current model", async () => {
     const h = await buildHarness();
     try {
       await assert.rejects(
         async () => h.provider.createSession(h.workspace, { thoughtLevel: "ultra" }),
-        /thought level ultra is not supported/,
+        /thought level ultra is not advertised/,
       );
     } finally {
       await stopHarness(h);
@@ -520,4 +524,16 @@ describe("ZcodeOfficialProvider (official open-source app-server contract)", () 
       }
     });
   });
+});
+
+
+it("official provider rejects explicit billing plans before any protocol dispatch", async () => {
+  const provider = new ZcodeOfficialProvider(loadConfig());
+  const ws = { workspacePath: process.cwd(), workspaceKey: process.cwd() };
+  for (const entitlementPlan of ["START", "INDIVIDUAL"] as const) {
+    await assert.rejects(provider.createSession(ws, { entitlementPlan }), { code: "ENTITLEMENT_UNAVAILABLE" });
+    await assert.rejects(provider.resumeSession(ws, "sess_00000000-0000-0000-0000-000000000001", { entitlementPlan }), { code: "ENTITLEMENT_UNAVAILABLE" });
+    await assert.rejects(provider.send({ sessionId: "unused", instruction: "OK", inputId: "input", timeoutMs: 100, entitlementPlan }), { code: "ENTITLEMENT_UNAVAILABLE" });
+  }
+  assert.equal(provider.childPid, null);
 });

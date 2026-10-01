@@ -15,8 +15,8 @@ import { saveExecutionOutput } from "../src/execution/output.js";
  * restart durability.
  */
 
-const WS_A = "f:\\examplework\\engineering-ai";
-const WS_B = "f:\\examplework\\other-project";
+const WS_A = "f:\workspaces\engineering-ai";
+const WS_B = "f:\workspaces\other-project";
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), "agent-plane-"));

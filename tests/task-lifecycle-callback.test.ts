@@ -149,6 +149,7 @@ describe("CodexTaskManager lifecycle callback plumbing", () => {
       workspace_id: workspace.id,
       instruction: "Add feature A",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
     };
 
@@ -236,6 +237,7 @@ describe("CodexTaskManager lifecycle callback plumbing", () => {
       workspace_id: workspace.id,
       instruction: "Long running task",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
     };
 
@@ -284,6 +286,7 @@ describe("CodexTaskManager lifecycle callback plumbing", () => {
       workspace_id: workspace.id,
       instruction: "Failing task",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
     };
 

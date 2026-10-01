@@ -13,7 +13,7 @@ import type {
 } from "../src/execution/app-server.js";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { getStateDir } from "../src/config/paths.js";
-import { cleanup, fakeCodexCatalog, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+import { cleanup, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 class FullAccessFakeAppServer implements AppServerClient {
   private notificationHandler: ((notification: AppServerNotification) => void | Promise<void>) | null = null;
@@ -114,7 +114,7 @@ describe("full-access bridge MCP lifecycle", () => {
     write(root, "package.json", JSON.stringify({ name: "full-access-e2e", scripts: { test: "node --version" } }));
     authFile = path.join(makeTmpDir("full-access-auth"), "store.json");
     const factory = (_options: AppServerFactoryOptions): AppServerClient => new FullAccessFakeAppServer();
-    bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false, authStoreFile: authFile, fullAccess: true, appServerFactory: factory, modelCatalog: fakeCodexCatalog(root) });
+    bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false, authStoreFile: authFile, fullAccess: true, appServerFactory: factory });
     bridgeWorkspaceId = bridge.registry.listMetadata().find((entry) => ["a2c-bridge", "c2c-bridge"].includes(entry.name))!.id;
     token = bridge.authStore.issueTokens({
       clientId: "full-access-owner",
@@ -131,15 +131,15 @@ describe("full-access bridge MCP lifecycle", () => {
     delete process.env.C2C_STATE_DIR;
   });
 
-  it("describes network as an explicit per-task opt-in in the authorized deployment", async () => {
+  it("describes the per-task network default in the authorized deployment", async () => {
     const { tools } = await client.listTools();
     const submitTool = tools.find((tool) => tool.name === "submit_codex_task");
     const submitSchema = submitTool?.inputSchema as {
       properties?: { network?: { default?: unknown; description?: string } };
     } | undefined;
-    expect(submitTool?.description).toContain("network access is opt-in per task");
-    expect(submitSchema?.properties?.network?.default).toBe(false);
-    expect(submitSchema?.properties?.network?.description).toContain("Opt in");
+    expect(submitTool?.description).toContain("network access is allowed by default");
+    expect(submitSchema?.properties?.network?.default).toBe(true);
+    expect(submitSchema?.properties?.network?.description).toContain("defaults to true");
   });
 
   it("routes a full-access task, links it to a session, and hides raw thread ids", async () => {
@@ -154,7 +154,7 @@ describe("full-access bridge MCP lifecycle", () => {
     }));
     expect(submitted.workspaceId).toBe(bridgeWorkspaceId);
     expect(submitted.sessionId).toMatch(/^c2cs_/);
-    expect(submitted.network).toBe(false);
+    expect(submitted.network).toBe(true);
 
     const task = await waitForTerminal(client, bridgeWorkspaceId, submitted.taskId);
     expect(task.status).toBe("completed");
@@ -170,7 +170,7 @@ describe("full-access bridge MCP lifecycle", () => {
     expect(summary.latestActiveSession?.workspaceId).toBe(bridgeWorkspaceId);
     expect(summary.latestActiveSession?.lastTaskId).toBe(submitted.taskId);
     expect(summary.sessions.some((session) => session.id === submitted.sessionId)).toBe(true);
-    expect(summary.records.find((record) => record.taskId === submitted.taskId)?.network).toBe(false);
+    expect(summary.records.find((record) => record.taskId === submitted.taskId)?.network).toBe(true);
   });
 
   it("updates the same session on continuation and enforces owner checks", async () => {
@@ -244,6 +244,7 @@ describe("full-access bridge MCP lifecycle", () => {
         workspace_id: otherWorkspaceId,
         instruction: "run an ordinary task in the other authorized workspace",
         write_scope: ["."],
+        network: false,
         run_tests: false,
       },
     }));
@@ -294,7 +295,7 @@ describe("full-access bridge MCP lifecycle", () => {
     await bridge.close();
 
     const factory = (_options: AppServerFactoryOptions): AppServerClient => new FullAccessFakeAppServer();
-    bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false, authStoreFile: authFile, fullAccess: true, appServerFactory: factory, modelCatalog: fakeCodexCatalog(root) });
+    bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false, authStoreFile: authFile, fullAccess: true, appServerFactory: factory });
     client = await connect(token);
 
     const after = jsonOf<{ latestActiveSession: { id: string; workspaceId: string } | null }>(await client.callTool({

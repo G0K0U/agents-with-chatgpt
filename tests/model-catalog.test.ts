@@ -42,6 +42,37 @@ const codexEntry = (id: string, efforts: string[], extra: Record<string, unknown
   ...extra,
 });
 
+describe("DSH first-class model catalog", () => {
+  it("projects exact local capabilities and resolves GSQ with high effort", async () => {
+    const generation = "dsh-test-generation";
+    const service = new ModelCatalogService({
+      workspaceRoot: process.cwd(),
+      dshHealth: async () => ({ adapter: "dsh-a2c-native-session-adapter", version: "0.2.0",
+        generation, hostPid: 1, dshVersion: "2.0.13-beta.1", harnessVersion: "0.1.6-alpha.2",
+        capabilities: { selectedTask: true, modelSelectionScope: "transactional-global-lease" } }),
+      dshModelCatalog: async () => ({ generation, default: { provider: "qqz-kvmem",
+        model: "Bonsai2-CRACK-PQ2.ninfer" }, groups: [{ id: "qqz-kvmem", name: "Local",
+        models: [{ id: "Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf", name: "GSQ",
+          slot: "a", backend: "kvmem", profile: "vision:fast", contextWindow: 131072,
+          inputModalities: ["text", "image"], multimodalEvidence: "configured mmproj file and vision profiles",
+          reasoning: { efforts: ["low", "medium", "high"].map((id) => ({ id })) } },
+        { id: "Bonsai2-CRACK-PQ2.ninfer", name: "CRACK", slot: "b", backend: "ninfer",
+          profile: "text:fast", contextWindow: 262144, inputModalities: ["text"],
+          reasoning: { efforts: ["low", "medium", "high"].map((id) => ({ id })) } }] }] }),
+    });
+    const catalog = await service.get(["dsh"]);
+    const section = catalog.agents[0]!;
+    expect(section.agent).toBe("dsh");
+    expect(section.capabilities?.modelSelectionScope).toBe("transactional-global-lease");
+    const gsq = section.models.find((entry) => entry.model_id.includes("GSQ"))!;
+    expect(gsq.input_modalities).toEqual(["text", "image"]);
+    expect(gsq.context_window).toBe(131072);
+    expect(gsq.model_selection_scope).toBe("transactional-global-lease");
+    expect(resolveModelSelection(catalog, { agent: "dsh", model: gsq.model_id, effort: "high" }).selection)
+      .toMatchObject({ agent: "dsh", model_id: gsq.model_id, effort: "high" });
+  });
+});
+
 function codexService(pages: CodexModelListPage[], opts: ConstructorParameters<typeof ModelCatalogService>[0] = {}) {
   return new ModelCatalogService({
     logger: nullLogger,
