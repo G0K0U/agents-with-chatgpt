@@ -23,6 +23,11 @@ describe("detached restart handoff (offline)", () => {
         workspaceRoot: root, workspaceId: stableWorkspaceId(root), stateDir: state, adminToken: "SECRET-ADMIN", publicUrl: null } }; }),
       tunnel: vi.fn(async () => true),
     };
+    // The fake old-bridge pid (1001) must never be resolved against the real
+    // process tree: on shared runners pid reuse can make it a genuine
+    // ancestor of this worker. Happy-path tests stub the fence; the
+    // ancestry/env-fenced tests below exercise the real rejection paths.
+    deps.isTaskDescendant = vi.fn(() => false);
   });
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); cleanup(base); });
   const request = (tunnel = false) => requestRestart(root, { stateDir: state, tunnel }, deps);
@@ -505,6 +510,8 @@ describe("restart helper readiness semantics (eventual success is not START_FAIL
       ensure: vi.fn(async () => { throw new Error("Bridge did not become healthy within 20s. See log"); }),
       tunnel: vi.fn(async () => true),
     };
+    // Same pid-reuse rationale as the offline describe block above.
+    deps.isTaskDescendant = vi.fn(() => false);
   });
   afterEach(() => { vi.restoreAllMocks(); cleanup(base); });
 
