@@ -140,6 +140,15 @@ export interface EnsureBridgeResult {
 
 export interface EnsureBridgeOptions extends SharedBridgeObservationOptions {
   port?: number;
+  /**
+   * How long to wait for a freshly spawned bridge to become healthy. The
+   * default stays 20s for interactive callers; the detached restart helper
+   * passes its remaining handoff budget because a cold replacement may
+   * legitimately take longer (state replay, Z2C/ChatGPT linkage) while still
+   * being the SAME single spawned child — a live child is progress, not
+   * failure, and only a real health observation completes the start.
+   */
+  startTimeoutMs?: number;
 }
 
 export interface StopBridgeOptions extends SharedBridgeObservationOptions {
@@ -372,7 +381,9 @@ export async function ensureBridge(workspaceRoot: string, opts: EnsureBridgeOpti
   child.unref();
   fs.closeSync(out);
 
-  const deadline = Date.now() + 20_000;
+  const requestedTimeout = opts.startTimeoutMs ?? 20_000;
+  const startTimeoutMs = Math.max(5_000, Math.min(170_000, requestedTimeout));
+  const deadline = Date.now() + startTimeoutMs;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 300));
     const runtime = await findLiveBridge(workspace.id, workspace.root, { ...opts, stateDir });
@@ -381,7 +392,13 @@ export async function ensureBridge(workspaceRoot: string, opts: EnsureBridgeOpti
       throw new Error(`Bridge process exited with code ${child.exitCode}. See ${logFile}`);
     }
   }
-  throw new Error(`Bridge did not become healthy within 20s. See ${logFile}`);
+  // Readiness condition (not just a bigger number): the spawned child is the
+  // only thing that can publish this workspace's runtime pointer, and a live
+  // child that has not exited is still starting. The bound is the caller's
+  // explicit budget; exceeding it with a live child fails closed — but the
+  // detached restart helper re-observes before declaring failure, so a
+  // slow-but-successful replacement is never falsely reported as failed.
+  throw new Error(`Bridge did not become healthy within ${Math.round(startTimeoutMs / 1000)}s. See ${logFile}`);
 }
 
 export async function adminFetch<T = unknown>(

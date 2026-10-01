@@ -86,6 +86,14 @@ class FakeNative {
     observeTask?.({ ...this.tasks.get(input.task_id)! });
     return { ...input, session_id: this.tasks.get(input.task_id)!.session_id, text: "fixture" };
   }
+  async resolveKeyedTask(): Promise<ZcodeNativeTaskView | null> { return null; }
+  async projectWorkspace(workspaceId: string): Promise<{ nativeWorkspaceId: string; canonicalPath: string }> {
+    // Identity mapping: the stub upstream accepts the same ids it echoes.
+    return { nativeWorkspaceId: workspaceId, canonicalPath: "fixture-root" };
+  }
+  async taskLaneStatus(): Promise<{ provider_healthy: boolean; provider_status: string; active_task: string | null; queued_task_count: number; paused: boolean }> {
+    return { provider_healthy: true, provider_status: "healthy", active_task: null, queued_task_count: 0, paused: false };
+  }
 }
 
 describe("G4 unified native/direct provider lifecycle (offline)", () => {

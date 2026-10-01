@@ -10,7 +10,7 @@ import { loadSessionOwnership } from "../src/authz/ownership.js";
 import type { AgentProvider, SessionStateAttestation, ProviderSendOptions, ProviderRunHandle } from "../src/providers/types.js";
 import { FileAuditLog } from "../src/util/log.js";
 
-const CANONICAL = "f:\\examplework\\engineering-ai";
+const CANONICAL = "f:\workspaces\engineering-ai";
 
 function buildAttestation(sessionId: string, status: string | null = "idle"): SessionStateAttestation {
   return {
@@ -26,6 +26,7 @@ function buildAttestation(sessionId: string, status: string | null = "idle"): Se
     runtimeVersion: "0.16.9",
     status,
     observedAt: new Date().toISOString(),
+    availableModels: [{ providerId: "zai-api", modelId: "GLM-5.3-Flash", reasoningLevels: ["low", "high", "max"], reasoningDefaultLevel: "max" }],
   };
 }
 
@@ -44,6 +45,8 @@ class TestableProvider {
   reportedStatus: string | null = "idle";
   failReadSessionState: Error | null = null;
   turnStatusToReturn: "completed" | "failed" | "stopped" = "completed";
+  /** Simulated app-server child generation (bumped on respawn). */
+  runtimeGeneration = 0;
 
   /**
    * Function controlling behavior of send(): returns handle or throws error.
@@ -169,6 +172,9 @@ describe("SessionService stale-busy recovery and safety gates", () => {
       // Turn 1 completes cleanly through the provider completion path
       const turn1 = await ctx.svc.send(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, session_id: sessionId, instruction: "turn 1" });
       assert.equal(turn1.turn, "completed");
+      assert.deepEqual(ctx.provider.sendInvocations[0].executionGrant, {
+        workspacePath: ctx.ws.toLowerCase(), write: true, mode: "machine-local-development",
+      });
       assert.equal(ctx.provider.stopSessionCalls.length, 0, "Turn 1 must not call stopSession");
 
       // Turn 2: simulate ZCode 0.16.9 stuck prompt state where send throws -32010
@@ -195,6 +201,9 @@ describe("SessionService stale-busy recovery and safety gates", () => {
 
       const sendsBeforeRecovery = ctx.provider.sendInvocations.length;
       const turn2 = await ctx.svc.send(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, session_id: sessionId, instruction: "turn 2" });
+      for (const send of ctx.provider.sendInvocations) {
+        assert.deepEqual(send.executionGrant, ctx.provider.sendInvocations[0].executionGrant);
+      }
       assert.equal(turn2.turn, "completed");
       const recoverySends = ctx.provider.sendInvocations.slice(sendsBeforeRecovery);
       assert.ok(recoverySends.length >= 3, "normal settle retries precede recovery");
@@ -423,6 +432,91 @@ describe("SessionService stale-busy recovery and safety gates", () => {
       } finally { ctx.cleanup(); }
     });
   }
+
+  it("restart with RUNTIME evidence: no in-memory evidence, but authoritative idle + prior assistant history recovers exactly once", async () => {
+    const ctx = setupTestContext();
+    try {
+      const created = await ctx.svc.createSession(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, access: "write" });
+      const sessionId = created.session_id;
+
+      // Simulate a service restart: in-memory completed-turn evidence is gone
+      // (fresh SessionService). The runtime itself still proves the previous
+      // turn: status idle + assistant history exists (marker > 0).
+      ctx.provider.snapshotAssistantMarker = async () => 1;
+      ctx.provider.reportedStatus = "idle";
+      let busy = true;
+      ctx.provider.sendHandler = async (options) => {
+        if (busy) {
+          throw new Error("ZCode Protocol error -32010: A prompt is already running for this session");
+        }
+        return { sessionId: options.sessionId, completion: Promise.resolve({ status: "completed" }) };
+      };
+      const originalStopSession = ctx.provider.stopSession.bind(ctx.provider);
+      ctx.provider.stopSession = async (sid: string) => {
+        await originalStopSession(sid);
+        busy = false;
+      };
+
+      const turn = await ctx.svc.send(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, session_id: sessionId, instruction: "post-restart turn" });
+      assert.equal(turn.turn, "completed");
+      assert.equal(ctx.provider.stopSessionCalls.length, 1, "runtime evidence authorizes exactly one stop");
+      assert.equal(ctx.provider.stopSessionCalls[0], sessionId);
+      assert.equal(ctx.provider.closeSessionCalls.length, 0);
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("runtime generation change invalidates in-memory completed-turn evidence (no marker history -> never stops)", async () => {
+    const ctx = setupTestContext();
+    try {
+      const created = await ctx.svc.createSession(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, access: "write" });
+      const sessionId = created.session_id;
+      const turn1 = await ctx.svc.send(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, session_id: sessionId, instruction: "turn 1" });
+      assert.equal(turn1.turn, "completed");
+
+      // The app-server child respawned: in-memory evidence from generation 0
+      // must not authorize a stop in generation 1 (marker has no history).
+      ctx.provider.runtimeGeneration = 1;
+      ctx.provider.reportedStatus = "idle";
+      ctx.provider.sendHandler = async () => {
+        throw new Error("ZCode Protocol error -32010: A prompt is already running for this session");
+      };
+      await assert.rejects(
+        () => ctx.svc.send(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, session_id: sessionId, instruction: "turn 2" }),
+        (err: { code?: string }) => err.code === "SESSION_BUSY",
+      );
+      assert.equal(ctx.provider.stopSessionCalls.length, 0, "stale generation evidence must never authorize a stop");
+    } finally {
+      ctx.cleanup();
+    }
+  });
+
+  it("runtime generation change still allows RUNTIME-evidence recovery (idle + prior history)", async () => {
+    const ctx = setupTestContext();
+    try {
+      const created = await ctx.svc.createSession(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, access: "write" });
+      const sessionId = created.session_id;
+      await ctx.svc.send(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, session_id: sessionId, instruction: "turn 1" });
+      ctx.provider.runtimeGeneration = 1;
+      ctx.provider.snapshotAssistantMarker = async () => 1;
+      ctx.provider.reportedStatus = "idle";
+      let busy = true;
+      ctx.provider.sendHandler = async (options) => {
+        if (busy) {
+          throw new Error("ZCode Protocol error -32010: A prompt is already running for this session");
+        }
+        return { sessionId: options.sessionId, completion: Promise.resolve({ status: "completed" }) };
+      };
+      const originalStopSession = ctx.provider.stopSession.bind(ctx.provider);
+      ctx.provider.stopSession = async (sid: string) => { await originalStopSession(sid); busy = false; };
+      const turn = await ctx.svc.send(LOCAL_PRINCIPAL, { workspace_id: ctx.grantId, session_id: sessionId, instruction: "turn 2" });
+      assert.equal(turn.turn, "completed");
+      assert.equal(ctx.provider.stopSessionCalls.length, 1);
+    } finally {
+      ctx.cleanup();
+    }
+  });
 
   it("concurrent busy sends can consume completed evidence only once", async () => {
     const ctx = setupTestContext(0);

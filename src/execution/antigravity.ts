@@ -30,6 +30,9 @@ export type AntigravityFailureReason =
   | "WORKSPACE_UNAVAILABLE"
   | "AUTH_ERROR"
   | "MODEL_UNAVAILABLE"
+  | "QUOTA_EXHAUSTED"
+  | "RATE_LIMITED"
+  | "CRASH"
   | "SESSION_START_FAILED"
   | "PROTOCOL_ERROR"
   | "SPAWN_FAILED"
@@ -43,7 +46,11 @@ export function projectAntigravityFailure(diagnostic: string): AntigravityFailur
   if (/flags provided but not defined|unknown flag|unknown option|invalid argument|requires an argument/i.test(bounded)) return "INVALID_ARGUMENTS";
   if (/workspace.*(?:does not exist|not accessible)|cwd.*(?:ENOENT|not found)|failed to open workspace/i.test(bounded)) return "WORKSPACE_UNAVAILABLE";
   if (/(?:not logged in|authentication failed|oauth.*failed|login required|please run.*(?:login|auth)|invalid credentials|unauthenticated|token has been revoked|unauthorized)/i.test(bounded)) return "AUTH_ERROR";
+  // Check MODEL_UNAVAILABLE first to preserve test parity (e.g. "model gemini-unknown not found or quota exhausted")
   if (/(?:model.*(?:not found|unavailable|unsupported|does not exist|not accessible)|unknown model|invalid model)/i.test(bounded)) return "MODEL_UNAVAILABLE";
+  if (/(?:individual quota reached|quota reached|quota exceeded|quota exhausted|out of quota|insufficient_quota|usage limit|exceeded.*(?:current )?quota|resource_exhausted.*(?:quota|exceeded))/i.test(bounded)) return "QUOTA_EXHAUSTED";
+  if (/(?:rate[ _-]limit|rate[ _-]limit[ _-]exceeded|too many requests|resource_exhausted.*(?:rate|429)|(?:^|[^\w])429(?:[^\w]|$))/i.test(bounded)) return "RATE_LIMITED";
+  if (/(?:segmentation fault|sigsegv|fatal error:|panic: runtime error|exit code 139|core dumped)/i.test(bounded)) return "CRASH";
   if (/(?:conversation.*(?:not found|does not exist|invalid)|session.*(?:not found|does not exist|failed to start)|failed to resume conversation)/i.test(bounded)) return "SESSION_START_FAILED";
   return "CLI_EXIT_UNCLASSIFIED";
 }
@@ -58,6 +65,12 @@ export function mapAntigravityErrorCode(reason: AntigravityFailureReason, exitCo
       return "ANTIGRAVITY_AUTH_ERROR";
     case "MODEL_UNAVAILABLE":
       return "ANTIGRAVITY_MODEL_UNAVAILABLE";
+    case "QUOTA_EXHAUSTED":
+      return "ANTIGRAVITY_QUOTA_EXHAUSTED";
+    case "RATE_LIMITED":
+      return "ANTIGRAVITY_RATE_LIMITED";
+    case "CRASH":
+      return "ANTIGRAVITY_CRASH";
     case "SESSION_START_FAILED":
       return "ANTIGRAVITY_SESSION_START_FAILED";
     case "WORKSPACE_UNAVAILABLE":
@@ -74,6 +87,15 @@ export function mapAntigravityErrorCode(reason: AntigravityFailureReason, exitCo
     default:
       return "ANTIGRAVITY_PROCESS_EXIT";
   }
+}
+
+export interface AntigravityFailureDetails {
+  reason: AntigravityFailureReason;
+  pool: AntigravityQuotaPoolId | "unknown";
+  retryAfter: number | null;
+  resetAt: string | null;
+  evidenceSource: "cli_stderr" | "cli_log" | "protocol_result" | "unknown";
+  rawEvidence?: string | null;
 }
 
 export interface AntigravityProviderStatus {
@@ -125,6 +147,7 @@ export interface AntigravityAttemptEvidence {
   lastSuccessAt: string | null;
   lastAuthErrorAt: string | null;
   lastModelErrorAt: string | null;
+  lastQuotaExhaustedAt: string | null;
 }
 
 function antigravityProviderDir(stateDir?: string): string {
@@ -182,8 +205,8 @@ export function antigravityEvidenceReadiness(
   if (attempt.reason === "AUTH_ERROR") {
     return { state: "AUTH_REQUIRED", detail: `last real Antigravity task (${attempt.taskId}) failed authentication` };
   }
-  if (attempt.reason === "MODEL_UNAVAILABLE") {
-    return { state: "QUOTA_BLOCKED", detail: `last real Antigravity task (${attempt.taskId}) could not resolve the model (quota/model unavailable)` };
+  if (attempt.reason === "MODEL_UNAVAILABLE" || attempt.reason === "QUOTA_EXHAUSTED") {
+    return { state: "QUOTA_BLOCKED", detail: `last real Antigravity task (${attempt.taskId}) failed: quota exhausted or model unavailable` };
   }
   const transientWindowMs = 10 * 60_000;
   if (Number.isFinite(successAt) && at - successAt <= transientWindowMs) {
@@ -230,6 +253,255 @@ export function getAntigravityModelsForPool(poolId: AntigravityQuotaPoolId): str
   return Object.values(ANTIGRAVITY_MODEL_DEFINITIONS)
     .filter((def) => def.quotaPoolId === poolId)
     .map((def) => def.id);
+}
+
+export function extractEffort(modelOrLabel: string): string | null {
+  if (!modelOrLabel) return null;
+  const norm = modelOrLabel.toLowerCase();
+  const m = norm.match(/-(high|medium|low|thinking)$/);
+  if (m) return m[1];
+  if (/\b(?:high|\(high\))\b/i.test(modelOrLabel)) return "high";
+  if (/\b(?:medium|\(medium\))\b/i.test(modelOrLabel)) return "medium";
+  if (/\b(?:low|\(low\))\b/i.test(modelOrLabel)) return "low";
+  if (/\b(?:thinking|\(thinking\))\b/i.test(modelOrLabel)) return "thinking";
+  return null;
+}
+
+export function canonicalizeAntigravityModel(input: string): { modelId: string; effort: string | null } | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  const lower = trimmed.toLowerCase();
+
+  // 1. Direct match on known model id
+  if (ANTIGRAVITY_MODEL_DEFINITIONS[lower]) {
+    return {
+      modelId: ANTIGRAVITY_MODEL_DEFINITIONS[lower].id,
+      effort: extractEffort(ANTIGRAVITY_MODEL_DEFINITIONS[lower].id),
+    };
+  }
+
+  // 2. Normalized matching (strip non-alphanumeric except dots)
+  const simplify = (s: string) => s.toLowerCase().replace(/[^a-z0-9.]/g, "");
+  const simplifiedInput = simplify(trimmed);
+
+  for (const def of Object.values(ANTIGRAVITY_MODEL_DEFINITIONS)) {
+    if (simplify(def.id) === simplifiedInput || (def.label && simplify(def.label) === simplifiedInput)) {
+      return {
+        modelId: def.id,
+        effort: extractEffort(def.id),
+      };
+    }
+  }
+
+  // Also check without dots e.g. "gemini38flashhigh" vs "gemini-3.8-flash-high"
+  const stripAll = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const strippedInput = stripAll(trimmed);
+  for (const def of Object.values(ANTIGRAVITY_MODEL_DEFINITIONS)) {
+    if (stripAll(def.id) === strippedInput || (def.label && stripAll(def.label) === strippedInput)) {
+      return {
+        modelId: def.id,
+        effort: extractEffort(def.id),
+      };
+    }
+  }
+
+  // 3. Match base model e.g. "gemini-3.8-flash"
+  if (/^gemini-\d+\.\d+-(?:flash|pro)$/i.test(trimmed)) {
+    return {
+      modelId: trimmed.toLowerCase(),
+      effort: null,
+    };
+  }
+
+  return null;
+}
+
+export function parseAntigravityDuration(text: string): { seconds: number | null; resetAt: string | null } {
+  const resetMatch = text.match(/(?:resets?\s+in|retry\s+(?:after|in))\s+((?:(\d+)\s*d\s*)?(?:(\d+)\s*h\s*)?(?:(\d+)\s*m(?:in)?\s*)?(?:(\d+)\s*s(?:ec)?\s*)?|\d+)/i);
+  if (!resetMatch || !resetMatch[1]) return { seconds: null, resetAt: null };
+
+  const durationStr = resetMatch[1].trim();
+  let totalSeconds = 0;
+  if (/^\d+$/.test(durationStr)) {
+    totalSeconds = parseInt(durationStr, 10);
+  } else {
+    const days = resetMatch[2] ? parseInt(resetMatch[2], 10) : 0;
+    const hours = resetMatch[3] ? parseInt(resetMatch[3], 10) : 0;
+    const minutes = resetMatch[4] ? parseInt(resetMatch[4], 10) : 0;
+    const seconds = resetMatch[5] ? parseInt(resetMatch[5], 10) : 0;
+    totalSeconds = days * 86400 + hours * 3600 + minutes * 60 + seconds;
+  }
+
+  if (totalSeconds <= 0) return { seconds: null, resetAt: null };
+  const resetAt = new Date(Date.now() + totalSeconds * 1000).toISOString();
+  return { seconds: totalSeconds, resetAt };
+}
+
+export function extractAntigravityFailureDetails(params: {
+  diagnostic: string;
+  model?: string;
+  evidenceSource?: "cli_stderr" | "cli_log" | "protocol_result" | "unknown";
+}): AntigravityFailureDetails {
+  const reason = projectAntigravityFailure(params.diagnostic);
+  let pool: AntigravityQuotaPoolId | "unknown" = "unknown";
+  if (params.model) {
+    const def = ANTIGRAVITY_MODEL_DEFINITIONS[params.model.toLowerCase()];
+    if (def) {
+      pool = def.quotaPoolId;
+    } else if (/claude|gpt/i.test(params.model)) {
+      pool = "antigravity:claude_gpt_shared";
+    } else if (/gemini/i.test(params.model)) {
+      pool = "antigravity:gemini";
+    }
+  }
+
+  const { seconds, resetAt } = parseAntigravityDuration(params.diagnostic);
+  return {
+    reason,
+    pool,
+    retryAfter: seconds,
+    resetAt,
+    evidenceSource: params.evidenceSource ?? "unknown",
+    rawEvidence: params.diagnostic.trim().slice(-1000),
+  };
+}
+
+export interface AntigravityModelEvidence {
+  modelId: string;
+  effort: string | null;
+  effortStatus: "verified" | "unverified";
+  evidenceSource: "cli_protocol" | "cli_log" | "transcript_setting" | "unknown";
+}
+
+export function resolveAntigravityModelEvidence(options: {
+  protocolModel?: string | null;
+  isolatedHome: string;
+  conversationId?: string;
+  startedAt?: number;
+}): AntigravityModelEvidence | null {
+  // Source A: Protocol stream event (stdout JSON)
+  if (options.protocolModel && typeof options.protocolModel === "string") {
+    const canonical = canonicalizeAntigravityModel(options.protocolModel);
+    if (canonical && canonical.effort) {
+      return {
+        modelId: canonical.modelId,
+        effort: canonical.effort,
+        effortStatus: "verified",
+        evidenceSource: "cli_protocol",
+      };
+    }
+    // Base model without effort (e.g. "gemini-3.8-flash")
+    return {
+      modelId: canonical?.modelId ?? options.protocolModel.trim(),
+      effort: null,
+      effortStatus: "unverified",
+      evidenceSource: "cli_protocol",
+    };
+  }
+
+  // Source B: CLI log file (isolatedHome/.gemini/antigravity-cli/log)
+  try {
+    const logDir = path.join(options.isolatedHome, ".gemini", "antigravity-cli", "log");
+    if (fs.existsSync(logDir)) {
+      const startThreshold = options.startedAt ? options.startedAt - 5000 : 0;
+      const files = fs.readdirSync(logDir)
+        .filter((f) => f.startsWith("cli-") && f.endsWith(".log"))
+        .map((f) => {
+          const fullPath = path.join(logDir, f);
+          const stat = fs.statSync(fullPath);
+          return { fullPath, mtime: stat.mtimeMs };
+        })
+        .filter((f) => f.mtime >= startThreshold)
+        .sort((a, b) => b.mtime - a.mtime);
+
+      for (const file of files.slice(0, 3)) {
+        const content = fs.readFileSync(file.fullPath, "utf8");
+        // Look for model override label, model="...", or Resolving model
+        const overrideMatch = content.match(/Propagating selected model override to backend:\s*label="([^"]+)"/i);
+        if (overrideMatch && overrideMatch[1]) {
+          const canonical = canonicalizeAntigravityModel(overrideMatch[1]);
+          if (canonical) {
+            return {
+              modelId: canonical.modelId,
+              effort: canonical.effort,
+              effortStatus: canonical.effort ? "verified" : "unverified",
+              evidenceSource: "cli_log",
+            };
+          }
+        }
+        const printModeMatch = content.match(/Print mode: starting \(.*model="([^"]+)"/i);
+        if (printModeMatch && printModeMatch[1]) {
+          const canonical = canonicalizeAntigravityModel(printModeMatch[1]);
+          if (canonical) {
+            return {
+              modelId: canonical.modelId,
+              effort: canonical.effort,
+              effortStatus: canonical.effort ? "verified" : "unverified",
+              evidenceSource: "cli_log",
+            };
+          }
+        }
+        const resolveMatch = content.match(/Resolving model\s+([a-z0-9_.-]+)/i);
+        if (resolveMatch && resolveMatch[1]) {
+          const canonical = canonicalizeAntigravityModel(resolveMatch[1]);
+          if (canonical) {
+            return {
+              modelId: canonical.modelId,
+              effort: canonical.effort,
+              effortStatus: canonical.effort ? "verified" : "unverified",
+              evidenceSource: "cli_log",
+            };
+          }
+        }
+      }
+    }
+  } catch {
+    // Non-blocking log inspection
+  }
+
+  // Source C: Transcript system setting event (transcript.jsonl step 0)
+  if (options.conversationId) {
+    try {
+      const transcriptFile = path.join(
+        options.isolatedHome,
+        ".gemini",
+        "antigravity-cli",
+        "brain",
+        options.conversationId,
+        ".system_generated",
+        "logs",
+        "transcript.jsonl"
+      );
+      if (fs.existsSync(transcriptFile)) {
+        const fd = fs.openSync(transcriptFile, "r");
+        const buf = Buffer.alloc(32768);
+        const bytesRead = fs.readSync(fd, buf, 0, 32768, 0);
+        fs.closeSync(fd);
+        const headContent = buf.toString("utf8", 0, bytesRead);
+
+        // ONLY match <USER_SETTINGS_CHANGE> in step 0 / system context; NEVER match agent responses!
+        const settingMatch = headContent.match(
+          /Model Selection[`']?\s+from\s+None\s+to\s+([^\r\n]+?)(?:\.\s+No need to comment|\.\s*<\/USER_SETTINGS_CHANGE>|<\/USER_SETTINGS_CHANGE>|\.\s*$)/i
+        );
+        if (settingMatch && settingMatch[1]) {
+          const label = settingMatch[1].trim();
+          const canonical = canonicalizeAntigravityModel(label);
+          if (canonical) {
+            return {
+              modelId: canonical.modelId,
+              effort: canonical.effort,
+              effortStatus: canonical.effort ? "verified" : "unverified",
+              evidenceSource: "transcript_setting",
+            };
+          }
+        }
+      }
+    } catch {
+      // Non-blocking transcript inspection
+    }
+  }
+
+  return null;
 }
 
 export function isWithinRoot(candidate: string, root: string): boolean {
@@ -637,34 +909,16 @@ export class AntigravityBackend implements ExecutionBackend {
         lastAttempt: { at, taskId: attempt.taskId, status: attempt.status, reason: attempt.reason, exitCode: attempt.exitCode },
         lastSuccessAt: attempt.status === "completed" ? at : prior?.lastSuccessAt ?? null,
         lastAuthErrorAt: attempt.reason === "AUTH_ERROR" ? at : prior?.lastAuthErrorAt ?? null,
-        lastModelErrorAt: attempt.reason === "MODEL_UNAVAILABLE" ? at : prior?.lastModelErrorAt ?? null,
+        lastModelErrorAt: (attempt.reason === "MODEL_UNAVAILABLE" || attempt.reason === "QUOTA_EXHAUSTED") ? at : prior?.lastModelErrorAt ?? null,
+        lastQuotaExhaustedAt: attempt.reason === "QUOTA_EXHAUSTED" ? at : prior?.lastQuotaExhaustedAt ?? null,
       };
       writeAntigravityAttemptEvidence(next, this.baseStateDir);
     } catch { /* never fail a finished task on evidence bookkeeping */ }
   }
 
   private readTranscriptModel(isolatedHome: string, conversationId: string): string | null {
-    try {
-      const transcriptFile = path.join(
-        isolatedHome,
-        ".gemini",
-        "antigravity-cli",
-        "brain",
-        conversationId,
-        ".system_generated",
-        "logs",
-        "transcript.jsonl"
-      );
-      if (!fs.existsSync(transcriptFile)) return null;
-      const content = fs.readFileSync(transcriptFile, "utf8");
-      const match = content.match(/Model Selection[`']?\s+from\s+None\s+to\s+([^.\r\n]+)/i);
-      if (match && match[1]) {
-        return match[1].trim();
-      }
-      return null;
-    } catch {
-      return null;
-    }
+    const evidence = resolveAntigravityModelEvidence({ isolatedHome, conversationId });
+    return evidence?.modelId ?? null;
   }
 
   getExecutablePath(): string {
@@ -939,9 +1193,12 @@ export class AntigravityBackend implements ExecutionBackend {
     // health records and must not mask task-lane provider capability.
     const evidenceReason =
       result.error?.code === "ANTIGRAVITY_AUTH_ERROR" ? "AUTH_ERROR"
-      : result.error?.code === "ANTIGRAVITY_MODEL_UNAVAILABLE" ? "MODEL_UNAVAILABLE"
+      : (result.error?.code === "ANTIGRAVITY_MODEL_UNAVAILABLE" ? "MODEL_UNAVAILABLE"
+      : (result.error?.code === "ANTIGRAVITY_QUOTA_EXHAUSTED" ? "QUOTA_EXHAUSTED"
+      : (result.error?.code === "ANTIGRAVITY_RATE_LIMITED" ? "RATE_LIMITED"
+      : (result.error?.code === "ANTIGRAVITY_CRASH" ? "CRASH"
       : result.status === "completed" ? null
-      : "CLI_EXIT_UNCLASSIFIED";
+      : "CLI_EXIT_UNCLASSIFIED"))));
     if (request.evidence !== false) {
       this.recordAttemptEvidence({
         taskId: request.taskId,
@@ -1044,18 +1301,30 @@ export class AntigravityBackend implements ExecutionBackend {
       let observedModel: string | null = null;
       let finalResponse = "";
       let finalStatus: "completed" | "failed" | "cancelled" | "timed_out" = "completed";
-      let failureError: { code: string; message: string } | undefined;
+      let failureError: {
+        code: string;
+        message: string;
+        pool?: string;
+        retryAfter?: number | null;
+        resetAt?: string | null;
+        reason?: string;
+        evidenceSource?: string;
+      } | undefined;
       let finalResultReceived = false;
       let processClosed = false;
       let tokenUsage: BackendExecutionResult["tokenUsage"];
       const outputChunks: string[] = [];
       let diagnosticTail = "";
+      let diagnosticSource: "cli_stderr" | "cli_log" | "protocol_result" | "unknown" = "unknown";
       let failureReason: AntigravityFailureReason = "CLI_EXIT_UNCLASSIFIED";
-      const observeDiagnostic = (text: unknown) => {
+      const observeDiagnostic = (text: unknown, source: "cli_stderr" | "cli_log" | "protocol_result" = "cli_stderr") => {
         if (typeof text !== "string") return;
         diagnosticTail = (diagnosticTail + text.slice(-8192)).slice(-8192);
         const reason = projectAntigravityFailure(diagnosticTail);
-        if (reason !== "CLI_EXIT_UNCLASSIFIED") failureReason = reason;
+        if (reason !== "CLI_EXIT_UNCLASSIFIED") {
+          failureReason = reason;
+          diagnosticSource = source;
+        }
       };
 
       // 1. Overall task timeout (this attempt's budget)
@@ -1226,7 +1495,7 @@ export class AntigravityBackend implements ExecutionBackend {
                 };
               }
               if (res.status === "ERROR") {
-                observeDiagnostic(typeof res.error === "string" ? res.error : res.error?.message);
+                observeDiagnostic(typeof res.error === "string" ? res.error : res.error?.message, "protocol_result");
                 finalStatus = "failed";
                 const errCode = mapAntigravityErrorCode(failureReason);
                 failureError = {
@@ -1245,7 +1514,7 @@ export class AntigravityBackend implements ExecutionBackend {
             }
           } catch {
             // Non-protocol stdout is diagnostic data, not agent output.
-            observeDiagnostic(trimmed);
+            observeDiagnostic(trimmed, "cli_stderr");
           }
         });
       }
@@ -1253,7 +1522,7 @@ export class AntigravityBackend implements ExecutionBackend {
       if (child.stderr) {
         child.stderr.on("error", () => {});
         child.stderr.on("data", (d) => {
-          observeDiagnostic(d.toString());
+          observeDiagnostic(d.toString(), "cli_stderr");
         });
       }
 
@@ -1277,6 +1546,34 @@ export class AntigravityBackend implements ExecutionBackend {
         this.activeProcesses.delete(request.taskId);
         request.onLifecyclePhase?.("TERMINAL");
 
+        // Inspect recent CLI log file if error diagnostic is unclassified
+        if (finalStatus === "failed" && failureReason === "CLI_EXIT_UNCLASSIFIED") {
+          try {
+            const logDir = path.join(env.USERPROFILE ?? this.getIsolatedHomeDir(), ".gemini", "antigravity-cli", "log");
+            if (fs.existsSync(logDir)) {
+              const files = fs.readdirSync(logDir)
+                .filter((f) => f.startsWith("cli-") && f.endsWith(".log"))
+                .map((f) => ({ fullPath: path.join(logDir, f), mtime: fs.statSync(path.join(logDir, f)).mtimeMs }))
+                .filter((f) => f.mtime >= processStartedAt - 5000)
+                .sort((a, b) => b.mtime - a.mtime);
+              if (files.length > 0) {
+                const tailContent = fs.readFileSync(files[0].fullPath, "utf8").slice(-16384);
+                observeDiagnostic(tailContent, "cli_log");
+              }
+            }
+          } catch {
+            // Best effort log inspection
+          }
+        }
+
+        const failureDetails = finalStatus === "failed"
+          ? extractAntigravityFailureDetails({
+              diagnostic: diagnosticTail,
+              model,
+              evidenceSource: diagnosticSource,
+            })
+          : undefined;
+
         if (activeRecord.cancelled) {
           finalStatus = "cancelled";
           failureError = { code: "ANTIGRAVITY_CANCELLED", message: "Task was cancelled by user request" };
@@ -1292,6 +1589,12 @@ export class AntigravityBackend implements ExecutionBackend {
             ? "reason=SANDBOX_SETUP_REQUIRED: sandboxing requires administrative setup"
             : failureReason === "AUTH_ERROR"
             ? "reason=AUTH_ERROR: authentication failed or credentials missing"
+            : failureReason === "QUOTA_EXHAUSTED"
+            ? `reason=QUOTA_EXHAUSTED: provider quota limit exhausted (pool=${failureDetails?.pool ?? "unknown"}${failureDetails?.retryAfter ? `, resets in ${failureDetails.retryAfter}s` : ""})`
+            : failureReason === "RATE_LIMITED"
+            ? `reason=RATE_LIMITED: provider rate limit reached (temporary${failureDetails?.retryAfter ? `, retry after ${failureDetails.retryAfter}s` : ""})`
+            : failureReason === "CRASH"
+            ? "reason=CRASH: provider process crashed unexpectedly"
             : failureReason === "MODEL_UNAVAILABLE"
             ? "reason=MODEL_UNAVAILABLE: requested model could not be resolved or quota exhausted"
             : failureReason === "SESSION_START_FAILED"
@@ -1305,6 +1608,28 @@ export class AntigravityBackend implements ExecutionBackend {
             message: !sessionEstablished
               ? `Antigravity CLI process exited before establishing a session (exitCode=${code}, ${detail})`
               : `Antigravity CLI process exited with code ${code} (${detail})`,
+            pool: failureDetails?.pool ?? "unknown",
+            retryAfter: failureDetails?.retryAfter ?? null,
+            resetAt: failureDetails?.resetAt ?? null,
+            reason: failureReason,
+            evidenceSource: failureDetails?.evidenceSource ?? "unknown",
+          };
+        } else if (finalStatus === "failed" && failureDetails) {
+          const errCode = mapAntigravityErrorCode(failureReason, code);
+          failureError = {
+            code: failureError?.code ?? errCode,
+            message: failureReason === "QUOTA_EXHAUSTED"
+              ? `Antigravity task reported execution error (reason=QUOTA_EXHAUSTED: pool=${failureDetails.pool}${failureDetails.retryAfter ? `, resets in ${failureDetails.retryAfter}s` : ""})`
+              : failureReason === "RATE_LIMITED"
+              ? `Antigravity task reported execution error (reason=RATE_LIMITED${failureDetails.retryAfter ? `, retry after ${failureDetails.retryAfter}s` : ""})`
+              : failureReason === "CRASH"
+              ? "Antigravity task reported execution error (reason=CRASH: CLI process crashed unexpectedly)"
+              : failureError?.message ?? `Antigravity task reported execution error (reason=${failureReason})`,
+            pool: failureDetails.pool,
+            retryAfter: failureDetails.retryAfter,
+            resetAt: failureDetails.resetAt,
+            reason: failureReason,
+            evidenceSource: failureDetails.evidenceSource,
           };
         }
 
@@ -1337,11 +1662,25 @@ export class AntigravityBackend implements ExecutionBackend {
           failureError = { code: "ANTIGRAVITY_SESSION_START_FAILED", message: "Antigravity exited without session evidence" };
         }
 
-        // Attempt reading model from session transcript if not exposed in stream
-        if (!observedModel && extractedConversationId) {
-          observedModel = this.readTranscriptModel(env.USERPROFILE ?? this.getIsolatedHomeDir(), extractedConversationId);
-        }
-        const actualModel = observedModel ?? "UNKNOWN";
+        // Model evidence resolution: protocol stream -> CLI log -> transcript setting (never agent self-reporting)
+        const modelEvidence = resolveAntigravityModelEvidence({
+          protocolModel: observedModel,
+          isolatedHome: env.USERPROFILE ?? this.getIsolatedHomeDir(),
+          conversationId: extractedConversationId,
+          startedAt: processStartedAt,
+        });
+
+        const actualModel = modelEvidence?.modelId ?? "UNKNOWN";
+        const observedSelection = modelEvidence ? {
+          model: modelEvidence.modelId,
+          effort: modelEvidence.effort,
+          effortStatus: modelEvidence.effortStatus,
+          source: modelEvidence.evidenceSource,
+        } : null;
+
+        const reqEffort = extractEffort(model);
+        const requestedSelection = { model, effort: reqEffort };
+        const dispatchedSelection = { cli: { model, effort: reqEffort } };
 
         const now = Date.now();
         const phaseDurations: Record<string, number> = {
@@ -1370,8 +1709,13 @@ export class AntigravityBackend implements ExecutionBackend {
           providerModel: model,
           requestedProvider: "gemini",
           requestedModel: model,
+          requestedSelection,
+          dispatchedModel: model,
+          dispatchedSelection,
           actualProvider: sessionEstablished ? "antigravity" : null,
           actualModel,
+          observedModel: modelEvidence?.modelId ?? null,
+          observedSelection,
           phaseDurations,
           providerSessionId: extractedConversationId,
           output: combinedOutput,
@@ -1379,6 +1723,7 @@ export class AntigravityBackend implements ExecutionBackend {
           tokenUsage,
           exitCode: code,
           error: failureError,
+          failureDetails,
         });
       });
 

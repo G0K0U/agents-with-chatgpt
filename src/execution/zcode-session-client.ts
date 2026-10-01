@@ -393,7 +393,9 @@ export class ZcodeSessionClient {
   async ensureGrant(canonicalPath: string, write: boolean): Promise<ZcodeWorkspaceGrant> {
     const existing = await this.findGrantByPath(canonicalPath);
     if (process.env.A2C_ZCODE_DEBUG) console.error(`[zcode-session] findGrantByPath(${canonicalPath}) →`, JSON.stringify(existing));
-    if (existing) return existing;
+    // A read projection must not prevent a later authorized write upgrade.
+    // Never downgrade an existing write grant for an observational call.
+    if (existing && (!write || existing.permissions?.write === true)) return existing;
     let res: Response;
     try {
       res = await fetch(`${this.config.apiBase}/api/workspaces/authorize`, {

@@ -9,7 +9,7 @@ import { loadSessionOwnership } from "../src/authz/ownership.js";
 import type { AgentProvider, SessionStateAttestation, ProviderSendOptions } from "../src/providers/types.js";
 import { FileAuditLog } from "../src/util/log.js";
 
-const CANONICAL = "f:\\examplework\\engineering-ai";
+const CANONICAL = "f:\workspaces\engineering-ai";
 
 function attestation(sessionId: string): SessionStateAttestation {
   return {
@@ -25,6 +25,7 @@ function attestation(sessionId: string): SessionStateAttestation {
     runtimeVersion: "0.16.9",
     status: "idle",
     observedAt: new Date().toISOString(),
+    availableModels: [{ providerId: "zai-api", modelId: "GLM-5.3-Flash", reasoningLevels: ["low", "high", "max"], reasoningDefaultLevel: "max" }],
   };
 }
 

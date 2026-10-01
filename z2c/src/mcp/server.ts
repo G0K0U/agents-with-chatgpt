@@ -7,7 +7,8 @@ import { timingSafeEqual, randomUUID } from "node:crypto";
 import type { TaskEngine, TaskEngineError } from "../core/tasks/engine.js";
 import { WorkspaceRegistry, WorkspaceError } from "../core/workspaces/registry.js";
 import { Persistence } from "../core/tasks/persistence.js";
-import { REQUIRED_START_PLAN_PROVIDER_ID, REQUIRED_START_PLAN_MODEL_ID, type AgentProvider } from "../providers/types.js";
+import { isAdmissibleObservedBinding } from "../authz/attestation.js";
+import type { AgentProvider } from "../providers/types.js";
 import type { FileAuditLog } from "../util/log.js";
 
 /**
@@ -78,6 +79,7 @@ export function buildMcpServer(deps: McpDeps): McpServer {
       inputSchema: {
         workspace_id: z.string(),
         instruction: z.string().min(1).max(20000),
+        entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional(),
         idempotency_key: z.string().regex(IDEMPOTENCY_KEY).optional(),
         write_scope: z.enum(["workspace", "readonly"]).optional(),
         network: z.enum(["default"]).optional(),
@@ -90,6 +92,7 @@ export function buildMcpServer(deps: McpDeps): McpServer {
         const view = await deps.engine.submitTask({
           workspace_id: args.workspace_id,
           instruction: args.instruction,
+          entitlement_plan: args.entitlement_plan,
           idempotency_key: args.idempotency_key,
           write_scope: args.write_scope,
           network: args.network,
@@ -192,10 +195,10 @@ export function buildMcpServer(deps: McpDeps): McpServer {
       const ws = deps.workspaces.resolveAuthorized(workspace_id);
       if (deps.provider.name !== "zcode-desktop" || !deps.provider.usesDesktopManagedAuth) throw new Error("Native Desktop provider required");
       const binding = await deps.provider.readSessionBinding(session_id, { workspacePath: ws.canonicalPath, workspaceKey: ws.canonicalPath });
-      if (binding?.provider_id !== REQUIRED_START_PLAN_PROVIDER_ID || binding?.model_id !== REQUIRED_START_PLAN_MODEL_ID || binding.source !== "desktop-session-read") {
+      if (binding?.source !== "desktop-session-read" || !isAdmissibleObservedBinding(binding ? { provider_id: binding.provider_id, model_id: binding.model_id, source: binding.source } : null)) {
         throw new Error("Exact native session workspace/model binding is unverified");
       }
-      return { content: [{ type: "text", text: JSON.stringify({ workspace_id: ws.workspaceId, canonical_path: ws.canonicalPath, session_id, model_binding: binding, immediate_resume: "native-session-v1" }) }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify({ workspace_id: ws.workspaceId, canonical_path: ws.canonicalPath, session_id, model_binding: binding, immediate_resume: "native-session-v1" }) }] };
     } catch (err) { return errorToToolResult(err); }
   });
 
@@ -244,14 +247,16 @@ export function buildMcpServer(deps: McpDeps): McpServer {
         workspace_id: z.string(),
         session_id: z.string().regex(/^sess_[0-9a-f-]{36}$/i),
         instruction: z.string().min(1).max(20000),
+        entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional(),
       },
     },
-    async ({ workspace_id, session_id, instruction }) => {
+    async ({ workspace_id, session_id, instruction, entitlement_plan }) => {
       try {
         const view = await deps.engine.submitTask({
           workspace_id,
           instruction,
           resume_session_id: session_id,
+          entitlement_plan,
           immediate: true,
         });
         return {
@@ -303,6 +308,10 @@ export function buildMcpServer(deps: McpDeps): McpServer {
           detail: deps.provider.statusDetail ?? null,
           zcode_version: deps.provider.providerVersion,
           capabilities: deps.provider.capabilityResult,
+          // Entitlement selection capability as OBSERVED from the connected
+          // runtime (runtime/capabilities). Absent provider support = null;
+          // consumers must treat null as "START/INDIVIDUAL fail closed".
+          entitlement_capability: deps.provider.entitlementSelection ?? null,
           workspace_id: workspace.workspaceId,
           durable_idempotency: IDEMPOTENCY_PROTOCOL,
           session_id: active?.zcodeSessionId ?? null,

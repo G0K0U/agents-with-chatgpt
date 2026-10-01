@@ -20,7 +20,7 @@ import {
  */
 
 const TEST_TOKEN = "z2cs_test_token_0123456789abcdef";
-const CANONICAL = "f:\\examplework\\engineering-ai";
+const CANONICAL = "f:\workspaces\engineering-ai";
 
 import { randomUUID } from "node:crypto";
 

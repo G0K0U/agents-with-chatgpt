@@ -1319,6 +1319,7 @@ async function planeForCli(stateDirOpt?: string) {
     stateDir,
     workspaces: () => workspaces,
     zcodeClient,
+    dshClient: new (await import("../execution/dsh-native-client.js")).DshNativeClient(),
     ownership: loadZcodeSessionOwnership(stateDir),
   });
 }
@@ -1331,8 +1332,8 @@ function planeCommandScaffold(): void {
 
   plane
     .command("sessions")
-    .description("List the shared session projection across Codex, Gemini/Antigravity, and ZCode (observe-only)")
-    .option("-p, --provider <name>", "filter: codex | gemini | zcode")
+    .description("List the shared session projection across Codex, Gemini/Antigravity, ZCode, and DSH (observe-only)")
+    .option("-p, --provider <name>", "filter: codex | gemini | zcode | dsh")
     .option("-o, --origin <name>", "filter: a2c | native | desktop")
     .option("-w, --workspace-id <id>", "filter by A2C workspace id")
     .option("-n, --limit <n>", "page size (1-100)", "50")
@@ -1379,7 +1380,7 @@ function planeCommandScaffold(): void {
   plane
     .command("activity")
     .description("Bounded cross-provider activity feed with seq cursor (observe-only)")
-    .option("-p, --provider <name>", "filter: codex | gemini | zcode")
+    .option("-p, --provider <name>", "filter: codex | gemini | zcode | dsh")
     .option("-s, --session-id <id>", "filter by session id")
     .option("-w, --workspace-id <id>", "filter by A2C workspace id")
     .option("--after-seq <n>", "events after this sequence number")

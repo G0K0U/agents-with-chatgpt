@@ -108,10 +108,24 @@ are included here. An upstream v0.9.4 executable does not contain this patch.
   protocol. The **Z2C companion** (shipped in [`z2c/`](z2c), MIT) provides a
   loopback, token-authenticated semantic service. It does not replace the
   Desktop bundled agent or read ZCode model credentials.
-- **Governed policy is FLASH-ONLY**: ChatGPT-controlled execution admits exactly
-  `builtin:zai-coding-plan / GLM-5.3-Flash / max`, observed from the exact native
-  session (`official-session-read`). The main GLM-5.3 model stays available for **manual**
-  ZCode use but is rejected for governed C2C execution — no automatic escalation.
+- **Stock vs. patched runtime**: a stock ZCode install covers the DEFAULT
+  plan. Explicit `START`/`INDIVIDUAL` entitlement sessions require the patched
+  CLI build under [`patches/zcode/`](patches/zcode) (based on `zai-org/ZCode`
+  v3.14.3, Apache-2.0, with reproducible build steps there). Capability is not
+  implied by the agent's reported version — verify via `runtimeCapabilities`
+  (`entitlementSelection`); arbitrary `>= 0.16.9` builds are not guaranteed.
+- **Plan-aware governed admission** (`DEFAULT | START | INDIVIDUAL`): an
+  execution request carries an explicit entitlement plan; the requested plan,
+  the plan the runtime actually selects, and the evidence source are kept
+  distinct and must match exactly — fail closed. There is no silent model or
+  plan substitution, and an exhausted quota never falls back to another plan
+  automatically. A plan that cannot be honored is reported as
+  `plan-unavailable` (a credential-state verdict), not as a crash.
+- **Exact model/reasoning selection**: the available model catalog is read
+  from the live account-scoped runtime per plan (learned, never assumed), and
+  the requested `plan + model + effort` triple is proven selectable before a
+  turn is spent. On the standalone route, GLM-5.3-Flash requires an explicit
+  reasoning level at selection time.
 - Model/reasoning changes on a live session are supported natively
   (`update_zcode_session`): same session id, re-attested binding, fail closed.
 - Prerequisite: ZCode signed into your Z.AI account; Z2C is built by the
@@ -124,7 +138,7 @@ are included here. An upstream v0.9.4 executable does not contain this patch.
 | Node.js ≥ 22, Git, pnpm | yes (winget / corepack, user scope) | |
 | Codex CLI + login | no — install/sign in yourself | lane active once detected |
 | Antigravity (AGY) CLI | no — install/sign in yourself | `%LOCALAPPDATA%\agy\bin` |
-| ZCode Desktop + Z.AI plan | no — install/sign in yourself | GLM Flash lane |
+| ZCode Desktop + Z.AI plan | no — install/sign in yourself | GLM Flash lane; START/INDIVIDUAL plans need the patched build (`patches/zcode/`) |
 | cloudflared | no — only for a stable public hostname | quick tunnels work without it |
 
 ## Quick deploy with a local agent · 本地 Agent 一键部署
@@ -339,17 +353,26 @@ Credentials stay in the OS app state directory, not in the project.
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
 - **Provider isolation**: one provider's failure never silently substitutes
-  another. The GLM governed lane only executes on the attested Flash identity.
+  another. The GLM governed lane only executes on the attested identity of the
+  explicitly selected plan/model/effort triple.
+- **Idempotency**: task submission accepts a client `idempotency_key`; a
+  replayed key on the same workspace returns the existing task instead of
+  spawning duplicate work.
+- **Single writer**: one writer slot per lane; concurrent submissions queue or
+  are rejected explicitly — never interleaved.
+- **Cancelable, checkpointed failure**: tasks can be cancelled mid-flight;
+  timeouts and provider failures close the loop with a classified terminal
+  state (not a hang), and the receipt records the checkpoint.
 
 ## Permission model (short version)
 
 - **Full local executor**: the CLI starts the official Codex App Server with
   full filesystem and process access, matching the selected Codex/ChatGPT local
-  execution mode. Requests default to `network: false`; this full-access
-  backend rejects that setting before launching a provider because it cannot
-  enforce offline execution. An explicit, locally authorized `network: true`
-  request is required for a live task. A submitted task can edit any host path
-  available to the bridge process.
+  execution mode. Task network access defaults to **online** when the `network`
+  field is omitted; an explicit `network: false` always forces offline
+  execution. Deployments without full access reject every network-enabled task
+  with `NETWORK_NOT_ALLOWED` and accept only `network: false`. A submitted task
+  can edit any host path available to the bridge process.
 - **Scoped public contract**: ChatGPT reaches execution through the task
   lifecycle, queue-control, provider, and audit-mirror tools; it cannot call an
   arbitrary MCP shell or App Server method directly. The bridge retains OAuth
@@ -375,12 +398,54 @@ Full threat model: [docs/security.md](docs/security.md)
 
 ## Verification
 
-- `c2c status --json` — bridge/tunnel/provider state for a workspace.
-- `c2c supervisor status` — control-plane self-check (all lanes).
-- `c2c doctor --fix` — auto-repair the connection.
+- `a2c status --json` — bridge/tunnel/provider state for a workspace.
+- `a2c supervisor status` — control-plane self-check (all lanes).
+- `a2c doctor --fix` — auto-repair the connection.
 - Provider smoke: one tiny read-only task per lane through ChatGPT. A governed
-  GLM task must produce START and COMPLETED receipts both showing
-  `GLM-5.3-Flash`.
+  GLM task must produce START and COMPLETED receipts whose attested
+  plan/model/effort match the explicit request exactly.
+
+## Optional: ChatGPT dot + Slack coordination
+
+For long-running or multi-task work, an optional coordination pattern is to
+pair a ChatGPT **dot** (a lightweight assistant surface) with a Slack channel:
+
+- **Continuous status checks** — the dot polls `a2c status --json` /
+  `supervisor status` on the machine that owns the bridge and posts concise
+  state summaries to Slack.
+- **Terminal-state notifications** — task START/COMPLETED/FAILED/CANCELLED
+  receipts are mirrored to Slack so a finished (or dead) task is visible
+  without watching the terminal.
+- **Result audit** — the dot cross-reads task metadata and receipts through
+  the authenticated MCP surface instead of trusting chat claims, mirroring
+  the audit-mirror journal entries.
+- **Authorized iteration** — follow-up tasks are dispatched only for changes
+  the human explicitly authorized in that thread; the dot never widens its
+  own scope.
+
+Prerequisites and honest limits:
+
+- The loop only works while all of these hold: the ChatGPT connector is
+  reachable, the dot's identity already holds the required OAuth scopes (the
+  dot gets no privileges of its own), and a valid monitoring configuration
+  exists on the machine that owns the bridge. If any of the three breaks, the
+  loop stops — it does not self-heal and nothing here runs as an always-on
+  service.
+- Monitoring works through explicit, repeated status queries and receipt
+  reads. A single status query is **not** a persistent monitor, the dot is
+  **not** permanently online, and a Slack thread cannot be assumed to
+  auto-refresh tool schemas — re-provision or re-pair when the MCP surface
+  changes.
+- No across-the-board model-stability claim is made: lanes differ in
+  acceptance state (see the [support matrix](docs/support-matrix.md) and the
+  [multi-agent operations manual](docs/multi-agent-operations.md)), and a
+  model that worked yesterday can still fail today.
+- Every check and every dispatched iteration consumes model quota from
+  whatever plan backs the dot; budget accordingly. Nothing in this
+  repository auto-switches plans when quota runs out.
+- This is an operational *pattern*, not a bundled feature: you bring the dot,
+  the Slack app, and the authorization. The repository ships no Slack
+  integration code and no dot internals.
 
 ## For developers
 
@@ -434,12 +499,40 @@ This public repository derives from and upstreams [XiaoDuoYa/codex-with-chatgpt]
 
 ## Status & disclaimer
 
-The tested 0.3.0 build's local A2C OAuth path completed a GPT-6 Sol/max nonce
-canary with matching selection, captured final output, and no file changes. See the
-[support matrix](docs/support-matrix.md) for build-specific evidence and
-unverified platforms. The current ChatGPT connector requires its own client
-check. Full-access mode is intentional: a holder of execution scopes can
-direct local Codex actions within the bridge process's OS permissions.
+Current release state (v0.3.0 line), stated with its evidence boundary:
+
+- The Z2C companion test suite passes in full (302/302, re-run on this
+  release-candidate tree), and `pnpm typecheck` / `pnpm build` pass. The
+  repository's vitest suite (91 files) passes under controlled concurrency:
+  1408 passed, 3 environment-dependent skips, 0 failed. The local bridge
+  service has also been verified across controlled restarts on the
+  maintainer's machine; that operational history is not part of this
+  repository's automated evidence.
+- End-to-end chat-side runs on the Z.AI standalone route completed with
+  output matching and independent session reads across both billing plans —
+  INDIVIDUAL GLM-5.3/max, INDIVIDUAL GLM-5.3-Flash/max, and START
+  GLM-5.3-Flash/max.
+- Gemini/AGY lane accepted this cycle: `gemini-3.8-flash-high` at high
+  reasoning effort completed **two consecutive turns in the same session**
+  with output match. The Codex lane is reported stable in use but was **not**
+  individually re-accepted in the current cycle.
+- The DeepSeek/DSH adapter (`integrations/dsh-native-adapter`) is **not**
+  covered end to end: agent/workspace discovery works, but `dsh_task_submit`
+  precise selection currently covers exactly two **local slots** — the GSQ
+  slot A (`Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf`) and the Bonsai CRACK slot B
+  (`Bonsai2-CRACK-PQ2.ninfer`). Other local alternative weights are **not yet
+  supported**, and deepseek-official **cloud models** are **out of scope for
+  this round**. No claim is made that all three agent families are fully
+  covered.
+- This is **not** a claim of exhaustive all-model/all-platform production
+  certification. Validate on your own machine with the verification steps
+  above.
+
+Bootstrap upgrade verified end-to-end: one authorized connector can select
+registered workspaces, persist sessions, resume task metadata after restart,
+and run the CLI executor in full-access mode.
+The full-access choice is intentional: anyone holding the connector's execution
+scopes can direct local agent actions within the OS permissions of the bridge.
 
 **Unofficial community project. Not affiliated with or endorsed by OpenAI, Google, or Z.AI.**
 

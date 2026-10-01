@@ -50,12 +50,13 @@ The accepted envelope is conceptually:
 ```
 
 The bridge locally revalidates every field and requires a registered
-`workspace_id`. `network` defaults to `false`, including in the CLI's selected
-full-access deployment. There, and only there, an explicit `network: true` may
-be authorized; the official App Server then receives `danger-full-access`,
-`networkAccess: true` and `approvalPolicy: never`. The submitted task can use
-the OS permissions of the bridge process, while an omitted or false flag keeps
-the task's network policy disabled. The public request still cannot add
+`workspace_id`. `network` defaults to **online** when omitted; an explicit
+`network: false` always forces the task offline. Deployments without full
+access accept only `network: false` and reject every network-enabled task
+(`NETWORK_NOT_ALLOWED`). In the CLI's selected full-access deployment a
+network-enabled task receives `danger-full-access`, `networkAccess: true` and
+`approvalPolicy: never`, and can use the OS permissions of the bridge
+process. The public request still cannot add
 arbitrary App Server methods or a generic shell tool. `get_codex_task` never
 returns raw agent conversation or unsanitized process output. Review remains
 the same: use `execution_summary`, `test_status`, `execution_output` and
@@ -335,8 +336,9 @@ Rules:
     connector offers the task tools, use only `submit_codex_task` with the
      selected registered workspace id, `write_scope: ["."]` (or another
      existing directory), and `approval_mode: workspace_write`. Omit `network`
-     for the offline default; use `network: true` only when the local
-     deployment explicitly authorizes it. Poll with `get_codex_task`, use
+     only when the task may use the network — the omitted default is online in
+     a full-access deployment; pass `network: false` whenever the task should
+     stay offline. Poll with `get_codex_task`, use
     `cancel_codex_task` only to stop that task, and review through the existing
     summary/output/test/diff tools. The CLI full-access deployment gives the
     task the bridge process's OS permissions; do not describe it as sandboxed.

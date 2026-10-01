@@ -33,7 +33,7 @@
 | Engineering AI audit mirror | The separately scoped writer accepts only bounded text or the matching fixed ledger read through an authorized Engineering AI workspace. It resolves only an explicit/standard/bounded-discovered named OneDrive account root, accepts exactly the two `Desktop/Startup` siblings (`engineering-ai-audit-status.md` and `engineering-ai-audit-timeline.md`), maps them to `docs/audit-loop-state.md` and `docs/audit-execution-timeline.md`, canonicalizes real paths, rejects traversal/siblings/absolute paths and symlink/junction/reparse-point escapes, writes through a complete temporary file plus atomic rename, and records UTC/byte-count/SHA-256 evidence in the C2C execution log. |
 | Codex approval escalation | The CLI full-access deployment sends `approvalPolicy: never`; the user-selected mode intentionally removes the former approval gate. Thread/turn identity, owner/session routing and terminal lifecycle checks remain. |
 | Agent runtime pollution | The fixed App Server child receives a bridge-owned per-workspace `SERENA_HOME`; its fixed official MCP config layer explicitly forwards only that variable to Serena. Serena's supported external project-data setting is prepared before startup. The state path is canonicalized and must be outside the connected workspace. Runtime paths are not added to task write scopes and are not accepted as task permission roots. |
-| Network opt-in / web-MCP bypass | Coding-task network is disabled by default, including in full-access mode. Only an explicit `network: true` accepted by the locally authorized full-access deployment enables the coding turn's `networkAccess`; verification remains `network: false`, and task lifecycle plus OAuth execution scope remain the authorization gate. |
+| Task network default / web-MCP bypass | Coding-task network defaults to **online** when the `network` field is omitted; only a full-access deployment accepts it, and an explicit `network: false` always forces the task offline. Deployments without full access reject every network-enabled task (`NETWORK_NOT_ALLOWED`). Verification remains always offline (`network` disabled in its bridge-owned profile), and task lifecycle plus OAuth execution scope remain the authorization gate. |
 | Execution output leak | Codex may nominate test/build/lint logs; a local sanitizer redacts tokens, pairing-code-shaped strings and home paths, truncates size, and refuses private-key blocks entirely. Restricted items are listed without a body. ChatGPT still cannot run commands directly. |
 | Verification command injection | `run_tests` is only a boolean. The bridge resolves a local typed profile keyed by the registered workspace id; executable, argv, cwd, timeout, sandbox and network policy are not MCP inputs. The official App Server `command/exec` call is constructed from that profile and is never exposed as a public tool. |
 | Verification state pollution | Verification reads the connected repository but uses a task-specific C2C-owned temp/cache root as its only writable root. Runtime creation and cleanup canonicalize paths and reject workspace-inside or reparse-point escapes. A missing profile or failed verifier is recorded as failure rather than success. |
@@ -72,8 +72,9 @@ anywhere. Keychain integration is a V2 item.
 With explicit `execution.submit`, ChatGPT may submit a task containing a
 registered workspace id, natural-language instruction, directory scope,
 `run_tests`, `network`, and the compatibility field
-`approval_mode: workspace_write`. `network` is false when omitted, and true is
-accepted only by the locally authorized full-access deployment. The official
+`approval_mode: workspace_write`. `network` defaults to online when omitted,
+an explicit `network: false` always forces offline execution, and deployments
+without full access accept only `network: false`. The official
 App Server performs the coding work with `danger-full-access`,
 `approvalPolicy: never`, and the effective `networkAccess` value; the task can
 use the OS permissions of the bridge process. The public MCP endpoint still does not
@@ -97,8 +98,9 @@ The current CLI deployment intentionally replaces the former coding-turn
 sandbox, sensitive-path denylist, and approval gate with the user-selected
 full-access mode. A holder of the connector's execution scopes can direct local
 Codex to read, create, modify, delete, and execute wherever the bridge process's
-operating-system account has access. Network remains disabled by default and is
-an explicit per-task opt-in in this deployment. This is an intentional
+operating-system account has access. Task network access defaults to online
+in this deployment; an explicit `network: false` forces the task offline.
+This is an intentional
 permission trade-off, not a security pass under the former sandbox criteria.
 
 The fixed 28-tool MCP contract, OAuth scope checks, stable workspace registry,

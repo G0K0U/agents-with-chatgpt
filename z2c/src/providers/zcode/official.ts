@@ -1,5 +1,18 @@
+import {
+  entitlementAccessMode,
+  entitlementFromAccessMode,
+  type EntitlementAttestation,
+  type EntitlementPlan,
+  type EntitlementSelectionSupport,
+  requireSupportedEntitlement,
+  unobservedEntitlement,
+} from "../entitlement.js";
 import type { Z2cConfig } from "../../config.js";
-import { resolveCliSpawn, resolveZcodeBuiltinProviderConfigFile } from "../../config.js";
+import {
+  builtinProviderConfigDiagnostic,
+  resolveCliSpawn,
+  resolveZcodeBuiltinProviderConfigFile,
+} from "../../config.js";
 import type {
   AgentProvider,
   CapabilityProbeResult,
@@ -13,13 +26,15 @@ import type {
   ReadAssistantOutputOptions,
 } from "../types.js";
 import type { SameSessionModelUpdate, SameSessionModelUpdateResult } from "../types.js";
-import { REQUIRED_START_PLAN_MODEL_ID, REQUIRED_START_PLAN_PROVIDER_ID } from "../types.js";
+import { PREFERRED_START_PLAN_MODEL_ID, PREFERRED_START_PLAN_PROVIDER_ID } from "../types.js";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
+import { FileAuditLog } from "../../util/log.js";
+import { classifyDevelopmentOperation } from "./permissions.js";
 import { ZcodeProcess } from "./process.js";
-import { ZcodeProtocol, ZcodeProtocolError } from "./protocol.js";
+import { ZcodeProtocol, ZcodeProtocolError, type PermissionDecisionRecord } from "./protocol.js";
 import { canonicalizeWorkspacePath, isSubPath } from "../../core/workspaces/registry.js";
 
 /**
@@ -35,7 +50,7 @@ import { canonicalizeWorkspacePath, isSubPath } from "../../core/workspaces/regi
  *    holds, or passes credential material (spawn env is scrubbed).
  *  - Z2C never pushes a provider registry; provider identity is only ever
  *    OBSERVED from session state.
- *  - Reverse requests from the agent are rejected fail-closed by ZcodeProtocol.
+ *  - Reverse permissions require an active dispatch grant; unknown requests fail closed.
  *  - Every identity claim (workspace / provider / model / thought level) is
  *    attested against the authoritative `session/read` snapshot of the EXACT
  *    session; unconfirmed identity fails closed.
@@ -92,6 +107,8 @@ export interface V4CollaborationState {
 
 /** Authoritative exact-session state, as observed from native surfaces. */
 export interface OfficialSessionAttestation {
+  /** Registry-backed entitlement readback; observed === null means unproven. */
+  entitlement: EntitlementAttestation;
   sessionId: string;
   workspaceKey: string | null;
   workspacePath: string | null;
@@ -107,6 +124,13 @@ export interface OfficialSessionAttestation {
   runtimeVersion: string | null;
   status: string | null;
   observedAt: string;
+  /** Runtime-advertised models from the same snapshot; null = not observed. */
+  availableModels: Array<{
+    providerId: string | null;
+    modelId: string;
+    reasoningLevels: string[];
+    reasoningDefaultLevel: string | null;
+  }> | null;
 }
 
 interface SessionSnapshot {
@@ -121,14 +145,20 @@ interface SessionSnapshot {
     mode?: { current?: unknown };
     permission?: { mode?: unknown };
     model?: {
-      current?: { providerId?: unknown; modelId?: unknown };
-      available?: Array<{ providerId?: unknown; modelId?: unknown; ref?: { providerId?: unknown; modelId?: unknown } }>;
+      current?: { providerId?: unknown; modelId?: unknown; accessMode?: unknown; accountAccess?: { mode?: unknown } };
+      available?: Array<{ providerId?: unknown; modelId?: unknown; ref?: { providerId?: unknown; modelId?: unknown }; accessMode?: unknown; accountAccess?: { mode?: unknown } }>;
     };
     thoughtLevel?: {
       enabled?: unknown;
       current?: unknown;
       defaultLevel?: unknown;
       available?: Array<{ value?: unknown }>;
+    };
+    /** Registry-backed entitlement readback (patched runtimes only). */
+    entitlement?: {
+      requested?: unknown;
+      observed?: { mode?: unknown } | null;
+      source?: unknown;
     };
   };
 }
@@ -146,6 +176,13 @@ export interface ZcodeProviderModelEntry {
   /** Native per-model reasoning evidence; empty when the runtime advertised none. */
   reasoning_levels: string[];
   reasoning_default_level: string | null;
+  /**
+   * Semantic account access mode of the route offering this model (e.g.
+   * "start-plan", "individual-coding-plan"); null when not account-backed or
+   * not advertised. This is the runtime's own entitlement fact, never a
+   * provider-id inference.
+   */
+  access_mode: string | null;
 }
 
 /**
@@ -156,7 +193,7 @@ export interface ZcodeProviderModelEntry {
 export interface ZcodeProviderModelCatalog {
   source_session_id: string;
   observed_at: string;
-  current: { provider_id: string | null; model_id: string | null; thought_level: string | null } | null;
+  current: { provider_id: string | null; model_id: string | null; thought_level: string | null; access_mode: string | null } | null;
   current_model_thought_levels: string[] | null;
   models: ZcodeProviderModelEntry[];
 }
@@ -172,11 +209,35 @@ function boundedStrings(value: unknown, max: number): string[] {
   return out;
 }
 
+/**
+ * Normalize the runtime's own `settings.entitlement` readback into the
+ * sanitized attestation shape. Unknown plan spellings, malformed payloads,
+ * and non-registry sources all collapse to "unproven" — evidence is never
+ * invented from provider ids or model names.
+ */
+export function parseEntitlementReadback(raw: unknown): EntitlementAttestation {
+  if (!raw || typeof raw !== "object") return unobservedEntitlement();
+  const record = raw as { requested?: unknown; observed?: unknown; source?: unknown };
+  const requestedMode = typeof record.requested === "string" ? record.requested : null;
+  const observedMode =
+    record.observed && typeof record.observed === "object" && typeof (record.observed as { mode?: unknown }).mode === "string"
+      ? (record.observed as { mode: string }).mode
+      : null;
+  return {
+    requested: entitlementFromAccessMode(requestedMode),
+    observed: entitlementFromAccessMode(observedMode),
+    access_mode: observedMode,
+    source: typeof record.source === "string" ? record.source : "unavailable",
+  };
+}
+
 /** Parse one native `session/read` snapshot into the catalog DTO; null when the snapshot carries no model settings. */
 export function parseSessionSettingsCatalog(sessionId: string, observedAt: string, snap: SessionSnapshot): ZcodeProviderModelCatalog | null {
   const settings = snap.settings ?? {};
   if (!settings.model && !settings.thoughtLevel) return null;
   const asString = (value: unknown): string | null => (typeof value === "string" && value.length > 0 ? value : null);
+  const accessModeOf = (entry: { accessMode?: unknown; accountAccess?: { mode?: unknown } } | null | undefined): string | null =>
+    asString(entry?.accessMode) ?? asString(entry?.accountAccess?.mode);
   const models: ZcodeProviderModelEntry[] = [];
   const available = Array.isArray(settings.model?.available) ? settings.model!.available! : [];
   for (const raw of available.slice(0, 100)) {
@@ -184,6 +245,7 @@ export function parseSessionSettingsCatalog(sessionId: string, observedAt: strin
       providerId?: unknown; modelId?: unknown; label?: unknown;
       ref?: { providerId?: unknown; modelId?: unknown };
       reasoning?: { levels?: unknown; defaultLevel?: unknown };
+      accessMode?: unknown; accountAccess?: { mode?: unknown };
     } | null;
     if (!entry) continue;
     const modelId = asString(entry.modelId) ?? asString(entry.ref?.modelId);
@@ -194,6 +256,7 @@ export function parseSessionSettingsCatalog(sessionId: string, observedAt: strin
       label: asString(entry.label),
       reasoning_levels: boundedStrings(entry.reasoning?.levels, 24),
       reasoning_default_level: asString(entry.reasoning?.defaultLevel),
+      access_mode: accessModeOf(entry),
     });
   }
   const current = settings.model?.current ?? null;
@@ -209,6 +272,7 @@ export function parseSessionSettingsCatalog(sessionId: string, observedAt: strin
       provider_id: asString(current?.providerId) ?? asString(currentRef?.providerId),
       model_id: asString(current?.modelId) ?? asString(currentRef?.modelId),
       thought_level: asString(thoughtLevel.current),
+      access_mode: accessModeOf(current),
     },
     current_model_thought_levels: thoughtAvailable,
     models,
@@ -223,10 +287,20 @@ export class ZcodeOfficialProvider implements AgentProvider {
   capabilityResult: CapabilityProbeResult | null = null;
   /** True: the provider never touches API-key based configuration; auth is ZCode-native. */
   readonly usesDesktopManagedAuth = true;
+  /**
+   * Bumped every time the app-server child is (re)spawned. Callers cache
+   * runtime-local evidence (e.g. "the previous turn completed") keyed to a
+   * generation; a change invalidates it safely.
+   */
+  private runtimeGenerationCounter = 0;
 
   private proc: ZcodeProcess | null = null;
   private protocol: ZcodeProtocol | null = null;
+  private executionGrants = new Map<string, NonNullable<ProviderSendOptions["executionGrant"]>>();
   private turnWaiters = new Map<string, (result: ProviderTurnResult) => void>();
+  /** Sessions with a post-timeout cancellation handshake in flight. */
+  private stoppingSessions = new Set<string>();
+  private audit: FileAuditLog | null = null;
   private runtimeCapabilities: Record<string, unknown> | null = null;
   /** V4 conversation subscriptions per session (CAS state source). */
   private v4Subscriptions = new Map<string, V4Subscription>();
@@ -260,19 +334,60 @@ export class ZcodeOfficialProvider implements AgentProvider {
         env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = builtinConfig;
       }
     }
+    // EXPLICIT opt-in only: let the child resolve billing entitlements from
+    // ZCode's own shared credential store in-process (standalone-account
+    // runtime). Z2C never touches that store itself; without this flag the
+    // child keeps the desktop-host fail-closed overlay (no START/INDIVIDUAL).
+    // cfg-derived in BOTH directions: cfg=false must also strip a value
+    // inherited from this service's own environment, so a machine-wide "1"
+    // cannot silently opt the child in.
+    if (this.cfg.standaloneAccountRuntime) {
+      env.ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME = "1";
+    } else {
+      delete env.ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME;
+    }
     return env;
   }
 
   private ensureProcess(): ZcodeProtocol {
     if (!this.protocol || !this.proc?.running) {
+      this.runtimeGenerationCounter += 1;
+      this.executionGrants.clear();
       this.proc?.kill();
       // `--stdio` is the documented app-server transport (the exact args ZCode
       // Desktop itself uses: ["app-server", "--stdio"]). The child env is the
       // scrubbed env from spawnEnv() — see OfficialSpawnProcess below.
-      const proc = new OfficialSpawnProcess(process.execPath, this.cfg.zcodeCliPath, this.spawnEnv());
+      const spawnEnvUsed = this.spawnEnv();
+      const proc = new OfficialSpawnProcess(process.execPath, this.cfg.zcodeCliPath, spawnEnvUsed);
       this.proc = proc;
-      const protocol = new ZcodeProtocol(proc);
+      const protocol = new ZcodeProtocol(proc, (params) => classifyDevelopmentOperation(params, this.executionGrants));
       this.protocol = protocol;
+      const permissionAudit = new FileAuditLog(join(this.cfg.stateDir, "audit"));
+      this.audit = permissionAudit;
+      // Startup evidence: WHERE the child's provider config came from. The
+      // payload is sanitized by construction (path + digest + counts only);
+      // when no path reaches the child it records the fallback as unobserved.
+      permissionAudit.record("info", "provider.configSource", {
+        ...builtinProviderConfigDiagnostic(
+          process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,
+          spawnEnvUsed.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,
+        ),
+        // Startup evidence: whether the child was opted into standalone
+        // account resolution. Boolean only — never credential material.
+        standaloneAccountRuntime: this.cfg.standaloneAccountRuntime === true,
+      });
+      protocol.on("permission-decision", (decision: PermissionDecisionRecord) => {
+        // Every decision on this surface is POLICY-derived: the callback never
+        // asks a human and never observes UI delivery, so records must never
+        // be reported as (or mistaken for) a user rejection.
+        permissionAudit.record("info", "interaction.resolved", {
+          decision: decision.allowed ? "allow" : "deny",
+          source: "policy",
+          ...(decision.allowed ? {} : { reason: decision.reason ?? "unclassified" }),
+          ...Object.fromEntries(Object.entries(decision.correlation).filter(([, v]) => v !== null)),
+          at: decision.at,
+        });
+      });
       protocol.on("notification", (rec: { method: string; params: unknown }) =>
         this.onNotification(rec.method, rec.params),
       );
@@ -288,6 +403,7 @@ export class ZcodeOfficialProvider implements AgentProvider {
           waiter({ status: "failed", detail: "app-server exited mid-turn" });
         }
         this.turnWaiters.clear();
+        this.executionGrants.clear();
         this.v4Subscriptions.clear();
         this.protocol = null;
       });
@@ -311,7 +427,16 @@ export class ZcodeOfficialProvider implements AgentProvider {
       const p = params as { type?: string; sessionId?: string; payload?: { response?: unknown; reason?: unknown } };
       if (!p?.sessionId) return;
       const waiter = this.turnWaiters.get(p.sessionId);
-      if (!waiter) return;
+      if (!waiter) {
+        // Exact terminal evidence arriving after the turn was already resolved
+        // (e.g. post-timeout): record it bounded and sanitized so the pre-
+        // viously "unobserved" outcome becomes auditable. A late event must
+        // never re-settle a promise or re-arm anything.
+        if (p.type === "turn.completed" || p.type === "turn.failed") {
+          this.audit?.record("info", "turn.terminalAfterResolution", { sessionId: p.sessionId, type: p.type });
+        }
+        return;
+      }
       if (p.type === "turn.completed") {
         this.turnWaiters.delete(p.sessionId);
         waiter({ status: "completed" });
@@ -675,6 +800,7 @@ export class ZcodeOfficialProvider implements AgentProvider {
   }
 
   async stop(): Promise<void> {
+    this.executionGrants.clear();
     this.proc?.kill();
     this.proc = null;
     this.protocol = null;
@@ -684,6 +810,25 @@ export class ZcodeOfficialProvider implements AgentProvider {
 
   getRuntimeCapabilities(): Record<string, unknown> | null {
     return this.runtimeCapabilities;
+  }
+
+  /**
+   * Entitlement selection support OBSERVED from the runtime's own
+   * `runtime/capabilities`. Only `entitlementSelection === true` unlocks
+   * START/INDIVIDUAL plans; anything else (including absent capability or an
+   * unprobed runtime) must keep them failing closed.
+   */
+  get entitlementSelection(): EntitlementSelectionSupport {
+    return {
+      entitlementSelection:
+        (this.runtimeCapabilities as { entitlementSelection?: unknown } | null)
+          ?.entitlementSelection === true,
+    };
+  }
+
+  /** Current app-server child generation (increments on every respawn). */
+  get runtimeGeneration(): number {
+    return this.runtimeGenerationCounter;
   }
 
   /** Configured identity preference (never credentials); catalog evidence only. */
@@ -728,8 +873,10 @@ export class ZcodeOfficialProvider implements AgentProvider {
    */
   async createSession(
     workspace: ProviderWorkspaceRef,
-    options?: { readonly?: boolean; modelId?: string; thoughtLevel?: string; providerId?: string },
+    options?: { entitlementPlan?: EntitlementPlan; readonly?: boolean; modelId?: string; thoughtLevel?: string; providerId?: string; preferredModelId?: string; preferredThoughtLevel?: string },
   ): Promise<string> {
+    const entitlementPlan = requireSupportedEntitlement(options?.entitlementPlan, this.entitlementSelection);
+    const protocolEntitlement = entitlementAccessMode(entitlementPlan);
     const proto = this.requireProtocol();
     const res = (await proto.request(
       "session/create",
@@ -741,7 +888,13 @@ export class ZcodeOfficialProvider implements AgentProvider {
         // but is established and ATTESTED below through the authoritative v4
         // CAS path (switchCollaborationMode → config.planEnabled).
         mode: options?.readonly ? "plan" : "edit",
+        ...(this.runtimeCapabilities?.machineLocalFilesystem === true
+          ? { filesystemScope: options?.readonly ? "workspace" : "machine" } : {}),
         persistence: "immediate",
+        // Semantic entitlement selector (patched runtimes only; the strict
+        // protocol schema of an old runtime rejects the unknown field, which
+        // keeps non-DEFAULT plans fail-closed end to end).
+        ...(protocolEntitlement ? { entitlement: protocolEntitlement } : {}),
       },
       60000,
     )) as SessionSnapshot;
@@ -757,9 +910,15 @@ export class ZcodeOfficialProvider implements AgentProvider {
         await this.setSessionCollaborationMode(sessionId, "plan", { timeoutMs: 20000 });
       }
       await this.applyRequestedIdentity(sessionId, workspace, {
-        modelId: options?.modelId ?? this.policy.modelId,
-        thoughtLevel: options?.thoughtLevel ?? this.policy.thoughtLevel,
-        providerId: options?.providerId ?? this.policy.providerId,
+        modelId: options?.modelId ?? null,
+        thoughtLevel: options?.thoughtLevel ?? null,
+        providerId: options?.providerId ?? this.policy.providerId ?? null,
+        // Configured identity is a PREFERENCE (provider-level default for
+        // direct callers; the engine forwards its own): applied only when the
+        // runtime's own advertisement offers it, never admission truth.
+        preferredModelId: options?.preferredModelId ?? this.policy.modelId ?? null,
+        preferredThoughtLevel: options?.preferredThoughtLevel ?? this.policy.thoughtLevel ?? null,
+        entitlementPlan,
       });
     } catch (err) {
       // Fail closed: a session whose identity cannot be attested is torn down.
@@ -773,6 +932,12 @@ export class ZcodeOfficialProvider implements AgentProvider {
    * Resolve requested model/thought level against the session's OWN state and
    * apply via session/setModel + session/setThoughtLevel.
    *
+   * Single capability truth: effort/reasoning levels for a request are taken
+   * from the TARGET model's own advertisement
+   * (settings.model.available[].reasoning.levels), never from
+   * settings.thoughtLevel.available — that field describes the CURRENT model
+   * and is only consulted when no model switch is involved.
+   *
    * Resolution order for the model (identity never invented by Z2C):
    *   1. exact match in the session's reported availability list
    *      (`settings.model.available[].ref|modelId`);
@@ -782,58 +947,180 @@ export class ZcodeOfficialProvider implements AgentProvider {
    *      models; success is only provisional until the readback attests it.
    * Unsupported explicitly-requested identity throws (fail closed; ZCode
    * itself silently SKIPS an unsupported thoughtLevel at create time — Z2C
-   * refuses that ambiguity by verifying after applying).
+   * refuses that ambiguity by verifying after applying). A requested effort
+   * that the TARGET model does not advertise is rejected BEFORE any switch.
    */
   private async applyRequestedIdentity(
     sessionId: string,
     workspace: ProviderWorkspaceRef,
-    requested: { modelId: string | null; thoughtLevel: string | null; providerId?: string | null },
+    requested: { modelId: string | null; thoughtLevel: string | null; providerId?: string | null; preferredModelId?: string | null; preferredThoughtLevel?: string | null; entitlementPlan?: EntitlementPlan },
   ): Promise<void> {
-    if (!requested.modelId && !requested.thoughtLevel && !requested.providerId) return;
+    // Soft preferences: applied ONLY when the runtime's own advertisement
+    // offers them; never admission evidence, never a hard failure.
+    const snapshot = await this.readSnapshot(sessionId);
+    const settings0 = snapshot.settings ?? {};
+    const available0 = settings0.model?.available ?? [];
+    const offeredModel = (modelId: string | null | undefined): boolean =>
+      !!modelId && available0.some((m) => {
+        const ref = (m as { ref?: { modelId?: unknown } }).ref ?? (m as { modelId?: unknown });
+        return (ref as { modelId?: unknown }).modelId === modelId;
+      });
+    const effectiveRequested = {
+      ...requested,
+      modelId: requested.modelId ?? (offeredModel(requested.preferredModelId) ? requested.preferredModelId! : null),
+    };
+    if (!effectiveRequested.modelId && !requested.thoughtLevel && !requested.providerId) return;
     const proto = this.requireProtocol();
-    const snap = await this.readSnapshot(sessionId);
+    const snap = snapshot;
     const settings = snap.settings ?? {};
     const current = settings.model?.current;
     const currentProviderId = typeof current?.providerId === "string" ? current.providerId : null;
+    const currentModelId = typeof current?.modelId === "string" ? current.modelId : null;
     const tl = settings.thoughtLevel ?? {};
-    const levelValues: string[] = (Array.isArray(tl.available) ? tl.available : [])
-      .map((l) => (typeof l?.value === "string" ? l.value : null))
-      .filter((v): v is string => v !== null);
-    const observedThoughtLevel: string | undefined =
-      typeof tl.current === "string" ? tl.current : levelValues[0];
-    const reasoningLevel = requested.thoughtLevel ?? observedThoughtLevel;
+    const currentModelLevels = boundedStrings(tl.available, 24);
 
-    if (requested.modelId || requested.providerId) {
-      // An explicitly requested provider is ENFORCED (user/runtime-selected
-      // constraint); otherwise the provider comes from availability or the
-      // session's current provider (observed, never invented by Z2C).
-      const available = settings.model?.available ?? [];
-      const refOf = (m: { providerId?: unknown; modelId?: unknown; ref?: { providerId?: unknown; modelId?: unknown } }) =>
-        m.ref ?? { providerId: m.providerId, modelId: m.modelId };
-      const requestedProvider = typeof requested.providerId === "string" ? requested.providerId : null;
-      const offered = available
-        .map((m) => refOf(m as { ref?: { providerId?: unknown; modelId?: unknown } }))
-        .filter((r) => typeof r.modelId === "string" && r.modelId === requested.modelId && typeof r.providerId === "string");
-      // When multiple routes offer Flash, select the governed coding-plan
-      // route. The task engine still requires the exact observed identity;
-      // a runtime without that route cannot silently admit another provider.
-      const match = requestedProvider
-        ? offered.find((r) => r.providerId === requestedProvider)
-        : requested.modelId === REQUIRED_START_PLAN_MODEL_ID
-          ? offered.find((r) => r.providerId === REQUIRED_START_PLAN_PROVIDER_ID) ?? offered[0]
-          : offered[0];
-      const targetProviderId = requestedProvider ?? (match ? (match.providerId as string) : currentProviderId);
-      if (!targetProviderId || (!match && !requested.modelId)) {
+    // Target-model truth from the runtime's OWN per-model advertisement.
+    const available = settings.model?.available ?? [];
+    const accessModeOfEntry = (entry: unknown): string | null => {
+      const e = (entry ?? {}) as { accessMode?: unknown; accountAccess?: { mode?: unknown } };
+      return typeof e.accessMode === "string" && e.accessMode
+        ? e.accessMode
+        : typeof e.accountAccess?.mode === "string" && e.accountAccess.mode
+          ? e.accountAccess.mode
+          : null;
+    };
+    const refOf = (m: { providerId?: unknown; modelId?: unknown; ref?: { providerId?: unknown; modelId?: unknown } }) =>
+      m.ref ?? { providerId: m.providerId, modelId: m.modelId };
+    const advertised = (modelId: string) => available
+      .map((entry) => {
+        const ref = refOf(entry as { ref?: { providerId?: unknown; modelId?: unknown } });
+        const reasoning = (entry as { reasoning?: { levels?: unknown; defaultLevel?: unknown } }).reasoning ?? {};
+        return {
+          providerId: typeof ref.providerId === "string" ? ref.providerId : null,
+          modelId: typeof ref.modelId === "string" ? ref.modelId : null,
+          reasoningLevels: boundedStrings(reasoning.levels, 24),
+          reasoningDefaultLevel: typeof reasoning.defaultLevel === "string" && reasoning.defaultLevel.length > 0 ? reasoning.defaultLevel : null,
+        };
+      })
+      .filter((r) => r.modelId === modelId);
+    const currentAdvertised = currentModelId ? advertised(currentModelId) : [];
+    const currentTarget = currentAdvertised[0] ?? null;
+
+    // Entitlement-constrained sessions only ever route over the semantic
+    // access mode requested (START → start-plan, INDIVIDUAL → individual-
+    // coding-plan). Routes without advertised access evidence are NOT
+    // eligible — an unattestable route cannot silently carry the plan.
+    const expectedAccessMode = entitlementAccessMode(requested.entitlementPlan ?? "DEFAULT");
+
+    const requestedModel = effectiveRequested.modelId;
+    const switchingModel = requestedModel !== null && requestedModel !== currentModelId;
+    const targetAdvertised = switchingModel && requestedModel ? advertised(requestedModel) : currentAdvertised;
+
+    // Effort validation targets the model being switched TO. A preferred
+    // (soft) effort is applied only when the effective target advertises it.
+    const effectiveThoughtLevel = requested.thoughtLevel
+      ?? (requested.preferredThoughtLevel && targetAdvertised[0]?.reasoningLevels.includes(requested.preferredThoughtLevel)
+        ? requested.preferredThoughtLevel
+        : null);
+    // Effort validation targets the model being switched TO.
+    //  - target evidence present → definitive pre-switch validation;
+    //  - target evidence absent (the runtime's available[] follows the CURRENT
+    //    model) → defer to post-switch verification below against the fresh
+    //    snapshot's thoughtLevel.available, which by then describes the TARGET
+    //    model. The PRE-switch model's level set is never the validation base.
+    if (effectiveThoughtLevel) {
+      if (tl.enabled === false) {
+        throw new Error("thought levels are disabled on this ZCode runtime");
+      }
+      const levels = targetAdvertised.length > 0 && targetAdvertised[0]!.reasoningLevels.length > 0
+        ? targetAdvertised[0]!.reasoningLevels
+        : switchingModel
+          ? null // no per-target evidence → verified after the switch instead
+          : (currentTarget?.reasoningLevels.length ? currentTarget.reasoningLevels : currentModelLevels);
+      if (levels !== null && !levels.includes(effectiveThoughtLevel)) {
+        const whose = switchingModel ? `target model ${requestedModel}` : `model ${currentModelId ?? "current"}`;
         throw new Error(
-          requestedProvider && !match
-            ? `requested provider ${requestedProvider} does not offer model ${requested.modelId ?? "<current>"} on this ZCode runtime`
-            : `requested model ${requested.modelId} is not offered by this ZCode runtime ` +
-              `(available: ${available.map((m) => String(refOf(m as { ref?: { modelId?: unknown } })?.modelId)).filter(Boolean).slice(0, 8).join(", ") || "none"})`,
+          `requested thought level ${effectiveThoughtLevel} is not advertised for the ${whose} ` +
+            `(advertised: ${levels.join(", ") || "none"})`,
         );
       }
+    }
+
+    if (effectiveRequested.modelId) {
+      // A provider route constraint applies together with a model application
+      // (explicit request or an applied preference). A dropped soft preference
+      // must never leave a bare provider-only switch behind.
+      const requestedProvider = typeof requested.providerId === "string" ? requested.providerId : null;
+      const offered = available
+        .map((m) => {
+          const ref = refOf(m as { ref?: { providerId?: unknown; modelId?: unknown } });
+          return {
+            providerId: ref.providerId,
+            modelId: ref.modelId,
+            accessMode: accessModeOfEntry(m),
+          };
+        })
+        .filter((r) => typeof r.modelId === "string" && r.modelId === requestedModel && typeof r.providerId === "string");
+      // Entitlement-constrained sessions intersect the offered routes with the
+      // requested semantic access mode. The snapshot's availability is scoped
+      // to the CURRENT model, so empty offered evidence for a DIFFERENT model
+      // is the normal switch case, NOT absence: the runtime itself enforces
+      // the entitlement on every setModel, and the post-set exact-session
+      // attestation is the fail-closed gate. Only REAL cross-plan evidence
+      // (the model advertised, but under a different access mode) rejects
+      // before the switch.
+      const eligible = expectedAccessMode
+        ? offered.filter((r) => r.accessMode === expectedAccessMode)
+        : offered;
+      if (expectedAccessMode && eligible.length === 0 && offered.length > 0) {
+        throw new Error(
+          `no advertised route with access mode ${expectedAccessMode} offers model ${requestedModel} ` +
+            `(offered routes: ${offered.map((r) => `${r.providerId}:${r.accessMode ?? "unattestable"}`).join(", ")})`,
+        );
+      }
+      if (expectedAccessMode && requestedProvider && !eligible.some((r) => r.providerId === requestedProvider)) {
+        throw new Error(
+          `requested provider ${requestedProvider} does not offer model ${requestedModel} over access mode ${expectedAccessMode}`,
+        );
+      }
+      // When multiple routes offer the same model, select the governed
+      // coding-plan route. The runtime enforces entitlement for the rest;
+      // a runtime without an admissible route cannot silently admit another.
+      const routePool = expectedAccessMode ? eligible : offered;
+      const match = requestedProvider
+        ? routePool.find((r) => r.providerId === requestedProvider)
+        : requestedModel === PREFERRED_START_PLAN_MODEL_ID && !expectedAccessMode
+          ? routePool.find((r) => r.providerId === PREFERRED_START_PLAN_PROVIDER_ID) ?? routePool[0]
+          : routePool[0];
+      const targetProviderId = match ? (match.providerId as string) : currentProviderId;
+      if (requestedProvider && !match) {
+        // Explicit provider route with no advertised match: fail closed BEFORE
+        // any setModel — never fall back to the current provider and let the
+        // attestation discover the substitution after the fact.
+        throw new Error(
+          `requested provider ${requestedProvider} does not offer model ${requestedModel ?? "<current>"} on this ZCode runtime`,
+        );
+      }
+      if (!targetProviderId || (!match && !requestedModel)) {
+        throw new Error(
+          `requested model ${requestedModel} is not offered by this ZCode runtime ` +
+            `(available: ${available.map((m) => String(refOf(m as { ref?: { providerId?: unknown; modelId?: unknown } })?.modelId)).filter(Boolean).slice(0, 8).join(", ") || "none"})`,
+        );
+      }
+      // Reasoning level submitted with setModel must belong to the TARGET
+      // model: explicit request (validated above) or the target's own
+      // advertised default; never the previous model's current level.
+      const targetEvidence = switchingModel
+        ? (match ? advertised((match.modelId as string)).find((a) => a.providerId === targetProviderId) ?? advertised((match.modelId as string))[0] : undefined)
+        : currentTarget ?? undefined;
+      const reasoningLevel = effectiveThoughtLevel
+        ?? targetEvidence?.reasoningDefaultLevel
+        ?? (targetEvidence && targetEvidence.reasoningLevels.length > 0
+          ? (typeof tl.current === "string" && targetEvidence.reasoningLevels.includes(tl.current) ? tl.current : targetEvidence.reasoningLevels[0]!)
+          : (typeof tl.current === "string" ? tl.current : undefined));
       const model: { providerId: string; modelId: string; options?: { reasoningLevel: string } } = {
         providerId: targetProviderId,
-        modelId: (match ? (match.modelId as string) : requested.modelId)!,
+        modelId: (match ? (match.modelId as string) : effectiveRequested.modelId)!,
       };
       if (reasoningLevel) model.options = { reasoningLevel };
       try {
@@ -844,32 +1131,51 @@ export class ZcodeOfficialProvider implements AgentProvider {
         );
       }
     }
-    if (requested.thoughtLevel) {
-      if (tl.enabled === false || !levelValues.includes(requested.thoughtLevel)) {
+    if (effectiveThoughtLevel) {
+      await proto.request("session/setThoughtLevel", { sessionId, thoughtLevel: effectiveThoughtLevel }, 30000);
+    }
+    // Post-switch advertisement proof for the deferred case: the fresh
+    // snapshot's thoughtLevel.available now describes the TARGET model; the
+    // requested effort must appear in it or the switch fails closed.
+    if (effectiveThoughtLevel && switchingModel && (targetAdvertised.length === 0 || targetAdvertised[0]!.reasoningLevels.length === 0)) {
+      const fresh = await this.readSnapshot(sessionId);
+      const postLevels = boundedStrings(fresh.settings?.thoughtLevel?.available ?? [], 24);
+      if (postLevels.length > 0 && !postLevels.includes(effectiveThoughtLevel)) {
         throw new Error(
-          `requested thought level ${requested.thoughtLevel} is not supported by this ZCode runtime ` +
-            `(supported: ${levelValues.join(", ") || "none"})`,
+          `requested thought level ${effectiveThoughtLevel} is not advertised for the target model ` +
+            `${effectiveRequested.modelId} (post-switch observed: ${postLevels.join(", ")})`,
         );
       }
-      await proto.request("session/setThoughtLevel", { sessionId, thoughtLevel: requested.thoughtLevel }, 30000);
     }
-    // Attest the EXACT session: id, workspace, provider, model, thought level.
+    // Attest the EXACT session: id, workspace, provider, model, thought level,
+    // and (for constrained sessions) the registry-backed entitlement readback.
     await this.attestSession(sessionId, workspace, {
-      modelId: requested.modelId,
-      thoughtLevel: requested.thoughtLevel,
+      modelId: effectiveRequested.modelId,
+      thoughtLevel: effectiveThoughtLevel,
       providerId: requested.providerId ?? null,
+      entitlementPlan: requested.entitlementPlan ?? null,
     });
   }
 
   async resumeSession(
     workspace: ProviderWorkspaceRef,
     sessionId: string,
-    options?: { readonly?: boolean },
+    options?: { entitlementPlan?: EntitlementPlan; readonly?: boolean },
   ): Promise<void> {
+    const entitlementPlan = requireSupportedEntitlement(options?.entitlementPlan, this.entitlementSelection);
     if (!/^sess_[0-9a-f-]{36}$/i.test(sessionId)) {
       throw new Error(`invalid ZCode session id format: ${sessionId.slice(0, 12)}…`);
     }
-    await this.requireProtocol().request("session/resume", { sessionId, workspace }, 60000);
+    const protocolEntitlement = entitlementAccessMode(entitlementPlan);
+    await this.requireProtocol().request("session/resume", {
+      sessionId,
+      workspace,
+      ...(this.runtimeCapabilities?.machineLocalFilesystem === true
+        ? { filesystemScope: options?.readonly ? "workspace" : "machine" } : {}),
+      // Resume-scoped entitlement: the runtime re-attests the session's current
+      // binding against the requested plan and fails closed on mismatch.
+      ...(protocolEntitlement ? { entitlement: protocolEntitlement } : {}),
+    }, 60000);
     // Live ZCode resets collaboration state (plan flag) to workspace defaults
     // on cold resume — the v4 projection replays history but execution state
     // is runtime-local. A readonly lane MUST re-establish plan via CAS and
@@ -877,26 +1183,51 @@ export class ZcodeOfficialProvider implements AgentProvider {
     if (options?.readonly) {
       await this.setSessionCollaborationMode(sessionId, "plan", { timeoutMs: 20000 });
     }
-    // Resume must land on the same authorized binding; anything else fails closed.
-    await this.attestSession(sessionId, workspace, {});
+    // Resume must land on the same authorized binding AND (when a non-DEFAULT
+    // plan was requested) on an attested matching entitlement; anything else
+    // fails closed.
+    await this.attestSession(sessionId, workspace, { entitlementPlan });
   }
 
   async send(options: ProviderSendOptions): Promise<ProviderRunHandle> {
+    requireSupportedEntitlement(options.entitlementPlan, this.entitlementSelection);
     const proto = this.requireProtocol();
+    if (this.turnWaiters.has(options.sessionId)) throw new Error("A prompt is already running for this session");
+    // A post-timeout cancellation handshake is still in flight: the previous
+    // turn's terminal state is unobserved, so a new send must fail closed
+    // until the bounded handshake completes.
+    if (this.stoppingSessions.has(options.sessionId)) {
+      throw new Error("A stop/cancellation handshake is still in progress for this session");
+    }
+    if (options.executionGrant) this.executionGrants.set(options.sessionId, { ...options.executionGrant });
     let timeoutTimer: NodeJS.Timeout | undefined;
     const completion = new Promise<ProviderTurnResult>((resolve) => {
       this.turnWaiters.set(options.sessionId, resolve);
       timeoutTimer = setTimeout(() => {
         if (this.turnWaiters.get(options.sessionId) === resolve) {
           this.turnWaiters.delete(options.sessionId);
-          resolve({ status: "failed", detail: "turn timeout" });
+          // Writer protection is revoked FIRST and unconditionally: a timed-
+          // out turn must never keep write authority while the stop handshake
+          // runs, and the grant is never restored by that path (fail closed).
+          this.executionGrants.delete(options.sessionId);
+          // Bounded cancellation: without it the underlying turn keeps
+          // executing as an orphan whose reverse-permission requests are
+          // denied against the already-revoked grant.
+          void this.requestPostTimeoutStop(options.sessionId);
+          // Truthful outcome: the turn was NOT observed to reach a terminal
+          // state — only cancellation was requested. Never fabricate "stopped"
+          // or "completed"; exact terminal evidence may still arrive late.
+          resolve({
+            status: "failed",
+            detail: `turn timeout after ${options.timeoutMs}ms; session/stop cancellation requested, terminal state unobserved; execution grant revoked`,
+          });
         }
       }, options.timeoutMs);
     });
     // A settled turn must not leave a live ref'd timer behind (it would keep
     // the process alive for the full timeout — 15 minutes on engine lanes).
     timeoutTimer?.unref?.();
-    void completion.catch(() => undefined).finally(() => clearTimeout(timeoutTimer));
+    void completion.catch(() => undefined).finally(() => { clearTimeout(timeoutTimer); this.executionGrants.delete(options.sessionId); });
     try {
       await proto.request(
         "session/send",
@@ -905,16 +1236,42 @@ export class ZcodeOfficialProvider implements AgentProvider {
       );
     } catch (err) {
       this.turnWaiters.delete(options.sessionId);
+      this.executionGrants.delete(options.sessionId);
+      clearTimeout(timeoutTimer);
       throw err;
     }
     return { sessionId: options.sessionId, completion };
   }
 
+  /** Bound for the post-timeout `session/stop` handshake. */
+  private static readonly POST_TIMEOUT_STOP_TIMEOUT_MS = 15000;
+
+  /**
+   * Supported bounded cancellation handshake for a turn that already timed
+   * out. Best-effort by design: an unconfirmed stop (error or timeout) leaves
+   * the terminal state explicitly unknown, keeps the execution grant revoked
+   * (writer protection retained), and never throws into the settled turn.
+   */
+  private async requestPostTimeoutStop(sessionId: string): Promise<void> {
+    if (this.stoppingSessions.has(sessionId)) return;
+    this.stoppingSessions.add(sessionId);
+    try {
+      await this.requireProtocol().request("session/stop", { sessionId }, ZcodeOfficialProvider.POST_TIMEOUT_STOP_TIMEOUT_MS);
+    } catch {
+      // Stop unconfirmed. Terminal state stays unobserved; the grant stays
+      // revoked — this path never re-arms write authority.
+    } finally {
+      this.stoppingSessions.delete(sessionId);
+    }
+  }
+
   async stopSession(sessionId: string): Promise<void> {
+    this.executionGrants.delete(sessionId);
     await this.requireProtocol().request("session/stop", { sessionId }, 20000);
   }
 
   async closeSession(sessionId: string): Promise<void> {
+    this.executionGrants.delete(sessionId);
     await this.requireProtocol().request("session/close", { sessionId }, 20000);
   }
 
@@ -941,6 +1298,10 @@ export class ZcodeOfficialProvider implements AgentProvider {
   private toAttestation(sessionId: string, snap: SessionSnapshot, v4?: V4CollaborationState | null): OfficialSessionAttestation {
     const s = snap.session ?? {};
     const model = (s.model ?? {}) as { providerId?: unknown; modelId?: unknown };
+    // Availability evidence from the SAME authoritative snapshot: the runtime's
+    // own per-model advertisement, normalized through the shared catalog
+    // parser so admission and agent_model_catalog see one capability truth.
+    const catalog = parseSessionSettingsCatalog(sessionId, new Date().toISOString(), snap);
     return {
       sessionId: typeof s.sessionId === "string" ? s.sessionId : sessionId,
       workspaceKey: typeof s.workspace?.workspaceKey === "string" ? s.workspace.workspaceKey : null,
@@ -955,7 +1316,26 @@ export class ZcodeOfficialProvider implements AgentProvider {
       runtimeVersion: this.providerVersion,
       status: typeof s.status === "string" ? s.status : null,
       observedAt: new Date().toISOString(),
+      // Registry-backed entitlement readback (patched runtimes); unproven on
+      // runtimes that do not publish the field.
+      entitlement: this.entitlementReadback(snap),
+      availableModels: catalog ? catalog.models.map((m) => ({
+        providerId: m.provider_id,
+        modelId: m.model_id,
+        reasoningLevels: m.reasoning_levels,
+        reasoningDefaultLevel: m.reasoning_default_level,
+      })) : null,
     };
+  }
+
+  /**
+   * Normalize the runtime's own `settings.entitlement` readback. Only
+   * `source === "provider-registry"` carries evidence; anything else (field
+   * absent, malformed, or an unknown access mode) maps to "unproven" without
+   * inventing a plan from provider ids or model names.
+   */
+  private entitlementReadback(snap: SessionSnapshot): EntitlementAttestation {
+    return parseEntitlementReadback(snap.settings?.entitlement);
   }
 
   /**
@@ -966,7 +1346,7 @@ export class ZcodeOfficialProvider implements AgentProvider {
   private async attestSession(
     sessionId: string,
     workspace: ProviderWorkspaceRef,
-    expect: { modelId?: string | null; thoughtLevel?: string | null; providerId?: string | null },
+    expect: { modelId?: string | null; thoughtLevel?: string | null; providerId?: string | null; entitlementPlan?: EntitlementPlan | null },
   ): Promise<OfficialSessionAttestation> {
     const snap = await this.readSnapshot(sessionId);
     const att = this.toAttestation(sessionId, snap);
@@ -990,6 +1370,23 @@ export class ZcodeOfficialProvider implements AgentProvider {
         `provider switch was not observed on the session (requested ${expect.providerId}, observed ${att.providerId ?? "none"})`,
       );
     }
+    // Exact-session entitlement attestation: a non-DEFAULT request must be
+    // proven by the runtime's own registry-backed readback. Missing evidence
+    // or a different observed plan fails closed — never a silent fallback.
+    if (expect.entitlementPlan && expect.entitlementPlan !== "DEFAULT") {
+      const expectedMode = entitlementAccessMode(expect.entitlementPlan);
+      const readback = att.entitlement;
+      if (
+        readback.source !== "provider-registry" ||
+        readback.observed !== expect.entitlementPlan ||
+        readback.access_mode !== expectedMode
+      ) {
+        throw new Error(
+          `entitlement ${expect.entitlementPlan} was not attested on the session ` +
+            `(observed ${readback.observed ?? "unproven"} via ${readback.source})`,
+        );
+      }
+    }
     return att;
   }
 
@@ -1010,6 +1407,8 @@ export class ZcodeOfficialProvider implements AgentProvider {
         /* v4 state unavailable — fields remain null */
       }
     }
+    // Entitlement readback is part of the attestation itself (toAttestation);
+    // it stays unproven unless the runtime published registry-backed evidence.
     return att;
   }
 
@@ -1050,30 +1449,43 @@ export class ZcodeOfficialProvider implements AgentProvider {
     const assistant = messages.filter((m) => (m.info as Record<string, unknown> | undefined)?.role === "assistant");
     const fresh = assistant.slice(minAssistantCount);
     const texts: string[] = [];
+    let turnErrorMessage: string | null = null;
     for (const m of fresh) {
       const info = m.info as Record<string, unknown> | undefined;
       // turn completion is NOT proof of success — model errors are recorded on
       // the assistant message and must fail the turn.
       const modelError = info?.error as { data?: { message?: string; code?: string } } | undefined;
       if (modelError) {
-        throw new Error(
-          `model error during turn: ${modelError.data?.code ?? "unknown"} ${modelError.data?.message ?? ""}`.trim(),
-        );
+        turnErrorMessage =
+          `model error during turn: ${modelError.data?.code ?? "unknown"} ${modelError.data?.message ?? ""}`.trim();
+        if (!opts?.allowModelError) {
+          throw new Error(turnErrorMessage);
+        }
       }
+      // Collect this message's text BEFORE handling the error marker: the
+      // checkpoint value of a cancelled turn is the work done before it died.
       for (const part of (m.parts as Array<Record<string, unknown>> | undefined) ?? []) {
         if (part.type === "text" && typeof part.text === "string") texts.push(part.text);
       }
+      if (modelError && opts?.allowModelError) {
+        // Checkpoint mode: surface the error as the terminal segment and stop
+        // — the error is the turn's true ending.
+        texts.push(`[${turnErrorMessage}]`);
+        break;
+      }
     }
     const joined = texts.join("\n").trim();
-    if (!joined) throw new Error("turn completed but assistant produced no text output");
+    if (!joined) throw new Error(turnErrorMessage ?? "turn completed but assistant produced no text output");
     return joined.length > maxChars ? joined.slice(0, maxChars) + "…[truncated]" : joined;
   }
 
   // ── same-session model/thought switching ──────────────────────────────────
   /**
-   * Switch model and/or thought level on the EXISTING session. The provider
-   * id is resolved from the session's own availability (never substituted);
-   * the workspace binding and requested identity must be re-observed on
+   * Switch model and/or thought level on the EXISTING session. The request is
+   * applied as ONE combined identity change so the effort is validated
+   * against the TARGET model (never the pre-switch model), the provider id is
+   * resolved from the session's own availability (never substituted), and the
+   * workspace binding plus every requested field are re-observed on
    * session/read or the switch fails closed.
    */
   async updateSessionModel(
@@ -1087,12 +1499,10 @@ export class ZcodeOfficialProvider implements AgentProvider {
     if (!/^sess_[0-9a-f-]{36}$/i.test(sessionId)) {
       throw new Error("invalid ZCode session id format");
     }
-    if (change.thoughtLevel) {
-      await this.applyRequestedIdentity(sessionId, workspace, { modelId: null, thoughtLevel: change.thoughtLevel });
-    }
-    if (change.modelId) {
-      await this.applyRequestedIdentity(sessionId, workspace, { modelId: change.modelId, thoughtLevel: null });
-    }
+    await this.applyRequestedIdentity(sessionId, workspace, {
+      modelId: change.modelId ?? null,
+      thoughtLevel: change.thoughtLevel ?? null,
+    });
     const snap = await this.readSnapshot(sessionId);
     const s = snap.session;
     if (!s || s.sessionId !== sessionId) throw new Error("session vanished during model update");
@@ -1104,10 +1514,16 @@ export class ZcodeOfficialProvider implements AgentProvider {
     if (change.modelId && model.modelId !== change.modelId) {
       throw new Error(`model switch was not observed on the session (requested ${change.modelId})`);
     }
+    const thoughtLevel = typeof snap.settings?.thoughtLevel?.current === "string" ? snap.settings.thoughtLevel.current : null;
+    if (change.thoughtLevel && thoughtLevel !== change.thoughtLevel) {
+      throw new Error(
+        `thought level switch was not observed on the session (requested ${change.thoughtLevel}, observed ${thoughtLevel ?? "none"})`,
+      );
+    }
     return {
       provider_id: String(model.providerId ?? ""),
       model_id: String(model.modelId ?? ""),
-      thoughtLevel: typeof snap.settings?.thoughtLevel?.current === "string" ? snap.settings.thoughtLevel.current : null,
+      thoughtLevel,
     };
   }
 

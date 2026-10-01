@@ -16,6 +16,16 @@ export interface WorkspaceSlotLock {
    * accepted the task; terminal observation releases by either id.
    */
   nativeTaskId?: string;
+  /**
+   * Correlation evidence for unresolved z2c reservations. Recorded BEFORE the
+   * upstream submit is dispatched so a lost response can be resolved later
+   * (key lookup / queue-empty proof) without ever re-submitting.
+   */
+  idempotencyKey?: string;
+  /** sha256 request fingerprint bound to idempotencyKey upstream. */
+  requestFingerprint?: string;
+  /** Set when the upstream request was actually dispatched (not before). */
+  dispatchedAt?: string;
   pid: number;
   acquiredAt: string;
 }
@@ -81,6 +91,9 @@ function validateLock(value: unknown): WorkspaceSlotLock | null {
     !(TASK_ID_PATTERN.test(candidate.taskId) || NATIVE_TASK_ID_PATTERN.test(candidate.taskId) || RESERVATION_ID_PATTERN.test(candidate.taskId)) ||
     !(candidate.provider === undefined || ["codex", "gemini", "z2c"].includes(candidate.provider as string)) ||
     !(candidate.sessionId === undefined || typeof candidate.sessionId === "string" && SESSION_ID_PATTERN.test(candidate.sessionId)) ||
+    !(candidate.idempotencyKey === undefined || typeof candidate.idempotencyKey === "string" && candidate.idempotencyKey.length <= 128 && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(candidate.idempotencyKey)) ||
+    !(candidate.requestFingerprint === undefined || typeof candidate.requestFingerprint === "string" && /^[0-9a-f]{64}$/.test(candidate.requestFingerprint)) ||
+    !(candidate.dispatchedAt === undefined || typeof candidate.dispatchedAt === "string") ||
     typeof candidate.pid !== "number" ||
     !Number.isInteger(candidate.pid) ||
     candidate.pid <= 0 ||
@@ -95,6 +108,9 @@ function validateLock(value: unknown): WorkspaceSlotLock | null {
     provider: (candidate.provider ?? "codex") as WorkspaceSlotLock["provider"],
     ...(typeof candidate.sessionId === "string" ? { sessionId: candidate.sessionId } : {}),
     ...(typeof candidate.nativeTaskId === "string" ? { nativeTaskId: candidate.nativeTaskId } : {}),
+    ...(typeof candidate.idempotencyKey === "string" ? { idempotencyKey: candidate.idempotencyKey } : {}),
+    ...(typeof candidate.requestFingerprint === "string" ? { requestFingerprint: candidate.requestFingerprint } : {}),
+    ...(typeof candidate.dispatchedAt === "string" ? { dispatchedAt: candidate.dispatchedAt } : {}),
     pid: candidate.pid,
     acquiredAt: candidate.acquiredAt,
   };
@@ -306,4 +322,34 @@ export function bindWorkspaceSlot(
   fs.writeFileSync(temporary, JSON.stringify(bound, null, 2), { mode: 0o600 });
   fs.renameSync(temporary, file);
   return bound;
+}
+
+/**
+ * Durably record dispatch correlation evidence on the CURRENT z2c reservation.
+ * Must be called BEFORE the upstream request leaves: the evidence is what a
+ * later bounded reconciliation uses to resolve a lost response without ever
+ * re-submitting. Idempotent for the same key; a different key on the same
+ * reservation is a programming error and fails closed.
+ */
+export function markReservationDispatched(
+  workspaceId: string, reservationId: string, evidence: { idempotencyKey: string; requestFingerprint: string }, stateDir?: string,
+): WorkspaceSlotLock {
+  const slot = readWorkspaceSlot(workspaceId, stateDir);
+  if (!slot || slot.provider !== "z2c" || slot.taskId !== reservationId) {
+    throw new Error("Workspace slot reservation mismatch");
+  }
+  if (slot.idempotencyKey !== undefined && slot.idempotencyKey !== evidence.idempotencyKey) {
+    throw new Error("Workspace slot dispatch evidence conflict");
+  }
+  const updated: WorkspaceSlotLock = {
+    ...slot,
+    idempotencyKey: evidence.idempotencyKey,
+    requestFingerprint: evidence.requestFingerprint,
+    dispatchedAt: slot.dispatchedAt ?? new Date().toISOString(),
+  };
+  const file = workspaceSlotFile(workspaceId, stateDir);
+  const temporary = file + ".tmp";
+  fs.writeFileSync(temporary, JSON.stringify(updated, null, 2), { mode: 0o600 });
+  fs.renameSync(temporary, file);
+  return updated;
 }

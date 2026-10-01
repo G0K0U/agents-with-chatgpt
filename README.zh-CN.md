@@ -204,8 +204,9 @@ Agent（Codex），然后去倒杯咖啡：
 
 ## 权限模型（简版）
 
-- **本地执行器**：CLI 以 full-access 模式启动官方 Codex App Server，网络默认
-  关闭，仅显式 `network: true` 且本地部署允许时开启。
+- **本地执行器**：CLI 以 full-access 模式启动官方 Codex App Server。任务省略
+  `network` 字段时默认在线；显式 `network: false` 一律强制离线；非 full-access
+  部署会直接拒绝任何联网任务。
 - **受限公开契约**：ChatGPT 只能通过任务生命周期、队列控制、供应商与审计镜像
   工具操作，不能直接调用任意 MCP Shell 或 App Server 方法。
 - **多授权工作区**：一个连接器只能选择本地 bridge 登记的注册工作区；每个条目有
@@ -282,10 +283,6 @@ CHANGELOG.md  各版本发布说明
 [自身 MIT 许可证](third_party/quanta/LICENSE)和[来源记录](third_party/quanta/PATCH-INFO.md)。
 
 ## 状态与声明
-
-0.3.0 候选版本的本地 A2C OAuth 路径已完成 GPT-6 Sol/max 短 nonce 真实调用，
-模型选择一致且没有文件改动。具体构建证据和未验证平台见[支持矩阵](docs/support-matrix.md)。
-当前 ChatGPT 连接器仍需由该客户端独立复核。
 
 **非官方社区项目。与 OpenAI、Google、Z.AI 无隶属或背书关系。**
 

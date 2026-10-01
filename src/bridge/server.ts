@@ -14,6 +14,7 @@ import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { CodexTaskManagerPool } from "../execution/pool.js";
 import { ModelCatalogService } from "../execution/model-catalog.js";
+import { DshNativeClient } from "../execution/dsh-native-client.js";
 import { zcodeSessionClient } from "../mcp/zcode-session-tools.js";
 import { EngineeringAiAuditMaintainer } from "../execution/audit-maintenance.js";
 import { startZcodeCoordinatorFromEnvironment, type ZcodeCoordinator } from "../execution/zcode-coordinator.js";
@@ -26,6 +27,7 @@ import type { TunnelProvider } from "../tunnel/provider.js";
 import { waitForPublicMcp, type PublicFetch, type PublicProbeResult } from "../tunnel/probe.js";
 import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { reconcileUnknownWorkspaceSlots } from "../execution/slot.js";
+import { localWakeSecret, pendingWakeEvents, startChatWake } from "../execution/chat-wake.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT, resolveStateDir, writeSecureJson } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
@@ -243,6 +245,8 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     workspaceRoot: bridgeRoot.root,
     stateDir,
     zcodeModelCatalog: () => zcodeSessionClient().modelCatalog(),
+    dshModelCatalog: () => new DshNativeClient().modelCatalog(),
+    dshHealth: () => new DshNativeClient().health(),
   });
 
   const taskManagers = new CodexTaskManagerPool(registry, sessions, {
@@ -535,6 +539,27 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
+  // ---- Chat-wake sidecar (loopback-only dedicated listener) ------------------
+  // Serving WAITING_AUDIT wake events to the browser extension. Never mounted
+  // on the public bridge; bearer-secret-gated; a busy port (another
+  // workspace's sidecar already on 47831) must never take the bridge down.
+  let chatWake: Awaited<ReturnType<typeof startChatWake>> | null = null;
+  if (opts.persistRuntime !== false) {
+    try {
+      const wakeDir = path.join(stateDir, "chat-wake");
+      chatWake = await startChatWake({
+        dir: wakeDir,
+        secret: localWakeSecret(wakeDir),
+        pending: () => pendingWakeEvents(stateDir, workspace.id),
+        port: Number(process.env.A2C_CHAT_WAKE_PORT ?? 47831),
+      });
+      logger.info(`Chat-wake sidecar listening on 127.0.0.1:${chatWake.port}`);
+    } catch (error) {
+      chatWake = null;
+      logger.warn(`Chat-wake sidecar unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   const persistRuntime = (): void => {
     if (opts.persistRuntime === false) return;
     const state: RuntimeState = {
@@ -581,6 +606,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
           );
         });
       }
+      await chatWake?.close().catch(() => undefined);
       await tunnel.stop().catch(() => undefined);
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (opts.persistRuntime !== false) clearRuntimeState(workspace.id, {

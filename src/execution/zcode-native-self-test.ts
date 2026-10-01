@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { assertNativeIdempotency, isAdmissibleZcodeProvider, nativeRequestFingerprint, ZcodeNativeError,
-  ZCODE_IDEMPOTENCY_PROTOCOL, ZCODE_NATIVE_REQUIRED_IDENTITY, type ZcodeNativeClient, type ZcodeNativeTaskView } from "./zcode-native.js";
+  ZCODE_IDEMPOTENCY_PROTOCOL, ZCODE_NATIVE_ADMISSIBLE_PROVIDER_IDS, type ZcodeNativeClient, type ZcodeNativeTaskView } from "./zcode-native.js";
 
 const PROBE = "Read-only protocol probe. Do not use tools, read files, run commands, or change anything. Reply only: C2C native protocol probe.";
 type Snapshot = { queue: string; writer: string };
@@ -9,6 +9,12 @@ export interface NativeSelfTestDeps {
   providerStatus: ZcodeNativeClient["providerStatus"];
   submitNative: (input: Parameters<ZcodeNativeClient["submitTask"]>[0]) => Promise<ZcodeNativeTaskView>;
   snapshot: () => Snapshot;
+  /**
+   * A2C → native workspace projection (the client's own authoritative
+   * mapping). Fingerprints and upstream-protocol evidence are computed over
+   * the projected NATIVE payload — the payload Z2C actually hashes.
+   */
+  projectWorkspace: (workspaceId: string) => Promise<{ nativeWorkspaceId: string; canonicalPath: string }>;
   cancel?: (input: { workspace_id: string; task_id: string }) => Promise<ZcodeNativeTaskView>;
   /** Optional layered proof: read the admitted task back from Z2C. */
   getTask?: (input: { workspace_id: string; task_id: string }) => Promise<ZcodeNativeTaskView>;
@@ -45,9 +51,17 @@ export interface NativeSelfTestEvidence {
 
 /** Server-owned instructions and key; never project upstream strings or errors. */
 export async function nativeSelfTest(workspaceId: string, deps: NativeSelfTestDeps) {
-  const input = { workspace_id: workspaceId, instruction: PROBE, write_scope: "readonly" as const,
+  // Upstream-bound evidence payload: the projected native workspace of the
+  // authorized A2C workspace — the exact payload Z2C hashes and attests.
+  const projection = await deps.projectWorkspace(workspaceId);
+  const nativeWorkspaceId = projection.nativeWorkspaceId;
+  const input = { workspace_id: nativeWorkspaceId, instruction: PROBE, write_scope: "readonly" as const,
     mode: "plan" as const, idempotency_key: `c2c_selftest_${randomUUID()}` };
   const changed = { ...input, instruction: `${PROBE} This is the conflict check.` };
+  // Caller-facing dispatch payload: deps take and release the authorized A2C
+  // workspace id (the client projects internally).
+  const callInput = { ...input, workspace_id: workspaceId };
+  const changedCall = { ...changed, workspace_id: workspaceId };
   const layers = {
     transport: "FAIL" as LayerResult,
     service_protocol: "FAIL" as LayerResult,
@@ -90,8 +104,11 @@ export async function nativeSelfTest(workspaceId: string, deps: NativeSelfTestDe
   const verify = (task: ZcodeNativeTaskView) => {
     if (task.workspace_id !== workspaceId || !/^z2c_[A-Za-z0-9_-]{1,100}$/.test(task.task_id) ||
         !task.session_id || !/^sess_[0-9a-f-]{36}$/i.test(task.session_id) ||
-        task.model_binding?.provider_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id ||
-        task.model_binding.model_id !== ZCODE_NATIVE_REQUIRED_IDENTITY.model_id) {
+        // Catalog policy 2026-09-28: the governed constraint is the admissible
+        // non-retired provider ROUTE with an OBSERVED model — any model the
+        // runtime advertises is admissible (Flash, GLM-5.3, future models).
+        !task.model_binding?.provider_id || !ZCODE_NATIVE_ADMISSIBLE_PROVIDER_IDS.has(task.model_binding.provider_id) ||
+        !task.model_binding.model_id) {
       throw new Error("invalid proof");
     }
     assertNativeIdempotency(task, input);
@@ -99,28 +116,28 @@ export async function nativeSelfTest(workspaceId: string, deps: NativeSelfTestDe
   try {
     const status = await deps.providerStatus(workspaceId);
     layers.transport = "PASS";
-    layers.workspace_binding = status?.workspace_id === workspaceId ? "PASS" : "FAIL";
+    layers.workspace_binding = status?.workspace_id === nativeWorkspaceId ? "PASS" : "FAIL";
     layers.desktop_managed_auth =
       isAdmissibleZcodeProvider(typeof status?.provider === "string" ? status.provider : "") ? "PASS" : "FAIL";
-    if (status?.workspace_id !== workspaceId || status.durable_idempotency !== ZCODE_IDEMPOTENCY_PROTOCOL) return evidence;
+    if (status?.workspace_id !== nativeWorkspaceId || status.durable_idempotency !== ZCODE_IDEMPOTENCY_PROTOCOL) return evidence;
     layers.service_protocol = "PASS";
     evidence.protocol = ZCODE_IDEMPOTENCY_PROTOCOL;
     before = deps.snapshot();
     if (!validSnapshot(before)) throw new Error("Snapshot unavailable");
     evidence.cleanup = "unknown_admission";
-    original = await deps.submitNative(input);
+    original = await deps.submitNative(callInput);
     verify(original);
     layers.submit_admission = "PASS";
     layers.provider_identity =
-      original.model_binding?.provider_id === ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id ? "PASS" : "FAIL";
+      original.model_binding?.provider_id !== undefined && ZCODE_NATIVE_ADMISSIBLE_PROVIDER_IDS.has(original.model_binding.provider_id) ? "PASS" : "FAIL";
     layers.model_identity =
-      original.model_binding?.model_id === ZCODE_NATIVE_REQUIRED_IDENTITY.model_id ? "PASS" : "FAIL";
+      !!original.model_binding?.model_id ? "PASS" : "FAIL";
     evidence.identity = { workspace_id: original.workspace_id, task_id: original.task_id, session_id: original.session_id! };
     evidence.model_binding = { provider_id: original.model_binding!.provider_id, model_id: original.model_binding!.model_id };
     evidence.replay_flags.push(original.idempotency!.replayed);
     checkSnapshot();
     if (original.idempotency!.replayed !== false) throw new Error("first admission replayed");
-    const replay = await deps.submitNative({ ...input });
+    const replay = await deps.submitNative({ ...callInput });
     verify(replay);
     evidence.replay_flags.push(replay.idempotency!.replayed);
     checkSnapshot();
@@ -130,7 +147,7 @@ export async function nativeSelfTest(workspaceId: string, deps: NativeSelfTestDe
     }
     layers.idempotent_replay = "PASS";
     try {
-      await deps.submitNative(changed);
+      await deps.submitNative(changedCall);
       // Any accepted response is a failure, even if it reuses the first identity.
     } catch (error) {
       if (error instanceof ZcodeNativeError && error.code === "ZCODE_NATIVE_UPSTREAM" && error.upstreamCode === "IDEMPOTENCY_CONFLICT") {

@@ -140,6 +140,28 @@ export async function startService(opts?: { port?: number }): Promise<RunningSer
   const ownership = loadSessionOwnership(stateDir);
   const sessions = new SessionService({ provider, grants, ownership, audit });
 
+  // Cold-start linkage: the durable task engine's workspace registry is synced
+  // from the AUTHORITATIVE grant registry (native ws_* ids) at startup and on
+  // demand for grants created while the service runs, so the A2C native lane
+  // can consistently forward the projected native id instead of relying on
+  // historical id coincidences. Revoked grants are never registered; an
+  // existing engine entry is left untouched.
+  const syncGrantRegistry = (workspaceId?: string): void => {
+    for (const grant of grants.list()) {
+      if (workspaceId !== undefined && grant.workspaceId !== workspaceId) continue;
+      try { workspaces.get(grant.workspaceId); continue; } catch { /* not registered yet */ }
+      try {
+        workspaces.register(grant.workspaceId, grant.canonicalPath, grant.displayName);
+        store.data.workspaces = workspaces.toList();
+        store.save();
+        audit.record("info", "workspace.registered_from_grant", { workspaceId: grant.workspaceId });
+      } catch (error) {
+        audit.record("warn", "workspace.register_from_grant_failed", { workspaceId: grant.workspaceId, error: String((error as Error)?.message ?? error).slice(0, 120) });
+      }
+    }
+  };
+  syncGrantRegistry();
+
   await provider.start();
   if (provider.status !== "healthy") {
     // Fail loudly: no silent degradation, no legacy downgrade.
@@ -206,6 +228,7 @@ export async function startService(opts?: { port?: number }): Promise<RunningSer
     grants,
     ownership,
     audit,
+    ensureWorkspaceRegistered: (workspaceId) => syncGrantRegistry(workspaceId),
     onShutdownRequest: () => void shutdown().then(() => process.exit(0)),
   });
   await new Promise<void>((resolve, reject) => {

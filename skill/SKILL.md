@@ -18,8 +18,10 @@ The C2C Bridge gives ChatGPT read/review MCP access and, with explicit execution
 scopes, a task submission/cancellation path to the official Codex executor. The
 current CLI deployment deliberately runs that executor with full local
 (filesystem and process), matching the user's selected ChatGPT/Codex permission
-level. Network remains disabled by default and is enabled only when a task
-explicitly opts in with `network: true` in this locally authorized deployment.
+level. Task network access defaults to online when the `network` field is
+omitted in this locally authorized deployment; pass `network: false` whenever
+the task must stay offline, and non-full-access deployments reject
+network-enabled tasks outright.
 ChatGPT still uses the fixed task lifecycle instead of a generic MCP shell
 interface. Control messages between you and ChatGPT stay tiny
 (< 1 KB) — ChatGPT pulls whatever data it needs by itself.
@@ -715,3 +717,43 @@ the previous public address is gone. Doctor already started a new one.
 | cloudflared missing | install it yourself (brew/winget), then retry |
 | Sidebar has no「项目」 | Ask the user to hover「聊天」, click the …, choose「按项目整理」 |
 | Collection page is the wrong Project | Ask the user to open the named collection and say「已找到」, or accept long-chat |
+
+## Workflow: multi-agent sessions (optional)
+
+All three lanes (Codex, Gemini/AGY, GLM/ZCode) are siblings under the same
+bridge. Operational guarantees — explicit plan/model/effort selection with no
+silent substitution, fail-closed admission, idempotent submission
+(`idempotency_key`), single writer per lane, cancellation with classified
+terminal states, and quota classification — are documented for users in
+`docs/multi-agent-operations.md` (in the repository checkout). Read it before
+submitting governed tasks to more than one lane.
+
+Lane acceptance is not uniform. Current evidence: the GLM lane across both
+billing plans (INDIVIDUAL GLM-5.3/max, INDIVIDUAL GLM-5.3-Flash/max, START
+GLM-5.3-Flash/max) and the Gemini/AGY lane (`gemini-3.8-flash-high` at high
+reasoning effort, two consecutive same-session turns with output match) are
+acceptance-tested. The DeepSeek/DSH adapter is partial: discovery works, and
+`dsh_task_submit` precise selection currently covers exactly two local slots —
+the GSQ slot A (`Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf`) and the Bonsai CRACK
+slot B (`Bonsai2-CRACK-PQ2.ninfer`). Other local alternative weights are not
+yet supported, and deepseek-official cloud models are out of scope for this
+round. Never claim end-to-end coverage for a lane
+without checking the "Evidence boundary" section of
+`docs/multi-agent-operations.md`.
+
+Routing discipline:
+
+1. Honor the user's explicit lane/plan/model request; resolve it against
+   `agent_model_catalog` / `agent_model_resolve` and never substitute.
+2. Submit through the standard task lifecycle; include an `idempotency_key`
+   whenever a submission could be retried.
+3. One lane = one writer; queue instead of interleaving.
+4. On failure, read the classified terminal state and act on it (quota
+   verdicts are not crashes; never retry onto a different plan).
+5. For long-running oversight (e.g. a ChatGPT dot posting status to Slack),
+   treat monitoring as repeated explicit status queries and receipt reads —
+   not as a persistent background monitor. The loop works only while the
+   connector stays reachable, the dot's OAuth scopes remain valid, and a
+   valid monitoring configuration exists; it is not permanently online and
+   implies no across-the-board model stability. Dispatch follow-up work only
+   within what the user authorized in that thread.

@@ -8,8 +8,9 @@ import type { TaskEngine } from "../core/tasks/engine.js";
 import type { AgentProvider } from "../providers/types.js";
 import type { AuditSink } from "../util/log.js";
 import { Z2C_PROTOCOL_VERSION } from "../version.js";
-import { IDEMPOTENCY_PROTOCOL } from "../core/tasks/idempotency.js";
+import { IDEMPOTENCY_KEY, IDEMPOTENCY_PROTOCOL } from "../core/tasks/idempotency.js";
 import type { SessionService, SessionServiceError } from "./sessions.js";
+import { classifyObservationError } from "./observation-errors.js";
 import type { ServiceSecurity } from "./security.js";
 import { LOCAL_PRINCIPAL, type PairingManager, type Principal } from "../authz/pairing.js";
 import type { WorkspaceGrants } from "../authz/grants.js";
@@ -38,6 +39,12 @@ export interface Z2cServiceDeps {
   grants: WorkspaceGrants;
   ownership: SessionOwnership;
   audit: AuditSink;
+  /**
+   * Cold-start linkage: register an engine workspace from the authoritative
+   * grant registry on miss (legacy task lane forwards projected native ids).
+   * Must throw when no active grant exists (fail closed).
+   */
+  ensureWorkspaceRegistered?: (workspaceId: string) => void;
   onShutdownRequest?: () => void;
 }
 
@@ -282,6 +289,13 @@ export interface ZcodeCatalogObservationOptions {
   maxCandidates?: number;
   /** Injectable clock for offline budget tests; defaults to Date.now. */
   now?: () => number;
+  /**
+   * Observability hook invoked with the FULL session id and classified
+   * outcome for every attempted candidate (before masking). Used to demote
+   * ownership records the runtime reports as no longer active (cold-start
+   * reconciliation) without exposing session ids in the public tool output.
+   */
+  onCandidateOutcome?: (sessionId: string, outcome: string) => void;
 }
 
 /**
@@ -312,18 +326,9 @@ export function adaptZcodeProviderToCatalogPort(provider: {
   };
 }
 
-export function classifyObservationError(message: string): string {
-  const lower = message.toLowerCase();
-  // Numeric protocol codes first: "-32601 method not found" is a protocol
-  // mismatch, not a missing session.
-  if (message.includes("-32004") || lower.includes("not active")) return "session-not-active";
-  if (message.includes("-32601") || message.includes("-32602") || lower.includes("protocol error")) return "protocol";
-  if (lower.includes("not associated") || lower.includes("not found")) return "session-not-found";
-  if (lower.includes("timed out") || lower.includes("timeout")) return "timeout";
-  if (lower.includes("401") || lower.includes("unauthorized") || lower.includes("forbidden") || lower.includes("permission")) return "permission";
-  if (lower.includes("econnrefused") || lower.includes("econnreset") || lower.includes("epipe") || lower.includes("transport")) return "transport";
-  return "error";
-}
+// Shared classifier lives in its own module so the SessionService can use it
+// without an import cycle; re-exported here for the established import path.
+export { classifyObservationError };
 
 /**
  * Bounded, sanitized rendering of an upstream observation error: structured
@@ -450,8 +455,10 @@ export async function observeZcodeCatalog(
         result.observedSessionId = candidate.sessionId;
         result.candidatesObserved += 1;
         result.evidenceSource = "session-settings-observed";
+        options.onCandidateOutcome?.(candidate.sessionId, "observed");
         attempts.push({ session_id: maskSession(candidate.sessionId), outcome: "observed" });
       } else {
+        options.onCandidateOutcome?.(candidate.sessionId, "session-settings-empty");
         attempts.push({ session_id: maskSession(candidate.sessionId), outcome: "session-settings-empty" });
       }
     } catch (error) {
@@ -463,6 +470,7 @@ export async function observeZcodeCatalog(
         result.evidenceSource = "observation-budget-exhausted";
         break;
       }
+      options.onCandidateOutcome?.(candidate.sessionId, kind);
       attempts.push({ session_id: maskSession(candidate.sessionId), outcome: kind, error: sanitizeObservationText(message) });
       if (kind === "permission") break; // repeats for every candidate; report honestly instead of hammering
     }
@@ -523,8 +531,17 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
       && typeof official.observeSessionSettings === "function"
       && typeof official.listSessions === "function";
     const port = isLocal ? adaptZcodeProviderToCatalogPort(official) : null;
+    // Cold-start reconciliation: the runtime itself tells us which sessions it
+    // no longer considers active (e.g. after an app-server restart). Demote
+    // owned records so stale pre-restart sessions stop projecting as current
+    // truth; any successful live use clears the demotion.
+    const onCandidateOutcome = (sessionId: string, outcome: string): void => {
+      if (outcome === "session-not-active" || outcome === "session-not-found") {
+        try { deps.ownership.markStale(sessionId); } catch { /* demotion is best-effort */ }
+      }
+    };
     const observation = port
-      ? await observeZcodeCatalog(port, { budgetMs: 8000, maxCandidates: 5 })
+      ? await observeZcodeCatalog(port, { budgetMs: 8000, maxCandidates: 5, onCandidateOutcome })
       : {
           evidenceSource: "configured",
           observedSessionId: null,
@@ -591,6 +608,7 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
       access: z.enum(["readonly", "write"]),
       model: z.string().max(64).optional(),
       thought_level: z.string().max(20).optional(),
+      entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional(),
       provider: z.string().max(64).optional(),
     },
   }, async (args) => text(await sess.createSession(currentPrincipal(), {
@@ -598,14 +616,15 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
     access: args.access,
     model: args.model,
     thought_level: args.thought_level,
+    entitlement_plan: args.entitlement_plan,
     provider: args.provider,
   })));
 
   server.registerTool("zcode_session_resume", {
     title: "Resume ZCode session",
     description: "Resume an owned session (re-establishes plan for readonly sessions after cold resume) and return attested state.",
-    inputSchema: { ...wsRefShape, access: z.enum(["readonly", "write"]) },
-  }, async (args) => text(await sess.resumeSession(currentPrincipal(), { workspace_id: args.workspace_id, session_id: args.session_id, access: args.access })));
+    inputSchema: { ...wsRefShape, access: z.enum(["readonly", "write"]), entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional() },
+  }, async (args) => text(await sess.resumeSession(currentPrincipal(), { workspace_id: args.workspace_id, session_id: args.session_id, access: args.access, entitlement_plan: args.entitlement_plan })));
 
   server.registerTool("zcode_session_read", {
     title: "Read ZCode session",
@@ -620,12 +639,14 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
     inputSchema: {
       ...wsRefShape,
       instruction: z.string().min(1).max(20000),
+      entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional(),
       timeout_ms: z.number().int().min(10000).max(900000).optional(),
     },
   }, async (args) => text(await sess.send(currentPrincipal(), {
     workspace_id: args.workspace_id,
     session_id: args.session_id,
     instruction: args.instruction,
+    entitlement_plan: args.entitlement_plan,
     timeout_ms: args.timeout_ms,
   })));
 
@@ -713,21 +734,28 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
     inputSchema: {
       workspace_id: z.string(),
       instruction: z.string().min(1).max(20000),
+      entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional(),
       idempotency_key: z.string().optional(),
       write_scope: z.enum(["workspace", "readonly"]).optional(),
       mode: z.enum(["plan", "build", "edit"]).optional(),
       resume_session_id: z.string().regex(/^sess_[0-9a-f-]{36}$/i).optional(),
+      model_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).optional(),
+      thought_level: z.string().regex(/^[a-z0-9_-]{1,20}$/).optional(),
     },
   }, async (args) => {
     try {
       if (currentPrincipal().kind !== "local") throw new Error("legacy task lane requires the local service principal");
+      ensureEngineWorkspace(args.workspace_id);
       const view = await deps.engine.submitTask({
         workspace_id: args.workspace_id,
         instruction: args.instruction,
+    entitlement_plan: args.entitlement_plan,
         ...(args.idempotency_key ? { idempotency_key: args.idempotency_key } : {}),
         write_scope: args.write_scope,
         mode: args.mode,
         ...(args.resume_session_id ? { resume_session_id: args.resume_session_id } : {}),
+        ...(args.model_id ? { model_id: args.model_id } : {}),
+        ...(args.thought_level ? { thought_level: args.thought_level } : {}),
       });
       if (view.session_id && !deps.ownership.get(view.session_id)) {
         deps.ownership.record({
@@ -753,6 +781,21 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
       throw new Error("legacy task lane requires the local service principal");
     }
   };
+  /**
+   * Register-on-miss for the legacy task lane: the A2C native lane forwards
+   * the PROJECTED native workspace id; when the engine registry does not know
+   * it yet (grant created after service start), sync from the authoritative
+   * grant registry once. No grant → the engine's own resolve fails closed.
+   */
+  const ensureEngineWorkspace = (workspaceId: string): void => {
+    try { deps.engine.getQueue(workspaceId); return; } catch (error) {
+      const code = (error as { code?: string })?.code;
+      if (code !== "UNKNOWN_WORKSPACE") throw error;
+    }
+    if (typeof deps.ensureWorkspaceRegistered === "function") {
+      deps.ensureWorkspaceRegistered(workspaceId);
+    }
+  };
   const legacyError = (err: unknown) => ({
     isError: true as const,
     content: [{ type: "text" as const, text: `${(err as { code?: string })?.code ?? "UPSTREAM"}: ${String((err as Error)?.message ?? err).slice(0, 200)}` }],
@@ -760,23 +803,50 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
 
   server.registerTool("provider_status", {
     title: "Governed task provider status",
-    description: "Local-only provider and durable task protocol status for the A2C adapter.",
+    description: "Local-only provider and durable task protocol status for the A2C adapter, including the workspace queue state used by writer-slot reconciliation.",
     inputSchema: { workspace_id: z.string().min(1) },
     annotations: { readOnlyHint: true },
   }, async ({ workspace_id }) => {
     try {
-      localTaskLane();
+      localTaskLane(); ensureEngineWorkspace(workspace_id);
       const queue = deps.engine.getQueue(workspace_id);
       const active = queue.activeTask ? deps.engine.getTask(workspace_id, queue.activeTask) : null;
       return text({
         provider: deps.provider.name,
         status: deps.provider.status,
         capabilities: deps.provider.capabilityResult,
+        // Entitlement selection capability as OBSERVED from the connected
+        // runtime (runtime/capabilities). Absent provider support = null;
+        // consumers must treat null as "START/INDIVIDUAL fail closed".
+        entitlement_capability: deps.provider.entitlementSelection ?? null,
         workspace_id,
         durable_idempotency: IDEMPOTENCY_PROTOCOL,
         session_id: active?.session_id ?? null,
         model_binding: active?.model_binding ?? null,
+        queue: {
+          paused: queue.paused,
+          active_task: queue.activeTask,
+          queued_task_count: queue.queuedTaskCount,
+        },
       });
+    } catch (err) { return legacyError(err); }
+  });
+
+  server.registerTool("resolve_zcode_task_by_key", {
+    title: "Resolve governed task by idempotency key",
+    description:
+      "Local-only read-only resolution of the durable task admitted under an idempotency key in this workspace. " +
+      "Returns { task: <view> } when the key is bound, { task: null, key_state: \"unbound\" } when no task was ever " +
+      "admitted under the key. Never submits or mutates; used to resolve a lost submit response without re-dispatching.",
+    inputSchema: { workspace_id: z.string().min(1), idempotency_key: z.string().regex(IDEMPOTENCY_KEY) },
+    annotations: { readOnlyHint: true },
+  }, async ({ workspace_id, idempotency_key }) => {
+    try {
+      localTaskLane();
+      ensureEngineWorkspace(workspace_id);
+      deps.engine.getQueue(workspace_id); // resolveAuthorized: fail closed on unknown workspace
+      const task = deps.engine.resolveKeyedTask(workspace_id, idempotency_key);
+      return text({ workspace_id, idempotency_key, key_state: task ? "bound" : "unbound", task });
     } catch (err) { return legacyError(err); }
   });
 
@@ -786,7 +856,7 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
     inputSchema: { workspace_id: z.string().min(1), task_id: z.string().min(1) },
     annotations: { readOnlyHint: true },
   }, async ({ workspace_id, task_id }) => {
-    try { localTaskLane(); return text(deps.engine.getTask(workspace_id, task_id)); }
+    try { localTaskLane(); ensureEngineWorkspace(workspace_id); return text(deps.engine.getTask(workspace_id, task_id)); }
     catch (err) { return legacyError(err); }
   });
 
@@ -795,7 +865,7 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
     description: "Local-only task cancellation with exact workspace and task binding.",
     inputSchema: { workspace_id: z.string().min(1), task_id: z.string().min(1) },
   }, async ({ workspace_id, task_id }) => {
-    try { localTaskLane(); return text(deps.engine.cancelTask(workspace_id, task_id)); }
+    try { localTaskLane(); ensureEngineWorkspace(workspace_id); return text(deps.engine.cancelTask(workspace_id, task_id)); }
     catch (err) { return legacyError(err); }
   });
 
@@ -805,24 +875,27 @@ export function buildMcpServer(deps: Z2cServiceDeps): McpServer {
     inputSchema: { workspace_id: z.string().min(1), task_id: z.string().min(1), output_id: z.string().min(1) },
     annotations: { readOnlyHint: true },
   }, async ({ workspace_id, task_id, output_id }) => {
-    try { localTaskLane(); return text(deps.engine.getOutput(workspace_id, task_id, output_id)); }
+    try { localTaskLane(); ensureEngineWorkspace(workspace_id); return text(deps.engine.getOutput(workspace_id, task_id, output_id)); }
     catch (err) { return legacyError(err); }
   });
 
   server.registerTool("resume_zcode_session", {
     title: "Resume governed ZCode session",
-    description: "Local-only immediate continuation of an owned Z2C session.",
+    description: "Local-only immediate continuation of an owned Z2C session. The session identity is preserved and re-attested.",
     inputSchema: {
       workspace_id: z.string().min(1),
       session_id: z.string().regex(/^sess_[0-9a-f-]{36}$/i),
       instruction: z.string().min(1).max(20000),
+      entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional(),
+      idempotency_key: z.string().regex(IDEMPOTENCY_KEY).optional(),
     },
-  }, async ({ workspace_id, session_id, instruction }) => {
+  }, async ({ workspace_id, session_id, instruction, idempotency_key, entitlement_plan }) => {
     try {
       localTaskLane();
+      ensureEngineWorkspace(workspace_id);
       const owned = deps.ownership.assertCanAccess(currentPrincipal(), session_id, "write");
       if (owned.workspaceId !== workspace_id) throw new Error("session workspace mismatch");
-      return text(await deps.engine.submitTask({ workspace_id, instruction, resume_session_id: session_id, immediate: true }));
+      return text(await deps.engine.submitTask({ workspace_id, instruction, entitlement_plan, resume_session_id: session_id, immediate: true, ...(idempotency_key ? { idempotency_key } : {}) }));
     } catch (err) { return legacyError(err); }
   });
 
