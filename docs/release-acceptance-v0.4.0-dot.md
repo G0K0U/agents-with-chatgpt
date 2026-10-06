@@ -12,7 +12,7 @@ dirty installation and product workspace.
 | Preserved upstream search coverage | PASS | 22 tests including 10 additional cases; no assertions removed |
 | Z2C typecheck/build/full suite | PASS | 318 passed, no failures or skips |
 | Dependency audit | PASS | A2C production+development and Z2C: zero known advisories at preparation |
-| Compiled isolated MCP candidate | PENDING | Auth/read-only smoke; no production state or provider inference |
+| Compiled isolated MCP candidate | PASS | Actual authenticated read-only MCP; 65 tools, 401 without auth, matching release/hash; no production state or inference |
 | Installed repair control plane | PASS | Development 0.3.0 LKG; actual authenticated read path and stable READY |
 | START / INDIVIDUAL | PASS | Exact native session requested=observed; live GLM max |
 | Installed native self-test | Historical PASS | Not repeated while the product queue is manually paused |
@@ -39,3 +39,10 @@ The release includes source and portable operation instructions, not tokens,
 account state, runtime journals, product source or an EXE. Recovery uses the
 existing supervisor and operator guard. Quota, login/2FA, revoked access and
 external cloud transactions remain explicit external boundaries.
+
+The formal candidate build gate passed and promoted immutable artifact
+0.4.0-42726c81-c3d316d0. The compiled smoke tested seven credential redaction
+forms on both mapper and rejected-call paths, rejected ambiguous model
+resolution, validated instance/release/build identity and authenticated shared
+agent-plane tools, then shut down its exact temporary child. It did not
+activate a production LKG, reconfigure a tunnel or create a model worker.
