@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir, writeSecureJson } from "../config/paths.js";
+import { productDispatchPaused } from "../config/dispatch-policy.js";
 
 const WORKSPACE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
-export type QueueStateReason = "default" | "manual" | "invalid_state";
+export type QueueStateReason = "default" | "manual" | "invalid_state" | "control_plane";
 
 export interface WorkspaceQueuePauseState {
   workspaceId: string;
@@ -55,6 +56,7 @@ function validPersistedState(value: unknown, workspaceId: string): value is Pers
  * or partially tampered state can never release queued work automatically.
  */
 export function readWorkspaceQueuePauseState(workspaceId: string, stateDir?: string): WorkspaceQueuePauseState {
+  if (productDispatchPaused(stateDir)) return { workspaceId, paused: true, updatedAt: null, reason: "control_plane" };
   const file = workspaceQueueStateFile(workspaceId, stateDir);
   let parsed: unknown;
   try {

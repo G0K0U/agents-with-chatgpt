@@ -4,6 +4,17 @@
 
 > ChatGPT 负责思考，Agent 负责干活——Codex、Gemini、GLM。
 
+## v0.4.0：针对 ChatGPT Dot 优化
+
+本次集成更新包含 Dot 的目标/Agent 管理与既有持续监督循环、正式全局派发恢复、
+boot/session reconciliation、有限自我修复，以及已保存的一键状态/恢复入口。
+Antigravity Opus 5.5 通过 live catalog 和正式准入核验，使用最高支持 effort。
+请求值与实际观测分开记录；额度耗尽明确失败，不静默换模型。
+
+查看[更新与实际限制](docs/release-v0.4.0-dot.md)、
+[Dot 目标工作流](docs/dot-goal-workflow.md)和
+[快捷恢复入口](docs/engineering-ai-workflow.md)。
+
 ## 解决什么问题
 
 ChatGPT 付费订阅的网页版额度大量闲置，编程 Agent 却在消耗紧张的 API 额度做
@@ -20,25 +31,15 @@ ChatGPT 通过 OAuth MCP 连接按需读取代码，并通过本地、经过身�
 1. **Codex** — 官方 Codex App Server（本地执行器）。
 2. **Gemini** — Antigravity/AGY CLI + Google OAuth（按需就绪；没有活跃会话也是
    健康状态）。
-3. **GLM（治理通道）** — Z2C 伴随组件 → ZCode Desktop → **仅 GLM-5.3-Flash**，
-   原生同会话模型/身份证明 + 精确工作区绑定。
+3. **GLM（治理通道）** — Z2C 伴随组件 → ZCode Desktop，显式 START/INDIVIDUAL，
+   从当前套餐目录选择模型，保留原生同会话证明与精确工作区绑定。
 
 ## 三条执行通道
 
 ### Codex — 原生 App Server
 
 - 使用本地官方 **Codex App Server**，无 shim、无反向代理。
-- 模型目录与任务执行使用同一已配置运行时；目录列出模型不等于真实任务完成。
-  具体支持范围见[支持矩阵](docs/support-matrix.md)。
 - 前置条件：机器上完成 Codex/OpenAI 登录（CLI 或桌面版）。
-
-### 可选用量遥测 — Quanta
-
-`agent_usage_status` 可读取本地 Quanta 采样。A2C 按供应商各自的采样时间
-执行 60 秒新鲜度判断；缺失、过期或刷新失败的数据仍显示为 unknown。
-没有安装 Quanta 也可手动执行 Agent。仓库包含 MIT 许可的
-[Quanta 0.9.4+a2c.1 修补源码和构建说明](third_party/quanta/PATCH-INFO.md)；
-上游原版 0.9.4 可执行文件不含此修补。
 
 ### Gemini — Antigravity/AGY CLI + Google OAuth
 
@@ -257,7 +258,6 @@ src/          C2C bridge、MCP 面、OAuth、配对、工作区策略、隧道�
               release/LKG 生命周期、supervisor
 z2c/          Z2C 伴随组件（MIT）：治理 GLM 控制平面 + desktop-agent 代理 +
               原生 ZCode 协议客户端
-third_party/  Quanta 0.9.4+a2c.1 的 MIT 许可修补源码
 skill/        Codex Skill（真正的 UX 层）
 tests/        单元 + 集成测试
 docs/         架构 / 协议 / 安全 / 故障排查
@@ -278,14 +278,9 @@ CHANGELOG.md  各版本发布说明
 
 本公开仓库派生自 [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt)
 （MIT 许可证），并包含当前的多 Agent 扩展。上游版权归原贡献者所有，依 MIT
-许可证条款保留。`z2c/` 伴随组件同样以 MIT 许可证分发；Quanta 修补源码保留
-[自身 MIT 许可证](third_party/quanta/LICENSE)和[来源记录](third_party/quanta/PATCH-INFO.md)。
+许可证条款保留。`z2c/` 伴随组件同样以 MIT 许可证分发。
 
 ## 状态与声明
-
-0.3.0 候选版本的本地 A2C OAuth 路径已完成 GPT-6 Sol/max 短 nonce 真实调用，
-模型选择一致且没有文件改动。具体构建证据和未验证平台见[支持矩阵](docs/support-matrix.md)。
-当前 ChatGPT 连接器仍需由该客户端独立复核。
 
 **非官方社区项目。与 OpenAI、Google、Z.AI 无隶属或背书关系。**
 

@@ -1,19 +1,12 @@
 /**
- * WMI sometimes returns null ExecutablePath/CommandLine for a live Node
- * process even when the current user can open it with PROCESS_QUERY_LIMITED_INFORMATION.
- * Keep the fallback in the compiled tree so immutable releases use the same
- * inspector as source runs. The OS creation time is compared with WMI before
- * a native result is accepted, preventing a PID reuse between both reads.
+ * User-session process identity without WMI/CIM or administrator privileges.
+ * Image, command line and creation time are read from the same limited-query
+ * handle. Inaccessible processes remain unproven; callers must fail closed.
  */
 export const WINDOWS_PROCESS_QUERY = String.raw`
 $OutputEncoding = [System.Text.UTF8Encoding]::new()
-$rows = @(Get-CimInstance -ClassName Win32_Process |
-  Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate,Name)
-$missing = @($rows | Where-Object {
-  $_.Name -ieq 'node.exe' -and (-not $_.ExecutablePath -or -not $_.CommandLine)
-})
-if ($missing.Count -gt 0) {
-  try {
+$rows = @()
+try {
     Add-Type -TypeDefinition @'
 using System;
 using System.Text;
@@ -61,21 +54,19 @@ public static class A2CNativeProcessInfo {
   }
 }
 '@
-    foreach ($row in $missing) {
-      $native = [A2CNativeProcessInfo]::Inspect([int]$row.ProcessId)
+    foreach ($processRow in [System.Diagnostics.Process]::GetProcesses()) {
+      $native = [A2CNativeProcessInfo]::Inspect([int]$processRow.Id)
       if (-not $native) { continue }
-      $nativeStart = [datetime]::Parse($native[2]).ToUniversalTime()
-      $wmiStart = ([datetime]$row.CreationDate).ToUniversalTime()
-      if ([Math]::Abs(($nativeStart - $wmiStart).TotalMilliseconds) -gt 1000) { continue }
-      if ($row.ExecutablePath -and $row.ExecutablePath -ine $native[0]) { continue }
-      if ($row.CommandLine -and $row.CommandLine -cne $native[1]) { continue }
-      $row.ExecutablePath = $native[0]
-      $row.CommandLine = $native[1]
+      $rows += [pscustomobject]@{
+        ProcessId = $processRow.Id
+        ExecutablePath = $native[0]
+        CommandLine = $native[1]
+        CreationDate = [datetime]::Parse($native[2]).ToUniversalTime()
+      }
     }
-  } catch {
-    # Native inspection is an optional proof source. Incomplete rows stay
-    # unavailable and all lifecycle callers continue to fail closed.
-  }
+} catch {
+  # Inventory failure must not masquerade as an empty machine.
+  exit 1
 }
 $rows | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate |
   ConvertTo-Json -Compress -Depth 3

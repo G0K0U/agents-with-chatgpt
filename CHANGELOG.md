@@ -3,6 +3,44 @@
 All notable changes to this project are documented here. The project versions
 pre-1.0 releases with a minor bump per feature release; tags follow `vX.Y.Z`.
 
+## [0.4.0] — 2026-10-06
+
+### Added
+
+- ChatGPT Dot goal/agent management integration using the existing Dot →
+  Luna low → A2C worker → Dot acceptance/next-task loop. Finite durable plans
+  and audit gates coexist with the human-authorized supervisor loop.
+- Formal protected operator dispatch-policy status/pause/resume, atomic and
+  idempotent persistence, and truthful ENV_OVERRIDE_ACTIVE reporting.
+- Boot/session generations, idempotent startup reconciliation, readiness and
+  inspectable degraded health, stale writer handling, version gates and the
+  existing supervisor's bounded targeted recovery.
+- Portable saved workflow and finite one-command status/start recovery entry.
+- Explicit native START/INDIVIDUAL entitlement readback and live highest effort
+  policy. Antigravity Opus 5.5 uses the highest live catalog level and existing
+  Claude/GPT quota pool, without fallback.
+
+### Fixed
+
+- Opus 5.5 catalog/admission mismatch rejected by an older model definition set.
+- Shared CLI logs contaminating another task's observed model/effort or cause.
+  Exact process/session evidence takes precedence; uncorrelated evidence is unknown.
+- Health reads repeatedly starting reconciliation and masking stable readiness.
+- Native timeout being overwritten by a model cancellation during partial-output
+  readback; known deadlines and cancellation now retain separate safe causes.
+- Supervisor first-tick startup being mistaken for failed ownership; bounded
+  waiting uses independent same-process proof and never starts a duplicate.
+- Specific safe operator stop failures replacing unclassified restart details.
+
+### Validation and boundaries
+
+See [v0.4.0 release notes](docs/release-v0.4.0-dot.md). Existing public media,
+record, sensitive-path and tunnel fixes are retained. External quota, login/2FA,
+cloud permission review and unknown partial-create outcomes are not bypassed.
+No new protected continuation, unlimited scheduler or real-machine reboot was
+installed/performed by this repair. Private state and journals are excluded.
+
+
 ## [0.3.0] — 2026-09-22
 
 ### Release closure fixes (2026-09-27)

@@ -1,4 +1,16 @@
-# Platform and provider support matrix
+# v0.4.0 support and evidence
+
+The public v0.4.0 source package is verified on Windows/Node 24. CI checks
+Windows/Node 22 and 24. Live installation repair evidence comes from the
+development 0.3.0 LKG and must not be substituted for live v0.4.0 artifact
+acceptance. See [current acceptance](release-acceptance-v0.4.0-dot.md).
+
+The existing Dot timer/poll loop, GLM START/INDIVIDUAL exact binding and an
+Opus 5.5/high read-only turn were observed during repair. The subsequent Opus
+product turn failed quota and is not accepted as UI completion. Real-machine
+reboot, independent-machine installation and other platforms remain NOT_TESTED.
+
+## Historical v0.3.0 support record
 
 This matrix describes v0.3.0 at the tested A2C source and emitted build hashes
 in the [acceptance record](release-acceptance-v0.3.0.md). Model availability can

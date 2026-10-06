@@ -33,6 +33,9 @@ import { createServer } from "node:net";
 import { existsSync, mkdirSync, appendFileSync, renameSync, writeFileSync, unlinkSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { resolveCanonicalProfile, buildDesktopChildEnv } from "./desktop-profile.mjs";
+import { DesktopTurnRouting } from "./desktop-turn-routing.mjs";
+
+const turnRouting = new DesktopTurnRouting();
 
 const CANONICAL_PROFILE = resolveCanonicalProfile();
 const DEFAULT_CLI = join(
@@ -137,6 +140,13 @@ process.stdin.on("end", () => child.stdin.end());
 // Child → Desktop + Z2C fans.
 const z2cClients = new Set(); // {socket, pendingIds:Set<string>}
 function childLineRouter(line) {
+  const message = JSON.parse(line);
+  const permissionOwner = turnRouting.route(message);
+  if (permissionOwner !== undefined) {
+    if (permissionOwner) permissionOwner.socket.write(line + "\n");
+    else child.stdin.write(JSON.stringify({ id: message.id, result: { decision: "deny" } }) + "\n");
+    return;
+  }
   const info = routeInfo(line);
   let routedToZ2c = false;
   if (info) {
@@ -173,7 +183,7 @@ try {
     let authBuffer = "";
     socket.setEncoding("utf8");
     socket.on("error", () => {});
-    socket.on("close", () => z2cClients.delete(client));
+    socket.on("close", () => { z2cClients.delete(client); turnRouting.disconnect(client); });
     socket.on("data", (chunk) => {
       if (!client.authed) {
         authBuffer += chunk;
@@ -196,6 +206,20 @@ try {
       }
       // Split frames; register z2c ids then forward unchanged to the child.
       const splitter = (client._splitter ??= new FrameSplitter((line) => {
+        let message;
+        try { message = JSON.parse(line); } catch { return; }
+        if (message.method === "z2c/claimTurn" || message.method === "z2c/releaseTurn") {
+          const claimed = message.method === "z2c/claimTurn"
+            ? turnRouting.claim(client, message.params?.sessionId, message.params?.timeoutMs)
+            : (turnRouting.release(client, message.params?.sessionId), true);
+          socket.write(JSON.stringify({ id: message.id, ...(claimed ? { result: { ok: true } } :
+            { error: { code: -32000, message: "turn claim rejected" } }) }) + "\n");
+          return;
+        }
+        if (!message.method && message.id != null) {
+          if (turnRouting.response(client, message.id)) child.stdin.write(line + "\n");
+          return;
+        }
         const info = routeInfo(line);
         if (info?.id && info.z2c) client.pendingIds.add(info.id);
         child.stdin.write(line + "\n");

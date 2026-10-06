@@ -15,10 +15,13 @@ const SECRET = "z2c-security-probe-secret-4f7a9";
 describe("credential hygiene (P0.2 invariants)", () => {
   it("config no longer exposes any ZCode credential-store reader", async () => {
     const configModule = await import("../src/config.js");
+    // Allow-list = every legitimate config.ts export. The invariant is that
+    // NO export reads or exposes ZCode credential material; the diagnostic
+    // exports (provider-config round) are path/size/counter helpers only.
     for (const key of Object.keys(configModule)) {
       assert.match(
         key,
-        /^(loadConfig|parseRegQueryOutput|localAppData|isJsScript|resolveCliSpawn|ZCODE_CLI_RELATIVE_LAYOUTS|resolveZcodeCliPath|resolveZcodeBuiltinProviderConfigFile)$/,
+        /^(loadConfig|parseRegQueryOutput|localAppData|isJsScript|resolveCliSpawn|ZCODE_CLI_RELATIVE_LAYOUTS|resolveZcodeCliPath|resolveZcodeBuiltinProviderConfigFile|ZCODE_BUILTIN_CONFIG_MAX_BYTES|isProtectedAccountPath|countPlanDeclarations|builtinProviderConfigDiagnostic)$/,
         `unexpected export: ${key}`,
       );
     }

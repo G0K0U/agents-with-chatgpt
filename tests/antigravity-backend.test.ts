@@ -7,6 +7,9 @@ import {
   DEFAULT_GEMINI_MODEL,
   ANTIGRAVITY_SECURITY_MODE,
   KNOWN_GEMINI_MODELS,
+  canonicalizeAntigravityModel,
+  resolveAntigravityModelEvidence,
+  getAntigravityModelsForPool,
 } from "../src/execution/antigravity.js";
 import {
   CodexTaskManager,
@@ -86,6 +89,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "test instruction",
       write_scope: ["src"],
+      network: false,
       provider: "gemini",
     });
     expect(validated.provider).toBe("gemini");
@@ -97,6 +101,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "test instruction",
       write_scope: ["src"],
+      network: false,
     });
     expect(validated.provider).toBe("codex");
   });
@@ -107,6 +112,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "test instruction",
       write_scope: ["src"],
+      network: false,
       provider: "codex",
     });
     expect(validated.provider).toBe("codex");
@@ -443,6 +449,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "Add a comment",
       write_scope: ["src"],
+      network: false,
     };
     const validated = validateCodexTask(workspace, input);
     expect(validated.provider).toBe("codex");
@@ -455,6 +462,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "Claude sonnet test",
       write_scope: ["src"],
+      network: false,
       provider: "gemini",
       model: "claude-sonnet-4-6",
     });
@@ -463,6 +471,24 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
   });
 
   // 21. unknown model for provider=gemini throws INVALID_MODEL with allowlist
+  it("admits supported Opus 5.5 and reads the exact protocol effort without fallback", () => {
+    const model = "claude-opus-5-5-high";
+    const validated = validateCodexTask(workspace, {
+      workspace_id: workspace.id, instruction: "Review method differences", write_scope: ["src"],
+      network: false, provider: "gemini", model,
+    });
+    expect(validated.model).toBe(model);
+    expect(getAntigravityModelsForPool("antigravity:claude_gpt_shared")).toContain(model);
+    expect(getAntigravityModelsForPool("antigravity:gemini")).not.toContain(model);
+    expect(canonicalizeAntigravityModel("Claude Opus 5.5 High")).toEqual({ modelId: model, effort: "high" });
+    expect(resolveAntigravityModelEvidence({ protocolModel: model, isolatedHome: workspace.root })).toEqual({
+      modelId: model, effort: "high", effortStatus: "verified", evidenceSource: "cli_protocol",
+    });
+    expect(() => validateCodexTask(workspace, {
+      workspace_id: workspace.id, instruction: "Unknown effort", write_scope: ["src"],
+      network: false, provider: "gemini", model: "claude-opus-5-5-ultra",
+    })).toThrowError(/is not in the Antigravity allowlist/);
+  });
   it("21. unknown model for provider=gemini throws INVALID_MODEL with allowlist", () => {
     expect(() => validateCodexTask(workspace, {
       workspace_id: workspace.id,
@@ -482,6 +508,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: workspace.id,
       instruction: "Model on codex test",
       write_scope: ["src"],
+      network: false,
       provider: "codex",
       model: "gpt-6-astra",
     });
@@ -506,6 +533,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Task 1",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "claude-sonnet-4-6",
@@ -517,6 +545,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Task 2 continuation",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
     }, { ownerId: "user-1", sessionId: first.sessionId! });
@@ -538,6 +567,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Task 1",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "claude-sonnet-4-6",
@@ -549,6 +579,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Task 2 switch model",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "gemini-3.8-pro-high",
@@ -565,6 +596,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Do something without session",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
     });
@@ -628,6 +660,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Check model identity separation",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "gemini-3.8-pro-high",
@@ -666,6 +699,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Check lifecycle",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
       model: "gemini-3.8-flash-high",
@@ -718,6 +752,7 @@ describe("Gate 1.16 — Antigravity Backend Wire-Up & Governance", () => {
       workspace_id: ws.id,
       instruction: "Check onIdentity timing",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
       provider: "gemini",
     });

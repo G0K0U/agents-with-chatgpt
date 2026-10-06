@@ -18,6 +18,7 @@ describe("daemon-owned native protocol self-test", () => {
     tasks = new Map(); requests = [];
     deps = {
       providerStatus: vi.fn(async () => ({ workspace_id: workspace, durable_idempotency: "workspace-task-v1", provider: "zcode-desktop" })),
+      projectWorkspace: vi.fn(async (id: string) => ({ nativeWorkspaceId: id, canonicalPath: `\\fixture\\root-${id}` })),
       snapshot: vi.fn(() => ({ queue: "a".repeat(64), writer: "b".repeat(64) })),
       submitNative: vi.fn(async input => {
         requests.push({ ...input });
@@ -63,7 +64,9 @@ describe("daemon-owned native protocol self-test", () => {
     deps.submitNative = async input => {
       const result = structuredClone(await submit(input)); calls++;
       if (fault === "workspace") result.workspace_id = "wrong";
-      if (fault === "binding") result.model_binding!.model_id = secret;
+      // Catalog policy: the model is free-form (runtime-advertised); the
+      // governed identity field is the provider ROUTE.
+      if (fault === "binding") result.model_binding!.provider_id = "custom:foreign";
       if (fault === "first_replayed") result.idempotency!.replayed = true;
       if (fault === "proof_missing") delete result.idempotency;
       if (calls === 2) {
@@ -122,11 +125,13 @@ describe("daemon-owned native protocol self-test", () => {
     const manager = new CodexTaskManager(ws, { stateDir: state, nativeClient: {
       submitTask: async (input, before) => { before?.(); return deps.submitNative(input); },
       cancelTask: async input => deps.cancel!(input),
+      projectWorkspace: async (id: string) => ({ nativeWorkspaceId: id, canonicalPath: root }),
     } as never });
     try {
       acquireWorkspaceSlot(ws.id, `c2c_${"a".repeat(16)}`, state, "gemini");
       const held = readWorkspaceSlot(ws.id, state), before = manager.nativeAdmissionSnapshot();
       const result = await nativeSelfTest(ws.id, { providerStatus: async () => ({ workspace_id: ws.id, durable_idempotency: "workspace-task-v1", provider: "zcode-desktop" }),
+        projectWorkspace: async (id: string) => ({ nativeWorkspaceId: id, canonicalPath: root }),
         submitNative: input => manager.submitNative(input), snapshot: () => manager.nativeAdmissionSnapshot(),
         cancel: input => manager.cancelNative(input, true) });
       expect(result.overall).toBe("PASS"); expect(tasks.size).toBe(1);

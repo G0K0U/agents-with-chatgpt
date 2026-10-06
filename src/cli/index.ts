@@ -1,6 +1,7 @@
 import { installationRoot } from "../bridge/runtime-identity.js";
+import { highestWorkerEffortRequired, requireHighestWorkerEffort } from "../config/worker-effort-policy.js";
 import { fullAccessDevelopmentEnabled } from "../config/development.js";
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
@@ -23,6 +24,8 @@ import { detectTunnelBinaries } from "../tunnel/detect.js";
 import {
   chooseQuickTunnel,
   hasCloudflaredCert,
+  inspectNamedTunnelCredentials,
+  namedTunnelCredentialRepairMessage,
   ProcessCloudflaredAccount,
   provisionNamedTunnel,
 } from "../tunnel/named-provision.js";
@@ -82,8 +85,53 @@ import {
   materializeVerificationProfile,
   prepareVerificationRuntime,
 } from "../execution/verification.js";
+import { importMediaAsset } from "../media/import.js";
 
 const program = new Command();
+program.command("worker-effort-policy")
+  .description("Local operator policy for GLM/Gemini: status or require-highest; no task creation")
+  .argument("<action>", "status or require-highest")
+  .option("--json", "machine-readable output")
+  .action((action: string, opts) => {
+    if (!["status", "require-highest"].includes(action)) throw new Error("Expected status or require-highest");
+    const stateDir = getStateDir((program.opts() as { stateDir?: string }).stateDir);
+    if (action === "require-highest") requireHighestWorkerEffort(stateDir);
+    const result = { glmAndGemini: highestWorkerEffortRequired(stateDir) ? "highest" : "caller-selected", luna: "unchanged", providerRestartRequired: action === "require-highest" };
+    say(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+  });
+program.command("dispatch-policy")
+  .description("Operator-only global product dispatch status/pause/resume; does not create tasks")
+  .argument("<action>", "status, pause or resume")
+  .option("-w, --workspace <path>", "authorized workspace root", installationRoot())
+  .option("--json", "machine-readable output")
+  .action(async (action: string, opts) => {
+    if (!["status", "pause", "resume"].includes(action)) throw new Error("Expected status, pause or resume");
+    const stateDir = getStateDir((program.opts() as { stateDir?: string }).stateDir);
+    const root = resolveWorkspace(opts.workspace);
+    const observation = await findBridgeObservation(new Workspace(root).id, root, { stateDir });
+    if (observation.state !== "healthy") throw new Error("Bridge is not available; no policy was changed");
+    const result = await adminFetch<Record<string, unknown>>(observation.runtime,
+      action === "status" ? "GET" : "POST", "/admin/dispatch-policy", 5000,
+      action === "status" ? undefined : { action });
+    say(opts.json ? JSON.stringify(result) : JSON.stringify(result, null, 2));
+    if (action === "resume" && result.effectivePaused) process.exitCode = 1;
+  });
+program.command("health")
+  .description("Read-only control-plane readiness and safe failure cause (no CIM/admin)")
+  .option("-w, --workspace <path>", "authorized workspace root", installationRoot())
+  .option("--json", "machine-readable output")
+  .action(async (opts) => {
+    const stateDir = getStateDir((program.opts() as { stateDir?: string }).stateDir);
+    const observation = await findBridgeObservation(new Workspace(resolveWorkspace(opts.workspace)).id, resolveWorkspace(opts.workspace), { stateDir });
+    if (observation.state !== "healthy") {
+      const { safeCause, ControlPlaneError } = await import("../bridge/control-plane-error.js");
+      const cause = safeCause(new ControlPlaneError("HOST_NOT_READY", "bridge_process", "a2c"));
+      say(JSON.stringify({ READY: false, READY_STATE: "DEGRADED_HOST", ...cause })); process.exitCode = 1; return;
+    }
+    const health = await adminFetch<Record<string, unknown>>(observation.runtime, "GET", "/admin/health", 5000);
+    say(opts.json ? JSON.stringify(health) : `${health.READY_STATE}: ${health.LAST_ERROR_CODE ?? "OK"} (${health.LAST_FAILURE_LAYER ?? "all required checks passed"})`);
+    if (!health.READY) process.exitCode = 1;
+  });
 
 program.command("continuation-install")
   .requiredOption("--manifest <file>", "Explicit locally approved manifest")
@@ -109,6 +157,34 @@ const cross = (msg: string): void => say(`✗ ${msg}`);
 
 function resolveWorkspace(option?: string): string {
   return path.resolve(option ?? process.cwd());
+}
+
+function parseInteger(value: string): number {
+  const normalized = value.trim();
+  if (!/^-?\d+$/.test(normalized)) {
+    throw new InvalidArgumentError("must be an integer");
+  }
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed)) throw new InvalidArgumentError("must be a safe integer");
+  return parsed;
+}
+
+function parseNonNegativeInteger(value: string): number {
+  const parsed = parseInteger(value);
+  if (parsed < 0) throw new InvalidArgumentError("must be a non-negative integer");
+  return parsed;
+}
+
+function parseChangedFiles(value: string): string[] | number {
+  const normalized = value.trim();
+  if (/^-?\d+$/.test(normalized)) {
+    const count = parseInteger(normalized);
+    if (count < 0) {
+      throw new InvalidArgumentError("changed-files count must be a non-negative safe integer");
+    }
+    return count;
+  }
+  return value.split(",").map((file) => file.trim()).filter(Boolean);
 }
 
 /** Local harness output only. Never pasted into ChatGPT. */
@@ -334,6 +410,11 @@ program
   .version(VERSION, "-v, --version")
   .option("--state-dir <path>", "explicit C2C state directory")
   .configureHelp({ sortSubcommands: true });
+
+/** Machine-wide commands ignore `-w` so a Skill that always passes it cannot crash them. */
+function acceptUnusedWorkspaceOption(command: Command): Command {
+  return command.option("-w, --workspace <path>", "ignored; this command is machine-wide");
+}
 
 // ---------------------------------------------------------------- serve (internal)
 
@@ -769,6 +850,8 @@ program
       : "Codex with ChatGPT";
     const tunnelState = workspace ? readTunnelState(workspace.id, opts.stateDir) : null;
     const namedReady = tunnelState ? isNamedTunnelReady(tunnelState) : false;
+    const namedCredential = namedReady ? inspectNamedTunnelCredentials(tunnelState?.tunnelId) : null;
+    const namedCredentialFailure = Boolean(namedCredential && namedCredential.status !== "ready");
     let namedRepair: { needed: boolean; userMessage?: string } = { needed: false };
     let chatgptRepair: {
       needed: boolean;
@@ -827,7 +910,7 @@ program
     } else if (runtime) {
       let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
       info = await refreshExternalTunnelInfo(runtime, info);
-      if (namedReady && opts.fix && info.tunnel.provider !== "cloudflare-named") {
+      if (namedReady && !namedCredentialFailure && opts.fix && info.tunnel.provider !== "cloudflare-named") {
         await stopBridge(root, { stateDir: opts.stateDir });
         await new Promise((resolve) => setTimeout(resolve, 400));
         try {
@@ -850,7 +933,7 @@ program
         }
       }
 
-      if ((!currentUrl || !healthy) && opts.fix && (expectedPublic || info.tunnel.running)) {
+      if ((!currentUrl || !healthy) && !namedCredentialFailure && opts.fix && (expectedPublic || info.tunnel.running)) {
         try {
           const binaries = detectTunnelBinaries();
           if (!binaries.cloudflared) {
@@ -872,7 +955,16 @@ program
         }
       }
 
-      if (currentUrl && healthy) {
+      if (namedCredentialFailure && namedCredential) {
+        report.tunnel = {
+          ok: false,
+          detail: `NAMED_TUNNEL_CREDENTIAL_${namedCredential.status.toUpperCase()}`,
+        };
+        namedRepair = {
+          needed: true,
+          userMessage: namedTunnelCredentialRepairMessage(namedCredential.status),
+        };
+      } else if (currentUrl && healthy) {
         report.tunnel = { ok: true, detail: currentUrl };
         const nextMcp = mcpUrlFromPublic(currentUrl);
         const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
@@ -898,14 +990,7 @@ program
           previousMcpUrl: lastEndpoint?.mcpUrl ?? null,
         };
         if (action === "update") {
-          try {
-            const pairing = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
-            chatgptRepair.pairingCode = pairing.code;
-            chatgptRepair.pairingExpiresAt = pairing.expiresAt;
-            results.push(`已生成新的配对码，需要更新「${boundName}」`);
-          } catch (error) {
-            report.oauth = { ok: false, detail: (error as Error).message };
-          }
+          results.push(`安全连接地址已更换，需要更新「${boundName}」`);
         }
       } else if (namedReady) {
         report.tunnel = report.tunnel ?? { ok: false, detail: "NAMED_TUNNEL_DOWN" };
@@ -928,6 +1013,15 @@ program
       }
     } else if (bridgeUnknown) {
       report.tunnel = report.tunnel ?? { ok: false, detail: "Bridge 状态无法确认，未执行连接器修复" };
+    } else if (namedCredentialFailure && namedCredential) {
+      report.tunnel = {
+        ok: false,
+        detail: `NAMED_TUNNEL_CREDENTIAL_${namedCredential.status.toUpperCase()}`,
+      };
+      namedRepair = {
+        needed: true,
+        userMessage: namedTunnelCredentialRepairMessage(namedCredential.status),
+      };
     } else if (namedReady) {
       report.tunnel = { ok: false, detail: "NAMED_TUNNEL_DOWN" };
       namedRepair = { needed: true, userMessage: NAMED_REPAIR_MESSAGE };
@@ -968,6 +1062,9 @@ program
         };
       }
       say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair, unified }));
+      const hasFailures =
+        Object.values(report).some((value) => !value.ok) || chatgptRepair.needed || namedRepair.needed;
+      if (hasFailures) process.exitCode = 1;
       return;
     }
     say(`${PRODUCT_NAME} Doctor`);
@@ -1009,7 +1106,7 @@ program
         : chatgptRepair.needed
           ? "本地已就绪，还需要在 ChatGPT 删除并重新添加该连接。"
           : namedRepair.needed
-            ? "固定域名还没连上，需要先登录 Cloudflare。"
+            ? "固定域名需要先按上面的诊断提示处理。"
             : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
     );
     if (!allOk || namedRepair.needed) process.exitCode = 1;
@@ -1127,10 +1224,12 @@ program
 
 // ---------------------------------------------------------------- sandbox-allow (Codex writable_roots, macOS + Windows)
 
-program
-  .command("sandbox-allow")
-  .description("Add the local settings directory to the Codex sandbox allowlist")
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  program
+    .command("sandbox-allow")
+    .description("Add the local settings directory to the Codex sandbox allowlist")
+    .option("--json", "machine-readable output", false)
+)
   .action((opts: { json: boolean }) => {
     const result = trySandboxAllow();
     if (opts.json) {
@@ -1162,11 +1261,13 @@ function runGit(args: string[]): { ok: boolean; stdout: string } {
   return { ok: result.status === 0, stdout: (result.stdout ?? "").trim() };
 }
 
-program
-  .command("update-check")
-  .description("Check GitHub for a newer version (real check at most once per local day)")
-  .option("--force", "check even if already checked today", false)
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  program
+    .command("update-check")
+    .description("Check GitHub for a newer version (real check at most once per local day)")
+    .option("--force", "check even if already checked today", false)
+    .option("--json", "machine-readable output", false)
+)
   .action((opts: { force: boolean; json: boolean }) => {
     const file = path.join(getStateDir(), "update-check.json");
     const today = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD in local tz
@@ -1319,6 +1420,7 @@ async function planeForCli(stateDirOpt?: string) {
     stateDir,
     workspaces: () => workspaces,
     zcodeClient,
+    dshClient: new (await import("../execution/dsh-native-client.js")).DshNativeClient(),
     ownership: loadZcodeSessionOwnership(stateDir),
   });
 }
@@ -1331,8 +1433,8 @@ function planeCommandScaffold(): void {
 
   plane
     .command("sessions")
-    .description("List the shared session projection across Codex, Gemini/Antigravity, and ZCode (observe-only)")
-    .option("-p, --provider <name>", "filter: codex | gemini | zcode")
+    .description("List the shared session projection across Codex, Gemini/Antigravity, ZCode, and DSH (observe-only)")
+    .option("-p, --provider <name>", "filter: codex | gemini | zcode | dsh")
     .option("-o, --origin <name>", "filter: a2c | native | desktop")
     .option("-w, --workspace-id <id>", "filter by A2C workspace id")
     .option("-n, --limit <n>", "page size (1-100)", "50")
@@ -1379,7 +1481,7 @@ function planeCommandScaffold(): void {
   plane
     .command("activity")
     .description("Bounded cross-provider activity feed with seq cursor (observe-only)")
-    .option("-p, --provider <name>", "filter: codex | gemini | zcode")
+    .option("-p, --provider <name>", "filter: codex | gemini | zcode | dsh")
     .option("-s, --session-id <id>", "filter by session id")
     .option("-w, --workspace-id <id>", "filter by A2C workspace id")
     .option("--after-seq <n>", "events after this sequence number")
@@ -1518,6 +1620,7 @@ supervisorCmd
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
     try {
+      await bootstrapTask;
       await supervisor.run();
       await bootstrapTask;
       await supervisor.waitForRecoveries();
@@ -1833,6 +1936,33 @@ session
     }
   });
 
+// ---------------------------------------------------------------- generated media handoff
+
+const assetCmd = program
+  .command("asset")
+  .description("Safely hand downloaded media into the current workspace");
+
+assetCmd
+  .command("import", { isDefault: true })
+  .description("Validate and copy a downloaded image or video into the workspace")
+  .requiredOption("--from <path>", "downloaded source file")
+  .requiredOption("--to <path>", "new workspace-relative destination")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { from: string; to: string; workspace?: string; json: boolean }) => {
+    try {
+      const result = await importMediaAsset({
+        workspaceRoot: resolveWorkspace(opts.workspace),
+        sourcePath: opts.from,
+        destinationPath: opts.to,
+      });
+      if (opts.json) say(JSON.stringify({ ok: true, ...result }));
+      else check(`媒体已导入：${result.destinationPath}`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
 session
   .command("set")
   .description("Save the ChatGPT Project and/or conversation for this workspace")
@@ -1935,10 +2065,12 @@ const prefsCmd = program
   .command("prefs")
   .description("Remember ChatGPT developer mode and setup choice for this machine");
 
-prefsCmd
-  .command("get", { isDefault: true })
-  .description("Show remembered ChatGPT setup choices (not per workspace)")
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  prefsCmd
+    .command("get", { isDefault: true })
+    .description("Show remembered ChatGPT setup choices (not per workspace)")
+    .option("--json", "machine-readable output", false)
+)
   .action((opts: { json: boolean }) => {
     const prefs = readUiPrefs();
     if (opts.json) {
@@ -1951,12 +2083,14 @@ prefsCmd
     else say("配置方式：尚未选择");
   });
 
-prefsCmd
-  .command("set")
-  .description("Save a ChatGPT setup choice for this machine")
-  .option("--developer-mode", "remember that ChatGPT developer mode is on", false)
-  .option("--setup-mode <mode>", "auto (preview) or manual")
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  prefsCmd
+    .command("set")
+    .description("Save a ChatGPT setup choice for this machine")
+    .option("--developer-mode", "remember that ChatGPT developer mode is on", false)
+    .option("--setup-mode <mode>", "auto (preview) or manual")
+    .option("--json", "machine-readable output", false)
+)
   .action((opts: { developerMode: boolean; setupMode?: string; json: boolean }) => {
     try {
       const modeRaw = opts.setupMode?.trim().toLowerCase();
@@ -1984,36 +2118,36 @@ prefsCmd
 
 program
   .command("record", { hidden: true })
-  .description("Record a Codex execution summary (used by the Skill)")
+  .description("Record an execution summary (used by the Skill)")
   .option("-w, --workspace <path>")
   .requiredOption("--task <id>")
-  .requiredOption("--iteration <n>")
+  .requiredOption("--iteration <n>", "non-negative execution iteration", parseNonNegativeInteger)
   .option("--changed-files <filesOrCount>", "comma-separated files or a count", "0")
   .option("--tests <summary>", "e.g. '27 passed'")
   .option("--exit-status <status>", "ok | failed | blocked", "ok")
+  .option("--executor <id>", "id of the executor that ran this iteration, e.g. codex")
   .option("--notes <text>")
   .option("--command <text>", "command whose output may be offered to ChatGPT")
   .option("--output <text>", "command output (prefer --output-file for long logs)")
   .option("--output-file <path>", "read command output from a local file")
-  .option("--exit-code <n>", "numeric exit code of that command")
+  .option("--exit-code <n>", "numeric exit code of that command", parseInteger)
   .action(
     (opts: {
       workspace?: string;
       task: string;
-      iteration: string;
+      iteration: number;
       changedFiles: string;
       tests?: string;
       exitStatus: string;
+      executor?: string;
       notes?: string;
       command?: string;
       output?: string;
       outputFile?: string;
-      exitCode?: string;
+      exitCode?: number;
     }) => {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const changed = /^\d+$/.test(opts.changedFiles)
-        ? parseInt(opts.changedFiles, 10)
-        : opts.changedFiles.split(",").map((file) => file.trim()).filter(Boolean);
+      const changed = parseChangedFiles(opts.changedFiles);
       let outputId: number | undefined;
       let outputAvailable = false;
       const rawOutput =
@@ -2024,9 +2158,9 @@ program
         const savedOutput = saveExecutionOutput(workspace.id, {
           command: opts.command,
           raw: rawOutput,
-          exitCode: opts.exitCode !== undefined ? parseInt(opts.exitCode, 10) : null,
+          exitCode: opts.exitCode ?? null,
           taskId: opts.task,
-          iteration: parseInt(opts.iteration, 10),
+          iteration: opts.iteration,
         });
         outputId = savedOutput.id;
         outputAvailable = savedOutput.allowed;
@@ -2036,11 +2170,12 @@ program
         // The legacy local recorder has no network input; its effective
         // policy is the safe default and is persisted explicitly.
         network: false,
-        iteration: parseInt(opts.iteration, 10),
+        iteration: opts.iteration,
         changedFiles: changed,
         tests: opts.tests ?? null,
         exitStatus: opts.exitStatus,
         timestamp: new Date().toISOString(),
+        executor: opts.executor?.slice(0, 80),
         notes: opts.notes?.slice(0, 400),
         outputId,
         outputAvailable,
@@ -2154,10 +2289,12 @@ tunnelCmd
     }
   });
 
-tunnelCmd
-  .command("login")
-  .description("Open the Cloudflare login window used by a named hostname")
-  .option("--json", "machine-readable output", false)
+acceptUnusedWorkspaceOption(
+  tunnelCmd
+    .command("login")
+    .description("Open the Cloudflare login window used by a named hostname")
+    .option("--json", "machine-readable output", false)
+)
   .action(async (opts: { json: boolean }) => {
     try {
       if (!opts.json) say(NAMED_LOGIN_PROMPT);

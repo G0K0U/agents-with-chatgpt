@@ -180,7 +180,7 @@ describe("post-reboot shared bridge discovery (hermetic)", () => {
     const record = await requestRestart(b.root, { stateDir, tunnel: true }, deps);
     expect(await runRestartHelper(record.id, stateDir, deps)).toMatchObject({ state: "complete", workspaceId: a.id, requestedWorkspace: { id: b.id } });
     expect(deps.stop).toHaveBeenCalledWith(b.root, { stateDir, expectedRuntime: old });
-    expect(deps.ensure).toHaveBeenCalledWith(a.root, { stateDir, port: old.port });
+    expect(deps.ensure).toHaveBeenCalledWith(a.root, expect.objectContaining({ stateDir, port: old.port, startTimeoutMs: expect.any(Number) }));
     expect(deps.tunnel).toHaveBeenCalledWith(expect.objectContaining({ workspaceId: a.id }));
   });
   it("shared restart persists A as owner, B as requester, and fences revoked authorization before helper stop", async () => {

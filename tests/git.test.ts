@@ -97,6 +97,24 @@ describe("gitStatus", () => {
     expect(statusObj.hidden.changes).toBeGreaterThanOrEqual(1);
     try { fs.unlinkSync(path.join(repo, "secret.key")); } catch {}
   });
+
+  it("omits sensitive and .c2cignore'd paths from the names ChatGPT sees", () => {
+    write(repo, ".c2cignore", "private-notes/\n");
+    write(repo, ".env", "SECRET_KEY=leaked-env\n");
+    write(repo, "private-notes/secret.md", "CONFIDENTIAL DATA\n");
+    write(repo, "public.txt", "PUBLIC CONTENT\n");
+
+    const status = gitStatus(repo);
+    expect(status.untracked).toContain("public.txt");
+    expect(status.untracked).not.toContain(".env");
+    expect(status.untracked).not.toContain("private-notes/secret.md");
+    expect(status.hidden.changes).toBeGreaterThan(0);
+
+    fs.rmSync(path.join(repo, ".c2cignore"), { force: true });
+    fs.rmSync(path.join(repo, ".env"), { force: true });
+    fs.rmSync(path.join(repo, "public.txt"), { force: true });
+    fs.rmSync(path.join(repo, "private-notes"), { recursive: true, force: true });
+  });
 });
 
 describe("gitDiff pagination", () => {

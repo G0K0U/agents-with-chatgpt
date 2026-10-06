@@ -30,10 +30,14 @@ import {
   ZcodeSessionOwnershipError,
 } from "../execution/zcode-session-ownership.js";
 import { safeOutput } from "./zcode-tools.js";
+import { errorToolResult } from "../bridge/control-plane-error.js";
+import { productDispatchPaused } from "../config/dispatch-policy.js";
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
 export interface ZcodeSessionToolDeps {
+  registryFailure?: unknown;
+  controlPlaneHealth?: () => Record<string, unknown>;
   requireScope: (authInfo: AuthInfo | undefined, scope: string) => ToolResult | null;
   resolveWorkspace: (requestedId: string, authInfo: AuthInfo | undefined, sessionId?: string) => unknown;
   /** Registered A2C workspaces visible to this principal (id + canonical root). */
@@ -104,7 +108,7 @@ export function registerZcodeSessionTools(server: McpServer, deps: ZcodeSessionT
   const mapErr = (error: unknown): ToolResult => {
     if (error instanceof ZcodeSessionOwnershipError) return fail(error.code, error.message);
     if (error instanceof ZcodeSessionError) {
-      return fail(error.code, error.upstreamCode ? `[${error.upstreamCode}] ${error.message}` : error.message);
+      return errorToolResult(error, "z2c", "z2c_transport");
     }
     const maybeCoded = error as { code?: string };
     if (typeof maybeCoded?.code === "string" && maybeCoded.code.startsWith("ZCODE_")) {
@@ -160,6 +164,7 @@ export function registerZcodeSessionTools(server: McpServer, deps: ZcodeSessionT
   }, async (_args, extra) => {
     const denied = requireScope(extra.authInfo, "execution.read");
     if (denied) return denied;
+    if (deps.controlPlaneHealth) return ok(deps.controlPlaneHealth());
     try {
       return ok(await zcodeSessionClient().runtimeCapabilities());
     } catch (err) { return mapErr(err); }
@@ -175,6 +180,7 @@ export function registerZcodeSessionTools(server: McpServer, deps: ZcodeSessionT
     const denied = requireScope(extra.authInfo, "workspace.read");
     if (denied) return denied;
     try {
+      if (deps.registryFailure) return errorToolResult(deps.registryFailure);
       const visible = new Map(deps.visibleWorkspaces(extra.authInfo).map((w) => [w.canonicalPath.replace(/[\\/]+$/, "").toLowerCase(), w.workspaceId]));
       const { workspaces } = await zcodeSessionClient().workspaceList();
       const listed = (workspaces as ZcodeWorkspaceGrant[])
@@ -201,6 +207,7 @@ export function registerZcodeSessionTools(server: McpServer, deps: ZcodeSessionT
       model: z.string().max(64).optional().describe("Requested native model (attested post-create)"),
       thought_level: z.string().max(20).optional().describe("Requested reasoning depth (attested post-create)"),
       provider: z.string().max(64).optional().describe("Optional explicit provider constraint"),
+      entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional().describe("Exact entitlement, attested by live native session; no fallback"),
     },
     annotations: { readOnlyHint: false },
   }, async (args, extra) => {
@@ -215,6 +222,7 @@ export function registerZcodeSessionTools(server: McpServer, deps: ZcodeSessionT
         ...(args.model ? { model: args.model } : {}),
         ...(args.thought_level ? { thought_level: args.thought_level } : {}),
         ...(args.provider ? { provider: args.provider } : {}),
+        ...(args.entitlement_plan ? { entitlement_plan: args.entitlement_plan } : {}),
       });
       ownershipFor(deps.stateDir).record({
         sessionId: state.session_id,
@@ -262,6 +270,7 @@ export function registerZcodeSessionTools(server: McpServer, deps: ZcodeSessionT
     if (denied) return denied;
     try {
       // CONTROL path: owner, local operator, or explicitly delegated controller.
+      if (productDispatchPaused(deps.stateDir)) return fail("ADMISSION_FAILED", "Product dispatch is paused by the operator");
       const owned = ownership().assertCanControl(extra.authInfo, args.session_id, args.workspace_id);
       const { zcodeWorkspaceId } = await resolveZcodeWorkspace(args.workspace_id, extra.authInfo, false);
       const result = await zcodeSessionClient().sendSession({

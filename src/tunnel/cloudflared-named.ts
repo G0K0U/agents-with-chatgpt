@@ -178,7 +178,7 @@ export function renderNamedTunnelConfig(opts: {
 export function namedTunnelLaunchArgs(
   configFile: string,
   tunnelId: string,
-  protocol: TunnelProtocol = "auto"
+  protocol: TunnelProtocol | null = null
 ): string[] {
   return [
     "tunnel",

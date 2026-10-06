@@ -146,6 +146,7 @@ describe("CodexTaskManagerPool onTaskLifecycleEvent propagation", () => {
       workspace_id: registered.id,
       instruction: "Verify pool lifecycle propagation",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
     };
 

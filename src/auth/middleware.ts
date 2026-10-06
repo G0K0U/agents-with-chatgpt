@@ -4,6 +4,7 @@ import type { AuthStore } from "./store.js";
 import type { Logger } from "../logger/index.js";
 
 export interface BearerAuthDeps {
+  allowUnboundHealth?: boolean;
   store: AuthStore;
   /** Kept for compatibility with the single-workspace bridge. */
   workspaceId?: string;
@@ -50,7 +51,11 @@ export function bearerAuth(deps: BearerAuthDeps) {
         ? [verdict.record.workspaceId]
         : [];
     const authorizedWorkspaceIds = tokenWorkspaceIds.filter((id) => registeredWorkspaceIds.has(id));
-    if (authorizedWorkspaceIds.length === 0) {
+    const healthOnly = deps.allowUnboundHealth && (
+      ["initialize", "notifications/initialized", "tools/list", "ping"].includes(req.body?.method) ||
+      req.body?.method === "tools/call" && req.body?.params?.name === "zcode_runtime_capabilities"
+    );
+    if (authorizedWorkspaceIds.length === 0 && !healthOnly) {
       deps.logger.warn("Rejected MCP request: token bound to a different workspace");
       res.status(403).json({
         error: "forbidden",

@@ -3,6 +3,18 @@
 > ChatGPT thinks. Agents work — Codex, Gemini, and GLM.
 > ChatGPT 负责思考，Agent 负责干活——Codex、Gemini、GLM。
 
+## v0.4.0 — optimized for ChatGPT Dot
+
+The integrated update adds Dot goal/agent management through the existing
+supervision loop, formal dispatch resume, boot/session reconciliation,
+bounded self-repair and a saved finite recovery entry. Antigravity Opus 5.5 is
+available through verified live admission at its highest supported effort.
+Requested selection and actual evidence remain distinct; quotas fail explicitly.
+
+Read [the release changes and limits](docs/release-v0.4.0-dot.md),
+[Dot goal workflow](docs/dot-goal-workflow.md), and
+[one-command recovery](docs/engineering-ai-workflow.md).
+
 > [!IMPORTANT]
 > **遇到问题？** 请先向 Codex 发送 **「更新 Codex with ChatGPT」** 并重试。更新到最新版本可以解决大多数已知问题。  
 > **Having trouble?** First ask Codex to **“Update Codex with ChatGPT”** and try again. Updating to the latest version resolves most known issues.
@@ -15,8 +27,8 @@
 
 1. **Codex** — 官方 Codex App Server（本地执行器）。
 2. **Gemini** — Antigravity/AGY CLI + Google OAuth（按需就绪，无会话也是健康态）。
-3. **GLM（治理通道）** — Z2C 伴随组件 → ZCode Desktop → **GLM-5.3-Flash（仅 Flash）**，
-   会话级模型/推理强度原生证明，严格工作区绑定。
+3. **GLM（治理通道）** — Z2C 伴随组件 → ZCode Desktop，显式 START/INDIVIDUAL，
+   使用当前套餐目录中的模型、原生会话证明和严格工作区绑定。
 
 **EN** — Use the ChatGPT web app as the planning and review brain for your coding
 sessions. Your repository is never uploaded: ChatGPT reads exactly the lines it
@@ -26,9 +38,9 @@ attested execution channels. Three independent provider lanes:
 1. **Codex** — the official Codex App Server (local executor).
 2. **Gemini** — the Antigravity/AGY CLI with Google OAuth (READY_ON_DEMAND; zero
    active sessions is a healthy state).
-3. **GLM (governed lane)** — the Z2C semantic service → official ZCode app-server → **GLM-5.3-Flash
-   only**, with native same-session model/identity attestation and exact
-   workspace binding.
+3. **GLM (governed lane)** — the Z2C semantic service → official ZCode app-server,
+   explicit START/INDIVIDUAL selection from the live plan catalog, native
+   same-session identity attestation and exact workspace binding.
 
 Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
 
@@ -81,19 +93,7 @@ accept both `A2C_*` (canonical) and `C2C_*` (legacy) environment variables.
 ### Codex — native App Server
 
 - Uses the official **Codex App Server** locally. No shims, no reverse proxies.
-- Account model discovery and task execution use the same configured Codex
-  runtime. A listed model still needs a completed live turn before support for
-  that model is claimed; see the [support matrix](docs/support-matrix.md).
 - Prerequisite: a Codex/OpenAI login on the machine (CLI or desktop app).
-
-### Optional usage telemetry — Quanta
-
-`agent_usage_status` reads local Quanta quota samples when available. A2C
-checks each provider's own sample time within 60 seconds; missing, old or
-failed samples stay unknown, including on an older Quanta installation.
-Manual agent execution does not require Quanta. The patched, MIT-licensed
-[Quanta 0.9.4+a2c.1 source and build instructions](third_party/quanta/PATCH-INFO.md)
-are included here. An upstream v0.9.4 executable does not contain this patch.
 
 ### Gemini — Antigravity/AGY CLI + Google OAuth
 
@@ -108,10 +108,24 @@ are included here. An upstream v0.9.4 executable does not contain this patch.
   protocol. The **Z2C companion** (shipped in [`z2c/`](z2c), MIT) provides a
   loopback, token-authenticated semantic service. It does not replace the
   Desktop bundled agent or read ZCode model credentials.
-- **Governed policy is FLASH-ONLY**: ChatGPT-controlled execution admits exactly
-  `builtin:zai-coding-plan / GLM-5.3-Flash / max`, observed from the exact native
-  session (`official-session-read`). The main GLM-5.3 model stays available for **manual**
-  ZCode use but is rejected for governed C2C execution — no automatic escalation.
+- **Stock vs. patched runtime**: a stock ZCode install covers the DEFAULT
+  plan. Explicit `START`/`INDIVIDUAL` entitlement sessions require the patched
+  CLI build under [`patches/zcode/`](patches/zcode) (based on `zai-org/ZCode`
+  v3.14.3, Apache-2.0, with reproducible build steps there). Capability is not
+  implied by the agent's reported version — verify via `runtimeCapabilities`
+  (`entitlementSelection`); arbitrary `>= 0.16.9` builds are not guaranteed.
+- **Plan-aware governed admission** (`DEFAULT | START | INDIVIDUAL`): an
+  execution request carries an explicit entitlement plan; the requested plan,
+  the plan the runtime actually selects, and the evidence source are kept
+  distinct and must match exactly — fail closed. There is no silent model or
+  plan substitution, and an exhausted quota never falls back to another plan
+  automatically. A plan that cannot be honored is reported as
+  `plan-unavailable` (a credential-state verdict), not as a crash.
+- **Exact model/reasoning selection**: the available model catalog is read
+  from the live account-scoped runtime per plan (learned, never assumed), and
+  the requested `plan + model + effort` triple is proven selectable before a
+  turn is spent. On the standalone route, GLM-5.3-Flash requires an explicit
+  reasoning level at selection time.
 - Model/reasoning changes on a live session are supported natively
   (`update_zcode_session`): same session id, re-attested binding, fail closed.
 - Prerequisite: ZCode signed into your Z.AI account; Z2C is built by the
@@ -124,7 +138,7 @@ are included here. An upstream v0.9.4 executable does not contain this patch.
 | Node.js ≥ 22, Git, pnpm | yes (winget / corepack, user scope) | |
 | Codex CLI + login | no — install/sign in yourself | lane active once detected |
 | Antigravity (AGY) CLI | no — install/sign in yourself | `%LOCALAPPDATA%\agy\bin` |
-| ZCode Desktop + Z.AI plan | no — install/sign in yourself | GLM Flash lane |
+| ZCode Desktop + Z.AI plan | no — install/sign in yourself | GLM Flash lane; START/INDIVIDUAL plans need the patched build (`patches/zcode/`) |
 | cloudflared | no — only for a stable public hostname | quick tunnels work without it |
 
 ## Quick deploy with a local agent · 本地 Agent 一键部署
@@ -339,7 +353,16 @@ Credentials stay in the OS app state directory, not in the project.
   git diff and test records through MCP — it never trusts "all tests passed"
   claims blindly.
 - **Provider isolation**: one provider's failure never silently substitutes
-  another. The GLM governed lane only executes on the attested Flash identity.
+  another. The GLM governed lane only executes on the attested identity of the
+  explicitly selected plan/model/effort triple.
+- **Idempotency**: task submission accepts a client `idempotency_key`; a
+  replayed key on the same workspace returns the existing task instead of
+  spawning duplicate work.
+- **Single writer**: one writer slot per lane; concurrent submissions queue or
+  are rejected explicitly — never interleaved.
+- **Cancelable, checkpointed failure**: tasks can be cancelled mid-flight;
+  timeouts and provider failures close the loop with a classified terminal
+  state (not a hang), and the receipt records the checkpoint.
 
 ## Permission model (short version)
 
@@ -366,21 +389,55 @@ Credentials stay in the OS app state directory, not in the project.
 - **The model never sees long-lived credentials**: the only secret that ever
   touches a browser is a one-time pairing code (5-minute TTL, 5 attempts,
   rate-limited, destroyed on use).
-- **GLM attestation**: a governed GLM task is admitted only after the exact
-  native session reports `zcode-desktop / builtin:zai-coding-plan / GLM-5.3-Flash`
-  through the Desktop's own session read. Unobserved or main-model identity
+- **GLM attestation**: a governed GLM task is admitted only after its exact native
+  session reports the requested provider, plan, model and live highest effort.
+  START and INDIVIDUAL are distinct account bindings. The Desktop session read
+  and provider registry supply the evidence; unobserved or mismatched identity
   fails closed.
 
 Full threat model: [docs/security.md](docs/security.md)
 
 ## Verification
 
-- `c2c status --json` — bridge/tunnel/provider state for a workspace.
-- `c2c supervisor status` — control-plane self-check (all lanes).
-- `c2c doctor --fix` — auto-repair the connection.
+- `a2c status --json` — bridge/tunnel/provider state for a workspace.
+- `a2c supervisor status` — control-plane self-check (all lanes).
+- `a2c doctor --fix` — auto-repair the connection.
 - Provider smoke: one tiny read-only task per lane through ChatGPT. A governed
-  GLM task must produce START and COMPLETED receipts both showing
-  `GLM-5.3-Flash`.
+  GLM task must produce START and COMPLETED receipts whose attested
+  plan/model/effort match the explicit request exactly.
+
+## Optional: ChatGPT dot + Slack coordination
+
+For long-running or multi-task work, an optional coordination pattern is to
+pair a ChatGPT **dot** (a lightweight assistant surface) with a Slack channel:
+
+- **Continuous status checks** — the dot polls `a2c status --json` /
+  `supervisor status` on the machine that owns the bridge and posts concise
+  state summaries to Slack.
+- **Terminal-state notifications** — task START/COMPLETED/FAILED/CANCELLED
+  receipts are mirrored to Slack so a finished (or dead) task is visible
+  without watching the terminal.
+- **Result audit** — the dot cross-reads task metadata and receipts through
+  the authenticated MCP surface instead of trusting chat claims, mirroring
+  the audit-mirror journal entries.
+- **Authorized iteration** — follow-up tasks are dispatched only for changes
+  the human explicitly authorized in that thread; the dot never widens its
+  own scope.
+
+Prerequisites and honest limits:
+
+- The ChatGPT connector must be reachable and the dot's identity must already
+  hold the required OAuth scopes; the dot gets no privileges of its own.
+- Monitoring works through explicit, repeated status queries and receipt
+  reads. A single status query is **not** a persistent monitor, and a Slack
+  thread cannot be assumed to auto-refresh tool schemas — re-provision or
+  re-pair when the MCP surface changes.
+- Every check and every dispatched iteration consumes model quota from
+  whatever plan backs the dot; budget accordingly. Nothing in this
+  repository auto-switches plans when quota runs out.
+- This is an operational *pattern*, not a bundled feature: you bring the dot,
+  the Slack app, and the authorization. The repository ships no Slack
+  integration code and no dot internals.
 
 ## For developers
 
@@ -413,7 +470,6 @@ src/          C2C bridge, MCP surface, OAuth, pairing, workspace policy,
               tunnel, provider lanes, release/LKG lifecycle, supervisor
 z2c/          Z2C companion (MIT): semantic service + official ZCode protocol;
               legacy desktop-agent proxy is separate and not the default
-third_party/  Vendored MIT-licensed Quanta 0.9.4+a2c.1 source patch
 skill/        the Codex Skill (the real UX layer)
 tests/        unit + integration tests
 docs/         architecture / protocol / security / troubleshooting
@@ -430,16 +486,37 @@ This repository includes source code, architecture, and generic tunnel integrati
 
 ## Attribution
 
-This public repository derives from and upstreams [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) under the MIT License, while this repository contains current multi-agent extensions. Upstream copyright remains with original contributors under the terms of the MIT License. The `z2c/` companion is distributed under the same MIT License. Vendored Quanta retains its own [MIT license](third_party/quanta/LICENSE) and [source record](third_party/quanta/PATCH-INFO.md).
+This public repository derives from and upstreams [XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt) under the MIT License, while this repository contains current multi-agent extensions. Upstream copyright remains with original contributors under the terms of the MIT License. The `z2c/` companion is distributed under the same MIT License.
 
 ## Status & disclaimer
 
-The tested 0.3.0 build's local A2C OAuth path completed a GPT-6 Sol/max nonce
-canary with matching selection, captured final output, and no file changes. See the
-[support matrix](docs/support-matrix.md) for build-specific evidence and
-unverified platforms. The current ChatGPT connector requires its own client
-check. Full-access mode is intentional: a holder of execution scopes can
-direct local Codex actions within the bridge process's OS permissions.
+Current release state (v0.4.0 line), stated with its evidence boundary:
+
+- The Z2C companion test suite passes in full (302/302, reported from the
+  maintainer's terminal), and `pnpm typecheck` / `pnpm build` pass. The local
+  bridge service runs after a controlled restart.
+- End-to-end chat-side runs on the Z.AI standalone route completed with
+  output matching and independent session reads across both billing plans —
+  INDIVIDUAL GLM-5.3/max, INDIVIDUAL GLM-5.3-Flash/max, and START
+  GLM-5.3-Flash/max.
+- Gemini/AGY lane accepted this cycle: `gemini-3.8-flash-high` at high
+  reasoning effort completed **two consecutive turns in the same session**
+  with output match. The Codex lane is reported stable in use but was **not**
+  individually re-accepted in the current cycle.
+- The DeepSeek/DSH adapter (`integrations/dsh-native-adapter`) is **not**
+  covered end to end: agent/workspace discovery works, but `dsh_task_submit`
+  currently reaches only a **local slot** — automatic precise selection of
+  deepseek-official **cloud models** is not implemented. No claim is made
+  that all three agent families are fully covered.
+- This is **not** a claim of exhaustive all-model/all-platform production
+  certification. Validate on your own machine with the verification steps
+  above.
+
+Bootstrap upgrade verified end-to-end: one authorized connector can select the
+registered engineering workspace and the bridge workspace, persist sessions,
+resume task metadata after restart, and run the CLI executor in full-access mode.
+The full-access choice is intentional: anyone holding the connector's execution
+scopes can direct local agent actions within the OS permissions of the bridge.
 
 **Unofficial community project. Not affiliated with or endorsed by OpenAI, Google, or Z.AI.**
 

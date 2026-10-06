@@ -5,9 +5,13 @@ import {
   type ZcodeDiscoveredSession,
 } from "../execution/zcode-session-client.js";
 import type { ZcodeSessionOwnership } from "../execution/zcode-session-ownership.js";
+import { DshNativeClient, type DshNativeSummary } from "../execution/dsh-native-client.js";
+import { DshNativeService } from "../execution/dsh-native-service.js";
 import { listExecutionOutputs, readExecutionOutput } from "../execution/output.js";
+import { ZcodeSessionError } from "../execution/zcode-session-client.js";
 import { AgentPlaneStore } from "./store.js";
 import { projectZcodeDiscovery } from "./adapters/zcode.js";
+import { projectDshDiscovery } from "./adapters/dsh.js";
 import { projectProviderTasks, taskView, readTaskFile } from "./adapters/tasks.js";
 import { visibleText } from "./redact.js";
 import type { AgentSessionRecord, AgentActivityEvent, AgentPlaneMessage, AgentProviderName, AgentSessionOrigin, AgentTaskView } from "./types.js";
@@ -19,9 +23,32 @@ function sanitizeLiveError(error: unknown): string {
 }
 
 /**
+ * Honest classification of a failed zcode live enrichment.
+ *
+ * SESSION_NOT_FOUND from the Z2C observation surface means the runtime does
+ * not consider this session live-readable in the current app-server
+ * generation (legacy/pre-restart session, closed session, or a binding
+ * mismatch). For a discovery-projected record that is an EXPECTED legacy
+ * condition, not a lane defect: it is reported as "stale-runtime" so the
+ * projection stays coherent and non-breaking. The session is never implicitly
+ * resumed (resume is a control action); a later successful read overwrites
+ * the status. Lane failures (transport/timeout/service errors) stay "error".
+ */
+function zcodeLiveReadFailure(error: unknown): { live_read_status: "stale-runtime" | "error"; last_live_error: string } {
+  const upstreamCode = error instanceof ZcodeSessionError ? error.upstreamCode : undefined;
+  if (upstreamCode === "SESSION_NOT_FOUND") {
+    return {
+      live_read_status: "stale-runtime",
+      last_live_error: "not live-readable in the current ZCode runtime generation (legacy, closed, or foreign-bound session); resume it explicitly to make it live",
+    };
+  }
+  return { live_read_status: "error", last_live_error: sanitizeLiveError(error) };
+}
+
+/**
  * The provider-neutral shared session/activity plane.
  *
- * One projection over three provider lanes:
+ * One projection over four provider lanes, including native DSH sessions:
  *   zcode  ← Z2C local-operator discovery (native session/list) + A2C ownership
  *   codex  ← A2C durable task records (origin a2c)
  *   gemini ← A2C durable task records (origin a2c, providerSessionId)
@@ -59,6 +86,7 @@ export interface AgentPlaneDeps {
   workspaces: () => Array<{ workspaceId: string; canonicalPath: string }>;
   /** Z2C semantic client; null disables the zcode lane (plane stays usable). */
   zcodeClient: ZcodeSessionClient | null;
+  dshClient?: DshNativeClient | null;
   ownership: ZcodeSessionOwnership;
 }
 
@@ -75,6 +103,9 @@ export class AgentPlane {
   private lastZcodeSync = 0;
   private discoveredZcode: ZcodeDiscoveredSession[] = [];
   private lastOwnershipCount = -1;
+  private lastDshSync = 0;
+  private discoveredDsh: Array<{ workspaceId: string; canonicalPath: string; item: DshNativeSummary }> = [];
+  private staleDshWorkspaces = new Set<string>();
 
   constructor(private readonly deps: AgentPlaneDeps) {
     this.store = new AgentPlaneStore(deps.stateDir);
@@ -112,7 +143,7 @@ export class AgentPlane {
 
   // ── sync / projection ─────────────────────────────────────────────────────
   /** Refresh the projection: Z2C discovery (TTL-cached) + provider task records. */
-  async sync(force = false): Promise<{ zcode: number; codex: number; gemini: number }> {
+  async sync(force = false): Promise<{ zcode: number; codex: number; gemini: number; dsh: number }> {
     const observedAt = new Date().toISOString();
     const workspaces = this.deps.workspaces();
     const previous = new Map(this.store.loadSessions().map((s) => [s.sessionId, s]));
@@ -150,20 +181,68 @@ export class AgentPlane {
 
     const tasks = projectProviderTasks({ stateDir: this.deps.stateDir, workspaces, observedAt });
 
-    // Merge: zcode projection wins for zcode ids; task projection for codex/gemini.
+    const dshFresh = new Set<string>();
+    if (this.deps.dshClient && (force || Date.now() - this.lastDshSync > 3_000)) {
+      const results = await Promise.all(workspaces.map(async (workspace) => {
+        try { return { workspace, result: await this.deps.dshClient!.list(workspace.canonicalPath) }; }
+        catch { return { workspace, result: null }; }
+      }));
+      for (const { workspace, result } of results) {
+        if (!result) {
+          this.staleDshWorkspaces.add(workspace.workspaceId);
+          continue;
+        }
+        dshFresh.add(workspace.workspaceId);
+        this.staleDshWorkspaces.delete(workspace.workspaceId);
+        this.discoveredDsh = this.discoveredDsh.filter((entry) => entry.workspaceId !== workspace.workspaceId);
+        this.discoveredDsh.push(...result.items.map((item) => ({
+          workspaceId: workspace.workspaceId, canonicalPath: workspace.canonicalPath, item,
+        })));
+      }
+      this.lastDshSync = Date.now();
+    }
+    let dshBindings: ReturnType<DshNativeService["bindings"]> = [];
+    if (this.deps.dshClient) {
+      try { dshBindings = new DshNativeService(this.deps.stateDir, this.deps.dshClient).bindings(); }
+      catch { /* invalid ownership store grants no projected controller */ }
+    }
+    const dsh = projectDshDiscovery({ discovered: this.discoveredDsh, bindings: dshBindings,
+      taskRecords: tasks.records, observedAt });
+    for (const record of dsh.records) {
+      if (this.staleDshWorkspaces.has(record.workspaceId)) record.live_read_status = "stale-cache";
+    }
+
+    // A successful native list replaces that workspace's previous DSH snapshot.
     const merged = new Map(previous);
+    for (const record of previous.values()) {
+      if (record.provider === "dsh" && dshFresh.has(record.workspaceId)) merged.delete(record.sessionId);
+      else if (record.provider === "dsh" && this.staleDshWorkspaces.has(record.workspaceId)) {
+        merged.set(record.sessionId, { ...record, controllers: [],
+          live_read_status: "stale-cache" });
+      }
+    }
     for (const record of [...zcodeRecords, ...tasks.records]) merged.set(record.sessionId, record);
+    for (const record of dsh.records) merged.set(record.sessionId, record);
+    const discoveredDshIds = new Set(dsh.records.map((record) => record.sessionId));
+    for (const record of tasks.records) {
+      if (record.provider === "dsh" && !discoveredDshIds.has(record.sessionId)) {
+        merged.set(record.sessionId, { ...record, controllers: [], ownerClientId: null,
+          live_read_status: "stale-cache",
+          last_live_error: "native session absent from DSH discovery" });
+      }
+    }
     const sessions = [...merged.values()];
 
     const before = JSON.stringify([...previous.values()].map(sortKey));
     const after = JSON.stringify(sessions.map(sortKey));
     if (before !== after) this.store.saveSessions(sessions);
-    this.store.appendActivity([...zcodeEvents, ...tasks.events]);
+    this.store.appendActivity([...zcodeEvents, ...tasks.events, ...dsh.events]);
 
     return {
       zcode: zcodeRecords.length,
       codex: tasks.records.filter((r) => r.provider === "codex").length,
       gemini: tasks.records.filter((r) => r.provider === "gemini").length,
+      dsh: dsh.records.length,
     };
   }
 
@@ -203,16 +282,17 @@ export class AgentPlane {
     let record = this.visibleOrThrow(authInfo, sessionId);
     if (record.provider === "zcode") {
       // A failed live refresh is surfaced on the record instead of silently
-      // returning a stale projection as if it were live.
+      // returning a stale projection as if it were live. Legacy/pre-restart
+      // sessions (runtime no longer considers them live) are reported as
+      // "stale-runtime" — explicit, non-breaking, never auto-resumed.
       try {
         record = await this.enrichZcode(record);
       } catch (error) {
-        record = {
-          ...record,
-          live_read_status: "error",
-          last_live_error: sanitizeLiveError(error),
-        };
+        record = { ...record, ...zcodeLiveReadFailure(error) };
       }
+    } else if (record.provider === "dsh") {
+      try { record = await this.enrichDsh(record); }
+      catch (error) { record = { ...record, live_read_status: "error", last_live_error: sanitizeLiveError(error) }; }
     }
     return record;
   }
@@ -235,6 +315,24 @@ export class AgentPlane {
       messages_readable: null,
       last_live_error: null,
     };
+    this.mergeRecord(enriched);
+    return enriched;
+  }
+
+  private async enrichDsh(record: AgentSessionRecord): Promise<AgentSessionRecord> {
+    if (!this.deps.dshClient) {
+      return { ...record, live_read_status: "skipped", messages_readable: null,
+        last_live_error: "no DSH native adapter bound" };
+    }
+    const native = await this.deps.dshClient.read(record.canonicalRoot, record.sessionId, 50);
+    const lastUser = [...native.messages].reverse().find((message) => message.role === "user");
+    const enriched: AgentSessionRecord = { ...record,
+      model: native.selection.model ?? record.model,
+      thoughtLevel: native.selection.reasoningEffort ?? record.thoughtLevel,
+      status: native.running ? "running" : record.status === "running" ? native.status : record.status,
+      lastUserInstruction: visibleText(lastUser?.text, 2000) ?? record.lastUserInstruction,
+      observedAt: new Date().toISOString(), live_read_status: "ok",
+      messages_readable: true, last_live_error: null };
     this.mergeRecord(enriched);
     return enriched;
   }
@@ -265,11 +363,7 @@ export class AgentPlane {
       try {
         record = await this.enrichZcode(record);
       } catch (error) {
-        record = {
-          ...record,
-          live_read_status: "error",
-          last_live_error: sanitizeLiveError(error),
-        };
+        record = { ...record, ...zcodeLiveReadFailure(error) };
       }
       try {
         const messages = await this.zcodeMessages(record, boundedLimit);
@@ -286,6 +380,22 @@ export class AgentPlane {
           live_read_status: record.live_read_status ?? "error",
           failure: sanitizeLiveError(error),
         };
+      }
+    }
+    if (record.provider === "dsh") {
+      try {
+        record = await this.enrichDsh(record);
+        if (!this.deps.dshClient) throw new Error("DSH native adapter is unavailable");
+        const native = await this.deps.dshClient.read(record.canonicalRoot, sessionId, boundedLimit);
+        const messages: AgentPlaneMessage[] = native.messages.slice(-boundedLimit)
+          .map((message) => ({ role: message.role,
+            text: visibleText(message.text, 16_000) ?? "", at: message.at }))
+          .filter((message) => message.text.length > 0);
+        return { sessionId, provider: "dsh", origin: record.origin, messages,
+          messages_readable: true, live_read_status: "ok" };
+      } catch (error) {
+        return { sessionId, provider: "dsh", origin: record.origin, messages: [],
+          messages_readable: false, live_read_status: "error", failure: sanitizeLiveError(error) };
       }
     }
     return { sessionId, provider: record.provider, origin: record.origin, messages: await this.taskMessages(record, boundedLimit) };

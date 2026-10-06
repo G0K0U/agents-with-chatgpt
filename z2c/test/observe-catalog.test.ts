@@ -528,13 +528,13 @@ describe("provider wiring through the real ZcodeOfficialProvider (Blocker 1)", (
 
 describe("observation error sanitization and classification (Blocker 3)", () => {
   it("strips bearer tokens, token URL parameters, key material and local paths", () => {
-    const dirty = "request failed: Authorization=Bearer abc.def.ghi-jkl?token=supersecret42&x=1 sk-abcdefghijklmnop1234 from C:\\Users\\sample-user\\AppData\\secret.txt via /home/sample-user/.zcode/x";
+    const dirty = "request failed: Authorization=Bearer abc.def.ghi-jkl?token=supersecret42&x=1 sk-abcdefghijklmnop1234 from C:\\Users\\Peter\\AppData\\secret.txt via /home/peter/.zcode/x";
     const clean = sanitizeObservationText(dirty);
     assert.ok(!clean.includes("abc.def.ghi"));
     assert.ok(!clean.includes("supersecret42"));
     assert.ok(!clean.includes("sk-abcdefghijklmnop"));
-    assert.ok(!clean.includes("C:\\Users\\sample-user"));
-    assert.ok(!clean.includes("/home/sample-user"));
+    assert.ok(!clean.includes("C:\\Users\\Peter"));
+    assert.ok(!clean.includes("/home/peter"));
     assert.ok(clean.includes("bearer [REDACTED]") || clean.includes("[REDACTED_AUTH]") || clean.includes("[REDACTED]"));
     assert.ok(clean.includes("[REDACTED_KEY]") || clean.includes("[REDACTED]"));
     assert.ok(clean.includes("[LOCAL_PATH]"));

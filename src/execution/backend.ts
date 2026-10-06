@@ -51,8 +51,27 @@ export interface BackendExecutionResult {
   providerModel: string;
   requestedProvider?: ExecutionProvider | string;
   requestedModel?: string;
+  dispatchedModel?: string;
+  requestedSelection?: { model: string | null; effort: string | null } | null;
+  dispatchedSelection?: unknown;
   actualProvider?: ExecutionProvider | string | null;
   actualModel?: string | null;
+  observedModel?: string | null;
+  observedSelection?: {
+    model: string | null;
+    effort: string | null;
+    effortStatus?: "verified" | "unverified";
+    source: string;
+    mismatch?: boolean;
+  } | null;
+  failureDetails?: {
+    reason: string;
+    pool: string;
+    retryAfter: number | null;
+    resetAt: string | null;
+    evidenceSource: string;
+    rawEvidence?: string | null;
+  };
   phaseDurations?: Record<string, number>;
   providerSessionId?: string;
   providerTurnId?: string;
@@ -76,6 +95,11 @@ export interface BackendExecutionResult {
   error?: {
     code: string;
     message: string;
+    pool?: string | null;
+    retryAfter?: number | string | null;
+    resetAt?: string | null;
+    reason?: string | null;
+    evidenceSource?: string | null;
   };
 }
 

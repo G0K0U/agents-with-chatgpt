@@ -138,7 +138,7 @@ describe("ZcodeSessionClient transport safety & single-flight", () => {
                 result: {
                   protocolVersion: "2024-11-05",
                   capabilities: { tools: {} },
-                  serverInfo: { name: "z2c-service", version: "0.1.0" },
+                  serverInfo: { name: "z2c-service", version: "1" },
                 },
               }),
             );

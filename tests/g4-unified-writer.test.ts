@@ -86,6 +86,14 @@ class FakeNative {
     observeTask?.({ ...this.tasks.get(input.task_id)! });
     return { ...input, session_id: this.tasks.get(input.task_id)!.session_id, text: "fixture" };
   }
+  async resolveKeyedTask(): Promise<ZcodeNativeTaskView | null> { return null; }
+  async projectWorkspace(workspaceId: string): Promise<{ nativeWorkspaceId: string; canonicalPath: string }> {
+    // Identity mapping: the stub upstream accepts the same ids it echoes.
+    return { nativeWorkspaceId: workspaceId, canonicalPath: "fixture-root" };
+  }
+  async taskLaneStatus(): Promise<{ provider_healthy: boolean; provider_status: string; active_task: string | null; queued_task_count: number; paused: boolean }> {
+    return { provider_healthy: true, provider_status: "healthy", active_task: null, queued_task_count: 0, paused: false };
+  }
 }
 
 describe("G4 unified native/direct provider lifecycle (offline)", () => {
@@ -124,8 +132,12 @@ describe("G4 unified native/direct provider lifecycle (offline)", () => {
   ] as const)("%s holds the workspace slot against %s", async (first, second) => {
     if (first === "z2c") await manager.submitNative(input());
     else {
-      direct(first);
-      await vi.waitFor(() => expect(first === "codex" ? codex.starts : gemini.starts).toBe(1));
+      const submitted = direct(first);
+      await vi.waitFor(() => {
+        const task = manager.get(submitted.taskId);
+        expect(task.status, JSON.stringify({ status: task.status, error: task.error, errorCode: task.errorCode })).not.toBe("failed");
+        expect(first === "codex" ? codex.starts : gemini.starts).toBe(1);
+      });
     }
     const held = readWorkspaceSlot(workspace.id, state);
     expect(held).toMatchObject({ provider: first });

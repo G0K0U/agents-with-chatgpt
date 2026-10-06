@@ -32,7 +32,7 @@ export interface ModelCatalogToolDeps {
   catalogService?: ModelCatalogService;
 }
 
-const AGENT_FIELD = z.enum(["all", "codex", "antigravity", "zcode"]).optional()
+const AGENT_FIELD = z.enum(["all", "codex", "antigravity", "zcode", "dsh"]).optional()
   .describe("Restrict to one backend; omitted or 'all' returns every backend section");
 
 export function registerModelCatalogTools(server: McpServer, deps: ModelCatalogToolDeps): void {
@@ -42,7 +42,7 @@ export function registerModelCatalogTools(server: McpServer, deps: ModelCatalogT
   server.registerTool("agent_model_catalog", {
     title: "Agent model catalog",
     description:
-      "Live, account-scoped model directory for the local execution backends (Codex, Antigravity/Gemini, ZCode/GLM). " +
+      "Live, account-scoped model directory for the local execution backends (Codex, Antigravity/Gemini, ZCode/GLM, DSH). " +
       "Read-only discovery: never starts inference or sessions, never changes default models. Each backend reports its " +
       "own source, runtime version, auth mode, completeness, and sanitized errors — one failed backend never hides " +
       "another. Catalog listing is NOT inference-verified availability. " + deps.untrustedNote,
