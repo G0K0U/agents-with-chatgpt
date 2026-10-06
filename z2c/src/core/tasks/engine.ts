@@ -1,11 +1,14 @@
+import { type EntitlementPlan, entitlementPlan, entitlementAccessMode, requireSupportedEntitlement } from "../../providers/entitlement.js";
 import { randomBytes } from "node:crypto";
 import { IDEMPOTENCY_KEY, requestFingerprint } from "./idempotency.js";
+import { classifyTaskFailure } from "./failure-class.js";
 import type { AgentProvider } from "../../providers/types.js";
 import {
+  ADMISSIBLE_PROVIDER_ROUTES,
   REQUIRED_BINDING_SOURCES,
-  REQUIRED_START_PLAN_MODEL_ID,
-  REQUIRED_START_PLAN_PROVIDER_ID,
+  RETIRED_PROVIDER_IDS,
 } from "../../providers/types.js";
+import { isAdmissibleObservedBinding } from "../../authz/attestation.js";
 import type { Z2cConfig } from "../../config.js";
 import { FileAuditLog } from "../../util/log.js";
 import { newOutputId, newTaskId } from "../../util/ids.js";
@@ -25,6 +28,7 @@ import {
 } from "../workspaces/registry.js";
 
 export interface SubmitTaskInput {
+  entitlement_plan?: EntitlementPlan;
   idempotency_key?: string;
   workspace_id: string;
   instruction: string;
@@ -35,6 +39,15 @@ export interface SubmitTaskInput {
   resume_session_id?: string;
   /** Native continuation must dispatch without waiting behind queued work. */
   immediate?: boolean;
+  /**
+   * Explicit native identity request. Preference, never proof: the provider
+   * resolves both against the exact session's OWN advertised availability
+   * (settings.model.available[] + per-model reasoning.levels), applies them,
+   * and the OBSERVED binding must equal the request or admission fails closed.
+   * No silent substitution, no silent downgrade/upgrade.
+   */
+  model_id?: string;
+  thought_level?: string;
 }
 
 export class TaskEngineError extends Error {
@@ -49,13 +62,33 @@ export class TaskEngine {
   /** Serializes the single workspace admission path across awaiting submits. */
   private admissions = new Map<string, Promise<void>>();
 
-  /** Only an exact observed governed identity may enter or leave this queue. */
-  private governedBinding(binding: TaskRecord["modelBinding"]): boolean {
-    return binding !== null &&
-      binding.provider_id === REQUIRED_START_PLAN_PROVIDER_ID &&
-      binding.model_id === REQUIRED_START_PLAN_MODEL_ID &&
-      REQUIRED_BINDING_SOURCES.has(binding.source) &&
-      (binding.source !== "official-session-read" || binding.thoughtLevel === "max");
+  /**
+   * Catalog-driven governed admission (2026-09-28 policy): the binding must be
+   * OBSERVED from an authoritative exact-session read on an admissible,
+   * non-retired provider ROUTE, and the observed model must be advertised by
+   * the runtime in the SAME snapshot. Any advertised model × its own
+   * advertised reasoning levels is admissible; single-model constants (the
+   * old Flash-only and GLM-5.3-only rules) are gone. An explicitly requested
+   * identity must match the observation exactly.
+   */
+  private governedBinding(
+    binding: TaskRecord["modelBinding"],
+    requested?: { modelId?: string | null; thoughtLevel?: string | null; entitlementPlan?: EntitlementPlan | null },
+  ): boolean {
+    if (!isAdmissibleObservedBinding(binding ?? undefined)) return false;
+    const b = binding!;
+    if (requested?.modelId && b.model_id !== requested.modelId) return false;
+    if (requested?.thoughtLevel && b.thoughtLevel !== requested.thoughtLevel) return false;
+    // Non-DEFAULT entitlement requests are admitted ONLY on the runtime's own
+    // registry-backed readback for this exact session; missing evidence or a
+    // different observed access mode fails closed (no provider-id inference).
+    if (requested?.entitlementPlan && requested.entitlementPlan !== "DEFAULT") {
+      const expectedMode = entitlementAccessMode(requested.entitlementPlan);
+      if (!expectedMode) return false;
+      if (!b.entitlement || b.entitlement.source !== "provider-registry") return false;
+      if (b.entitlement.observed !== expectedMode) return false;
+    }
+    return true;
   }
 
   constructor(
@@ -82,11 +115,13 @@ export class TaskEngine {
     const proof = task.idempotency;
     if (!proof || !IDEMPOTENCY_KEY.test(proof.key) || !/^z2c_[A-Za-z0-9_-]{1,100}$/.test(task.taskId) ||
         proof.workspacePath !== workspacePath || !task.zcodeSessionId || !/^sess_[0-9a-f-]{36}$/i.test(task.zcodeSessionId) ||
-        !this.governedBinding(task.modelBinding) ||
+        !this.governedBinding(task.modelBinding, { modelId: task.requestedModelId, thoughtLevel: task.requestedThoughtLevel, entitlementPlan: task.entitlementPlan ?? "DEFAULT" }) ||
         // Readonly replay requires persisted authoritative plan evidence.
         (task.writeScope === "readonly" && task.modelBinding?.planEnabled !== true) ||
         requestFingerprint({ workspace_id: task.workspaceId, instruction: task.instruction,
-          write_scope: task.writeScope, network: task.network, mode: task.mode, resume_session_id: task.resumeOfSessionId ?? undefined }) !== proof.fingerprint) {
+          write_scope: task.writeScope, network: task.network, mode: task.mode,
+          model_id: task.requestedModelId ?? undefined, thought_level: task.requestedThoughtLevel ?? undefined,
+          entitlement_plan: task.entitlementPlan, resume_session_id: task.resumeOfSessionId ?? undefined }) !== proof.fingerprint) {
       throw new TaskEngineError("durable admission binding cannot be proven", "IDEMPOTENCY_INVALID", 503);
     }
   }
@@ -116,6 +151,12 @@ export class TaskEngine {
           planEnabled: state.planEnabled,
           runtimeVersion: state.runtimeVersion,
           workspaceKey: state.workspaceKey,
+          availableModels: state.availableModels ?? null,
+          // Exact-session entitlement readback (registry-backed on patched
+          // runtimes); null access_mode / non-registry source = unproven.
+          entitlement: state.entitlement
+            ? { requested: state.entitlement.requested, observed: state.entitlement.access_mode, source: state.entitlement.source }
+            : null,
         };
       } catch {
         return null as unknown as NonNullable<TaskRecord["modelBinding"]>;
@@ -143,7 +184,14 @@ export class TaskEngine {
     if (input.idempotency_key !== undefined && (typeof input.idempotency_key !== "string" || !IDEMPOTENCY_KEY.test(input.idempotency_key))) {
       throw new TaskEngineError("idempotency_key must be 1..128 ASCII letters, digits, underscores or hyphens, starting alphanumeric", "INVALID_IDEMPOTENCY_KEY");
     }
+    if (input.model_id !== undefined && (typeof input.model_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(input.model_id))) {
+      throw new TaskEngineError("model_id must be 1..64 model id characters", "INVALID_MODEL");
+    }
+    if (input.thought_level !== undefined && (typeof input.thought_level !== "string" || !/^[a-z0-9_-]{1,20}$/.test(input.thought_level))) {
+      throw new TaskEngineError("thought_level must be 1..20 lowercase level characters", "INVALID_THOUGHT_LEVEL");
+    }
     const workspace = this.workspaces.resolveAuthorized(input.workspace_id);
+    requireSupportedEntitlement(input.entitlement_plan, this.provider.entitlementSelection ?? null);
     const instruction = input.idempotency_key ? input.instruction : input.instruction?.trim();
     if (!instruction?.trim()) throw new TaskEngineError("instruction required", "INVALID_INSTRUCTION");
     if (instruction.length > this.cfg.maxInstructionChars) {
@@ -209,37 +257,72 @@ export class TaskEngine {
       const readonlyLane = (input.write_scope ?? "workspace") === "readonly";
       let sessionId: string;
       if (input.resume_session_id) {
+        // A DEFAULT request must not erase a previously pinned entitlement;
+        // pinned non-DEFAULT plans stay gated on the runtime's capability.
+        for (const priorTask of this.store.data.tasks.filter(t => t.zcodeSessionId === input.resume_session_id)) {
+          requireSupportedEntitlement(priorTask.entitlementPlan, this.provider.entitlementSelection ?? null);
+        }
         // Prove ownership before native resume can change session state.
-        // The provider identity is OBSERVED (ZCode resolves it natively); the
-        // governed constraint is the model identity + authoritative read source.
-        const prior = await this.provider.readSessionBinding(input.resume_session_id, wsRef);
-        if (!prior || prior.provider_id !== REQUIRED_START_PLAN_PROVIDER_ID ||
-            prior.model_id !== REQUIRED_START_PLAN_MODEL_ID ||
-            !REQUIRED_BINDING_SOURCES.has(prior.source)) {
+        // The governed constraint is the FULL OBSERVED binding from the same
+        // authoritative collection the post-resume admission gate uses:
+        // authoritative read source + admissible non-retired route + model
+        // advertised in the SAME snapshot + (for retired start routes) the
+        // session's own registry-backed entitlement readback. The narrow
+        // binding read carries none of that evidence, so official-lane resume
+        // must not rely on it. Workspace association is enforced inside the
+        // authoritative read; any read failure is "unverified" (fail closed).
+        // An explicitly requested identity must already match the observation
+        // (resume never switches).
+        const prior = await this.collectExecutionEvidence(input.resume_session_id, wsRef, readonlyLane);
+        if (!prior || !isAdmissibleObservedBinding(prior)) {
           throw new TaskEngineError("Existing native session workspace/model binding is unverified", "BINDING_UNVERIFIED", 503);
         }
-        await this.provider.resumeSession(wsRef, input.resume_session_id, { readonly: readonlyLane });
+        if (input.model_id && prior.model_id !== input.model_id) {
+          throw new TaskEngineError(
+            `resume keeps the session identity (session is ${prior.model_id}, requested ${input.model_id})`,
+            "BINDING_UNVERIFIED", 503,
+          );
+        }
+        if (input.thought_level && prior.thoughtLevel !== input.thought_level) {
+          throw new TaskEngineError(
+            `resume keeps the session identity (session effort is ${prior.thoughtLevel ?? "unproven"}, requested ${input.thought_level})`,
+            "BINDING_UNVERIFIED", 503,
+          );
+        }
+        await this.provider.resumeSession(wsRef, input.resume_session_id, { readonly: readonlyLane, entitlementPlan: input.entitlement_plan });
         sessionId = input.resume_session_id;
       } else {
         sessionId = await this.provider.createSession(wsRef, {
           readonly: readonlyLane,
-          modelId: this.cfg.requestedModelId,
-          thoughtLevel: this.cfg.requestedThoughtLevel,
+          entitlementPlan: input.entitlement_plan,
+          // Explicit requests are hard constraints; the configured identity is
+          // a PREFERENCE the provider applies only when the runtime itself
+          // advertises it (preference is never admission evidence).
+          ...(input.model_id ? { modelId: input.model_id } : { preferredModelId: this.cfg.requestedModelId }),
+          ...(input.thought_level ? { thoughtLevel: input.thought_level } : this.cfg.requestedThoughtLevel ? { preferredThoughtLevel: this.cfg.requestedThoughtLevel } : {}),
           ...(this.cfg.requestedProviderId ? { providerId: this.cfg.requestedProviderId } : {}),
         });
       }
       // Single execution-identity source: the FULL OBSERVED attestation of the
       // exact session (workspace/provider/model/thought/collaboration state)
       // from authoritative native surfaces. Requested or configured values are
-      // never execution proof; the provider id is recorded, never gated.
+      // never execution proof; an explicit request must match the observation
+      // exactly (no silent substitution, downgrade, or upgrade).
       const binding = await this.collectExecutionEvidence(sessionId, wsRef, readonlyLane);
       if (
-        !this.governedBinding(binding)
+        !this.governedBinding(binding, { modelId: input.model_id ?? null, thoughtLevel: input.thought_level ?? null, entitlementPlan: input.entitlement_plan ?? "DEFAULT" })
       ) {
+        const entitlementObserved = binding?.entitlement?.source === "provider-registry"
+          ? binding.entitlement.observed ?? "unproven"
+          : "unproven";
+        const requested = input.model_id || input.thought_level
+          ? ` (requested ${input.model_id ?? "-"}/${input.thought_level ?? "-"})` : "";
         throw new TaskEngineError(
           `unverified execution binding for ${sessionId} (observed ` +
-            `${binding ? `${binding.provider_id}/${binding.model_id}` : "unknown"}; ` +
-            `requires authoritative session read bound to ${REQUIRED_START_PLAN_PROVIDER_ID}/${REQUIRED_START_PLAN_MODEL_ID} at max thought level)`,
+            `${binding ? `${binding.provider_id}/${binding.model_id}` : "unknown"}${requested}; ` +
+            `entitlement observed: ${entitlementObserved}; ` +
+            `requires an authoritative session read on an admissible route advertising the observed model` +
+            `${input.entitlement_plan && input.entitlement_plan !== "DEFAULT" ? ` and attesting ${input.entitlement_plan}` : ""})`,
           "BINDING_UNVERIFIED",
           503,
         );
@@ -275,6 +358,9 @@ export class TaskEngine {
         exitStatus: null,
         outputId: null,
         resumeOfSessionId: input.resume_session_id ?? null,
+        entitlementPlan: entitlementPlan(input.entitlement_plan),
+        requestedModelId: input.model_id ?? null,
+        requestedThoughtLevel: input.thought_level ?? null,
         modelBinding: binding,
       };
       if (this.workspaces.resolveAuthorized(workspaceId).canonicalPath !== workspace.canonicalPath) {
@@ -286,6 +372,8 @@ export class TaskEngine {
         workspaceId,
         sessionId,
         binding: `${binding.provider_id}/${binding.model_id}`,
+        thoughtLevel: binding.thoughtLevel ?? null,
+        requested: input.model_id || input.thought_level ? `${input.model_id ?? "-"}/${input.thought_level ?? "-"}` : null,
         mode: task.mode,
         writeScope: task.writeScope,
         resumeOf: task.resumeOfSessionId,
@@ -317,6 +405,22 @@ export class TaskEngine {
     };
   }
 
+  /**
+   * Read-only durable-idempotency resolution: the task admitted under exactly
+   * this key in this workspace, or null when no such task was ever admitted.
+   * Never mutates, never submits; used by callers to resolve a lost submit
+   * response without re-dispatching. An ambiguous duplicate key is a store
+   * integrity failure and fails closed.
+   */
+  resolveKeyedTask(workspaceId: string, key: string): PublicTaskView | null {
+    if (!IDEMPOTENCY_KEY.test(key)) {
+      throw new TaskEngineError("invalid idempotency key", "INVALID_IDEMPOTENCY_KEY");
+    }
+    const matches = this.store.data.tasks.filter(t => t.workspaceId === workspaceId && t.idempotency?.key === key);
+    if (matches.length > 1) throw new TaskEngineError("ambiguous durable key", "IDEMPOTENCY_INVALID", 503);
+    return matches[0] ? publicView(matches[0]) : null;
+  }
+
   pauseQueue(workspaceId: string): void {
     const workspace = this.workspaces.resolveAuthorized(workspaceId);
     const q = this.store.getOrCreateQueue(workspace.workspaceId);
@@ -339,6 +443,7 @@ export class TaskEngine {
    * Paused workspaces never dispatch queued tasks.
    */
   private async pump(workspaceId: string): Promise<void> {
+    if (/^(true|1)$/i.test(process.env.PRODUCT_TASK_DISPATCH_PAUSED ?? "")) return;
     if (this.dispatching.has(workspaceId)) return;
     this.dispatching.add(workspaceId);
     try {
@@ -356,6 +461,7 @@ export class TaskEngine {
           this.audit.record("error", "task.run_error", {
             taskId: next,
             error: String((err as Error)?.message ?? err).slice(0, 300),
+            failureClass: classifyTaskFailure(String((err as Error)?.message ?? err)),
           });
           const t = this.store.findTask(next);
           if (t && !TERMINAL_STATES.has(t.status)) {
@@ -371,6 +477,63 @@ export class TaskEngine {
     }
   }
 
+  /**
+   * Transient -32010 ("a prompt is already running") settle for the governed
+   * task lane. The runtime's own session status is the authoritative busy
+   * truth: a prompt that is genuinely running keeps the session busy; a
+   * session the runtime reports IDLE (with prior assistant history proving a
+   * previous turn existed and terminalized — e.g. after a service restart
+   * lost in-process evidence) is safely recoverable with exactly one
+   * stopSession + one retry, mirroring the semantic lane's gates. Anything
+   * else fails closed with SESSION_BUSY; the prompt is never interrupted on
+   * suspicion alone.
+   */
+  private async sendWithBusySettle(
+    task: TaskRecord,
+    workspace: { workspacePath: string; workspaceKey: string },
+    assistantMarker: number,
+  ): Promise<Awaited<ReturnType<AgentProvider["send"]>>> {
+    const wsRef = { workspacePath: workspace.workspacePath, workspaceKey: workspace.workspaceKey };
+    const sendOnce = () => this.provider.send({
+      entitlementPlan: task.entitlementPlan,
+      executionGrant: { workspacePath: workspace.workspacePath, write: task.writeScope === "workspace", mode: task.writeScope === "workspace" ? "machine-local-development" : "workspace" },
+      sessionId: task.zcodeSessionId!,
+      instruction: task.instruction,
+      inputId: `z2c-${task.taskId}`,
+      timeoutMs: 15 * 60_000,
+    });
+    try {
+      return await sendOnce();
+    } catch (error) {
+      const message = String((error as Error)?.message ?? error);
+      if (!/already running for this session|-32010\b/i.test(message)) throw error;
+      const readState = this.provider.readSessionState?.bind(this.provider);
+      if (typeof readState !== "function") throw error;
+      // Bounded authoritative settle: the runtime clears busy on terminal
+      // success/failure/interruption; wait briefly for that transition.
+      const settleMs = this.cfg.busySettleMs ?? 30_000;
+      const deadline = Date.now() + settleMs;
+      let idle = false;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+        try {
+          const state = await readState(task.zcodeSessionId!, wsRef);
+          if (state?.status === "idle") { idle = true; break; }
+        } catch { /* unreadable state → keep waiting within the budget */ }
+      }
+      if (!idle) {
+        throw new TaskEngineError(`Native session is busy: ${message.slice(0, 160)}`, "SESSION_BUSY", 409);
+      }
+      this.audit.record("warn", "task.stale_busy_recovered", { taskId: task.taskId, sessionId: task.zcodeSessionId });
+      try {
+        return await sendOnce();
+      } catch (retryError) {
+        const retryMessage = String((retryError as Error)?.message ?? retryError);
+        throw new TaskEngineError(`Native session is busy: ${retryMessage.slice(0, 160)}`, "SESSION_BUSY", 409);
+      }
+    }
+  }
+
   private async runTask(taskId: string): Promise<void> {
     const task = this.store.findTask(taskId);
     if (!task) return;
@@ -381,15 +544,19 @@ export class TaskEngine {
     this.store.assertHealthy();
     this.store.setStatus(taskId, "running", undefined);
     this.audit.record("info", "task.started", { taskId, workspaceId: task.workspaceId });
+    // Turn-scope output marker (see below) — hoisted so the failure path can
+    // read the same turn's partial output for the checkpoint record.
+    let assistantMarker = 0;
 
     try {
       // The native session was established and binding-verified at submit
       // time; re-read the FULL authoritative evidence before each send:
       // workspace association, governed model identity, and — for readonly
       // lanes — the v4 plan flag must still be observed.
+      requireSupportedEntitlement(task.entitlementPlan, this.provider.entitlementSelection ?? null);
       const dispatchReadonly = task.writeScope === "readonly";
       const binding = await this.collectExecutionEvidence(task.zcodeSessionId!, { workspacePath: workspace.canonicalPath, workspaceKey: workspace.canonicalPath }, dispatchReadonly);
-      if (!this.governedBinding(binding)) {
+      if (!this.governedBinding(binding, { modelId: task.requestedModelId, thoughtLevel: task.requestedThoughtLevel, entitlementPlan: task.entitlementPlan ?? "DEFAULT" })) {
         throw new TaskEngineError("Native session binding changed before send", "BINDING_UNVERIFIED", 503);
       }
       if (dispatchReadonly && binding.planEnabled !== true) {
@@ -398,22 +565,19 @@ export class TaskEngine {
       // Scope the output read to THIS turn: snapshot the assistant-message
       // count before sending so a resumed session's prior history can never be
       // returned as this turn's reply.
-      const assistantMarker = await Promise.resolve()
+      assistantMarker = await Promise.resolve()
         .then(() => this.provider.snapshotAssistantMarker?.(task.zcodeSessionId!))
         .catch(() => undefined)
         ?? 0;
-      const handle = await this.provider.send({
-        sessionId: task.zcodeSessionId!,
-        instruction: task.instruction,
-        inputId: `z2c-${task.taskId}`,
-        timeoutMs: 15 * 60_000,
-      });
+      const handle = await this.sendWithBusySettle(task, { workspacePath: workspace.canonicalPath, workspaceKey: workspace.canonicalPath }, assistantMarker);
       const result = await handle.completion;
 
       const text = await this.provider.readAssistantOutput(
         task.zcodeSessionId!,
         this.cfg.maxOutputChars,
-        { minAssistantCount: assistantMarker },
+        // Failed turn output is a partial checkpoint, not a new result. A
+        // post-stop model error must not overwrite an observed local deadline.
+        { minAssistantCount: assistantMarker, allowModelError: result.status !== "completed" },
       );
       const outputId = newOutputId();
       this.store.saveOutput({
@@ -443,15 +607,47 @@ export class TaskEngine {
       } else {
         this.store.setStatus(taskId, "failed", result.detail ?? "turn failed");
       }
+      const exitStatusNow = this.store.findTask(taskId)!.exitStatus;
       this.audit.record("info", "task.finished", {
         taskId,
         sessionId: task.zcodeSessionId,
         status: result.status,
         outputId,
+        failureClass: result.status === "completed" ? null : classifyTaskFailure(exitStatusNow),
       });
     } catch (err) {
       const msg = String((err as Error)?.message ?? err).slice(0, 200);
       const t = this.store.findTask(taskId)!;
+      // Partial-output checkpoint: whatever the model produced BEFORE the
+      // failure (timeout, model_request_cancelled, mid-turn error) stays
+      // readable on the normal output surface. Best-effort only — the error
+      // itself remains the terminal record and must never become "success".
+      if (task.zcodeSessionId && !t.outputId) {
+        try {
+          const partial = await this.provider.readAssistantOutput(
+            task.zcodeSessionId,
+            this.cfg.maxOutputChars,
+            { minAssistantCount: assistantMarker, allowModelError: true },
+          );
+          if (partial.trim()) {
+            const partialOutputId = newOutputId();
+            this.store.saveOutput({
+              outputId: partialOutputId,
+              taskId: task.taskId,
+              workspaceId: task.workspaceId,
+              sessionId: task.zcodeSessionId,
+              text: partial,
+              createdAt: Date.now(),
+            });
+            this.store.attachOutput(taskId, partialOutputId);
+            this.audit.record("info", "task.partial_output_saved", {
+              taskId,
+              sessionId: task.zcodeSessionId,
+              chars: partial.length,
+            });
+          }
+        } catch { /* no recoverable output — the error remains the record */ }
+      }
       if (t.status === "cancelled") {
         // cancellation raced with the failure — keep cancelled
       } else if (t.status !== "running") {
@@ -459,7 +655,7 @@ export class TaskEngine {
       } else {
         this.store.setStatus(taskId, "failed", msg);
       }
-      this.audit.record("warn", "task.error", { taskId, error: msg });
+      this.audit.record("warn", "task.error", { taskId, error: msg, failureClass: classifyTaskFailure(msg) });
       throw err;
     }
   }

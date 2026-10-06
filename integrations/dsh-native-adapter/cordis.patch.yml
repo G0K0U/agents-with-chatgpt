@@ -1,0 +1,3 @@
+- insert:
+    - id: a2c-native-session-adapter
+      name: dsh-a2c-native-session-adapter

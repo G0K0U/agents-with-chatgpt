@@ -1,5 +1,7 @@
 import fs from "node:fs";
-import { ZcodeNativeClient, ZcodeNativeError, loadZcodeNativeConfig, type ZcodeNativeTaskView } from "./zcode-native.js";
+import { productDispatchPaused } from "../config/dispatch-policy.js";
+import { OrchestratorCore, acquireStateLock } from "./orchestrator-core.js";
+import { ZcodeNativeClient, ZcodeNativeError, loadZcodeNativeConfig, nativeRequestFingerprint, nativeResumeFingerprint, type ZcodeNativeTaskView } from "./zcode-native.js";
 import { observeNativeModel, verificationFingerprint, type NativeModelEvidence } from "./continuation-evidence.js";
 import type { ContinuationController } from "./continuation.js";
 import { sanitizeExecutionCommand } from "./sanitize.js";
@@ -37,20 +39,25 @@ import { resolveVerificationProfile } from "./operator-verification.js";
 import type { CodexRuntimeEnvironment } from "./runtime.js";
 import type { ExecutionSelection, ModelCatalogService } from "./model-catalog.js";
 import { MODEL_ID_PATTERN, EFFORT_PATTERN } from "./model-catalog.js";
+import { createStepSelectionResolver } from "./step-selection.js";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { Logger, nullLogger, redact } from "../logger/index.js";
 import { type ExecutionProvider, type ExecutionBackend, type TaskLifecyclePhase } from "./backend.js";
 import { AntigravityBackend, DEFAULT_GEMINI_MODEL, KNOWN_GEMINI_MODELS, type AntigravityProviderStatus } from "./antigravity.js";
+import { DshNativeService, type DshTaskRecord } from "./dsh-native-service.js";
 import type { TaskLifecycleEvent, TaskLifecycleEventType } from "./audit-maintenance.js";
 import type { C2CSessionRegistry } from "../session/registry.js";
 import {
   acquireWorkspaceSlot,
   bindWorkspaceSlot,
+  markReservationDispatched,
   readWorkspaceSlot,
   workspaceSlotFile,
   reconcileWorkspaceSlot,
   releaseWorkspaceSlot,
+  renewWorkspaceSlot,
   WorkspaceSlotError,
+  type WorkspaceSlotLock,
   type WorkspaceSlotReconciliation,
 } from "./slot.js";
 import {
@@ -118,9 +125,15 @@ export interface ApprovalAuditEvent {
 interface TaskErrorInfo {
   code: string;
   message: string;
+  pool?: string | null;
+  retryAfter?: number | string | null;
+  resetAt?: string | null;
+  reason?: string | null;
+  evidenceSource?: string | null;
 }
 
 export interface PersistedTaskRecord {
+  orchestratorKey?: string;
   continuation?: { idempotencyKey: string; model: string; effort: string; timeoutMs: number };
   /** Resolved model selection for codex tasks (persisted; revalidated at dispatch). */
   selection?: ExecutionSelection | null;
@@ -134,15 +147,29 @@ export interface PersistedTaskRecord {
    * no confirmed response — the mutation is never automatically re-sent).
    */
   dispatchedSelection?: {
-    thread: { model: string | null };
-    turn: { model: string | null; effort: string | null; outcome: "accepted" | "unknown" } | null;
+    thread?: { model: string | null };
+    turn?: { model: string | null; effort: string | null; outcome: "accepted" | "unknown" } | null;
+    cli?: { model: string | null; effort: string | null };
   } | null;
   /**
    * What the upstream proved: thread/start echo and/or session readback.
    * effort is null unless the upstream explicitly reported it — the
    * dispatched effort is never copied here.
    */
-  observedSelection?: { model: string | null; effort: string | null; source: string; mismatch?: boolean } | null;
+  observedSelection?: {
+    model: string | null;
+    effort: string | null;
+    effortStatus?: "verified" | "unverified";
+    source: string;
+    mismatch?: boolean;
+  } | null;
+  failureDetails?: {
+    reason?: string | null;
+    pool?: string | null;
+    retryAfter?: number | string | null;
+    resetAt?: string | null;
+    evidenceSource?: string | null;
+  };
   actualModel?: NativeModelEvidence | string | null;
   stableVerification?: { passed: boolean; sourceHash: string | null; commands: Array<{ command: string; exitCode: number | null; sourceHash?: string | null }> };
   taskId: string;
@@ -424,7 +451,7 @@ export interface TaskManagerOptions {
   /** Maximum number of waiting tasks for this workspace. Defaults to 50. */
   maxQueueSize?: number;
   /** Native client shared by dispatch and workspace-slot status reconciliation. */
-  nativeClient?: Pick<ZcodeNativeClient, "submitTask" | "resumeSession" | "getTask" | "cancelTask" | "executionOutput">;
+  nativeClient?: Pick<ZcodeNativeClient, "submitTask" | "resumeSession" | "getTask" | "cancelTask" | "executionOutput" | "resolveKeyedTask" | "taskLaneStatus" | "projectWorkspace" | "sessionRuntimeStatus">;
   /** Alias retained for local callers that use the shorter queue-size name. */
   queueSize?: number;
   /** Alias for maxQueueSize used by older local integrations. */
@@ -433,6 +460,12 @@ export interface TaskManagerOptions {
   onTaskLifecycleEvent?: (event: TaskLifecycleEvent) => void;
   /** Live model catalog; production wires it, unit tests may omit it. */
   modelCatalog?: ModelCatalogService;
+  /**
+   * Bounded recovery window (ms) before an unresolved z2c writer reservation
+   * may be resolved by upstream observation (key lookup / queue-empty proof).
+   * Default 120000; bounded 1000..900000.
+   */
+  nativeReservationRecoveryMs?: number;
 }
 
 const TERMINAL_STATUSES = new Set<TaskStatus>(["completed", "failed", "cancelled", "interrupted", "timed_out"]);
@@ -447,6 +480,45 @@ const ALL_TASK_STATUSES = new Set<TaskStatus>([
   "interrupted",
   "timed_out",
 ]);
+
+/**
+ * Detect a Z2C "failed" status caused by the provider.send timeout expiring.
+ *
+ * The upstream official provider (official.ts:1133-1141) deletes its turn
+ * waiter after 15 minutes and resolves with `{status:"failed", detail:"turn
+ * timeout"}`. The engine records this as status=failed, exit_status="turn
+ * timeout" (engine.ts:592). Crucially, the REAL Desktop turn was never
+ * interrupted — the runtime session may keep running long after the waiter
+ * was cleaned up.
+ *
+ * A2C must NOT treat this as a confirmed terminal: releasing the writer slot
+ * would allow a concurrent writer while the first is still mutating the repo.
+ * Reconciliation must instead wait for a genuine idle or a reliably terminal
+ * observation (completed, cancelled, or runtime-confirmed interrupted).
+ *
+ * Also covers unknown/disconnection failures that are NOT reliably terminal.
+ */
+export function isNativeTimeoutFailure(task: ZcodeNativeTaskView): boolean {
+  if (task.status !== "failed") return false;
+  const exit = typeof task.exit_status === "string" ? task.exit_status.toLowerCase() : "";
+  // "turn timeout" is the exact string from official.ts:1140 via engine.ts:592.
+  // Also match broader "timeout" patterns and unknown/empty exits where the
+  // provider itself may have been unreachable (fail closed).
+  if (/\bturn\s+timeout\b/.test(exit)) return true;
+  if (/\btimeout\b/.test(exit) && !/\bcancelled\b/.test(exit) && !/\binterrupted\b/.test(exit)) return true;
+  return false;
+}
+
+/**
+ * A session runtime status proves "idle" only when it is the runtime's exact
+ * `idle` value. Z2C's own stale-busy gate uses the same contract (native
+ * session state is exactly "idle"; every other value fails closed), so case
+ * variants, surrounding whitespace, empty, unknown, and every busy state
+ * (running/pending/queued/error) are NOT idle evidence.
+ */
+export function isSessionIdleEvidence(status: string | null | undefined): boolean {
+  return status === "idle";
+}
 const TASK_ID_PATTERN = /^c2c_[0-9a-f]{8,32}$/;
 export const DEFAULT_TASK_QUEUE_SIZE = 50;
 const MAX_TASK_QUEUE_SIZE = 1_000;
@@ -465,6 +537,48 @@ const DEFAULT_TASK_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_VERIFICATION_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 const DEFAULT_INTERRUPT_GRACE_MS = 5_000;
+
+/** Unified orchestrator lane projections (provider → common shape). */
+
+type OrchestratorLaneTaskView = import("./orchestrator-core.js").OrchestratorLaneTaskView;
+
+function mapNativeStatus(status: string): OrchestratorLaneTaskView["status"] {
+  return ["queued", "running", "cancelling", "completed", "failed", "cancelled", "interrupted", "timed_out"].includes(status)
+    ? status as OrchestratorLaneTaskView["status"] : "failed";
+}
+
+function projectNativeLaneTask(view: ZcodeNativeTaskView): OrchestratorLaneTaskView {
+  return {
+    taskId: view.task_id,
+    status: mapNativeStatus(view.status),
+    outputIds: view.output_id ? [view.output_id] : [],
+    error: view.exit_status && !["completed", "running", "queued"].includes(view.status)
+      ? { code: "ZCODE_NATIVE_UPSTREAM", message: String(view.exit_status) } : null,
+    verification: null,
+  };
+}
+
+const DSH_LANE_STATUS: Record<DshTaskRecord["status"], OrchestratorLaneTaskView["status"]> = {
+  admitting: "queued",
+  outcome_unknown: "running",
+  accepted: "queued",
+  running: "running",
+  completed: "completed",
+  cancel_requested: "cancelling",
+  cancelled: "cancelled",
+  interrupted: "interrupted",
+  failed: "failed",
+};
+
+function projectDshLaneTask(record: DshTaskRecord): OrchestratorLaneTaskView {
+  return {
+    taskId: record.taskId,
+    status: DSH_LANE_STATUS[record.status] ?? "failed",
+    outputIds: record.outputIds ?? [],
+    error: record.error ?? null,
+    verification: null,
+  };
+}
 
 function boundedMilliseconds(value: number | undefined, fallback: number, min: number, max: number): number {
   if (value === undefined) return fallback;
@@ -684,6 +798,8 @@ function publicView(record: PersistedTaskRecord): CodexTaskView {
 }
 
 export type TaskAccessContext = {
+  /** Internal durable admission key; never accepted from task MCP arguments. */
+  orchestratorKey?: string;
   /** Local controller only; never populated from untrusted MCP arguments. */
   continuation?: { idempotencyKey: string; model: string; effort: string; timeoutMs: number; authorize: () => boolean };
   /** Catalog-resolved selection computed by the async caller before submit. */
@@ -1093,7 +1209,7 @@ export function validateCodexTask(
       if (!KNOWN_GEMINI_MODELS.has(trimmedModel)) {
         throw new TaskError(
           "INVALID_MODEL",
-          `Requested Gemini model "${trimmedModel}" is not in the Antigravity allowlist. Allowed models: ${Array.from(KNOWN_GEMINI_MODELS).join(", ")}`
+          `Requested Antigravity model "${trimmedModel}" is not in the Antigravity allowlist. Allowed models: ${Array.from(KNOWN_GEMINI_MODELS).join(", ")}`
         );
       }
       model = trimmedModel;
@@ -1115,10 +1231,10 @@ export function validateCodexTask(
     }
     effort = rawInput.effort.trim();
   }
-  const networkRequested = rawInput.network === true;
-  // Network is an explicit per-task opt-in. Safe/API deployments reject it;
-  // the existing local full-access deployment is the only deployment that
-  // can authorize the opt-in, while its default remains offline.
+  const networkRequested = rawInput.network !== false;
+  // Network defaults to true (online) when omitted. Safe/API deployments
+  // without fullAccess reject network=true; explicit network=false is always
+  // honored. Full-access deployments allow network by default.
   if (networkRequested && !fullAccess) {
     throw new TaskError("NETWORK_NOT_ALLOWED", "Network access is disabled for C2C tasks");
   }
@@ -1197,8 +1313,16 @@ export function validateCodexTask(
 export class CodexTaskManager {
   private collectorBusy = false;
   private nativeClient: TaskManagerOptions["nativeClient"];
+  private dshServiceInstance: DshNativeService | null = null;
   private nativeSlotStatus = "unresolved";
+  private readonly nativeDispatches = new Set<string>();
+  private nativeReconciliation?: Promise<{ status: string; released: boolean }>;
+  /** Bounded recovery window for unresolved z2c writer reservations (ms). */
+  private readonly nativeReservationRecoveryMs: number;
   continuationController?: ContinuationController;
+  readonly orchestrator: OrchestratorCore;
+  private orchestratorTimer?: ReturnType<typeof setInterval>;
+  private leaseHeartbeatTimer?: ReturnType<typeof setInterval>;
   private readonly continuationAuthorize: TaskManagerOptions["continuationAuthorize"];
   readonly stateDir: string;
   private readonly logger: Logger;
@@ -1262,6 +1386,7 @@ export class CodexTaskManager {
       30 * 60_000
     );
     this.approvalTimeoutMs = boundedMilliseconds(opts.approvalTimeoutMs, DEFAULT_APPROVAL_TIMEOUT_MS, 50, 5 * 60_000);
+    this.nativeReservationRecoveryMs = boundedMilliseconds(opts.nativeReservationRecoveryMs ?? 120_000, 120_000, 1_000, 15 * 60_000);
     this.interruptGraceMs = boundedMilliseconds(opts.interruptGraceMs, DEFAULT_INTERRUPT_GRACE_MS, 50, 60_000);
     this.sessionRegistry = opts.sessionRegistry ?? null;
     this.restartRequiredResolver = opts.restartRequiredResolver ?? (() => false);
@@ -1275,6 +1400,80 @@ export class CodexTaskManager {
     this.loadTasks();
     this.reconcileActiveSlot();
     this.recovering = false;
+    const startOrchestratorRecovery = () => {
+      if (this.orchestratorTimer || this.closed) return;
+      this.orchestratorTimer = setInterval(() => {
+        void this.orchestrator.recover().catch(() => { /* Durable intent remains retryable. */ });
+      }, 1000);
+      this.orchestratorTimer.unref();
+    };
+    this.orchestrator = new OrchestratorCore(this.stateDir, this.workspace.id, this, {
+      onPersistedRun: startOrchestratorRecovery,
+      validate: step => {
+        // Codex-family steps validate against the full task contract; native
+        // lanes (zcode/dsh) reuse the same shape contract for instruction and
+        // write scope, without codex/gemini model semantics.
+        validateCodexTask(this.workspace, {
+          workspace_id: this.workspace.id,
+          instruction: step.instruction,
+          write_scope: step.write_scope,
+          network: step.network,
+          run_tests: step.run_tests,
+          provider: step.agent === "antigravity" ? "gemini" : (step.agent === "zcode" || step.agent === "dsh") ? "codex" : step.agent,
+          ...(step.model !== undefined && step.agent !== "zcode" && step.agent !== "dsh" ? { model: step.model } : {}),
+          ...(step.effort !== undefined && step.agent === "codex" ? { effort: step.effort } : {}),
+        }, { fullAccess: this.fullAccess });
+      },
+      // Production always wires the live catalog (bridge); contract-only
+      // deployments/tests without a catalog service fall back to the
+      // request-as-resolved pass-through inside OrchestratorCore.
+      ...(this.modelCatalog ? { resolveSelection: createStepSelectionResolver(this.modelCatalog) } : {}),
+      lanes: {
+        // ZCode/GLM lane: the AUTHORITATIVE native surface (Z2C submit/read),
+        // projected into the unified lane shape — no second runner.
+        zcode: {
+          submit: async (step, resolved, access) => {
+            const key = access.orchestratorKey ? `orch${access.orchestratorKey.replaceAll(":", "-")}` : undefined;
+            const view = await this.submitNative({
+              workspace_id: this.workspace.id,
+              instruction: step.instruction,
+              write_scope: "workspace",
+              ...(resolved.model_id ? { model_id: resolved.model_id } : {}),
+              ...(resolved.effort ? { thought_level: resolved.effort } : {}),
+              ...(step.entitlement_plan !== undefined ? { entitlement_plan: step.entitlement_plan } : {}),
+              ...(key ? { idempotency_key: key } : {}),
+            });
+            return projectNativeLaneTask(view);
+          },
+          get: async taskId => {
+            const view = await this.getNative({ workspace_id: this.workspace.id, task_id: taskId });
+            return projectNativeLaneTask(view);
+          },
+        },
+        // DSH/local-model lane: the AUTHORITATIVE native service (exact-model
+        // transactional lease), projected into the unified lane shape.
+        dsh: {
+          submit: async (step, resolved, access) => {
+            if (!resolved.effort || !["low", "medium", "high"].includes(resolved.effort)) {
+              throw new TaskError("INVALID_TASK", "DSH lane requires an advertised low/medium/high effort");
+            }
+            const requestId = access.orchestratorKey
+              ? `orch${access.orchestratorKey.replaceAll(":", "-")}`
+              : `orch${randomUUID().replaceAll("-", "").slice(0, 24)}`;
+            const record = await this.dshService().submitSelected(
+              this.workspace.id, this.workspace.root, access.ownerId ?? "local",
+              requestId, step.instruction, resolved.model_id, resolved.effort as "low" | "medium" | "high");
+            return projectDshLaneTask(record);
+          },
+          get: async taskId => {
+            const record = await this.dshService().refreshTask(this.workspace.id, this.workspace.root, taskId);
+            return projectDshLaneTask(record);
+          },
+        },
+      },
+      authorize: owner => owner === "local" || this.continuationAuthorize?.(owner, this.workspace.id, "execution.submit") === true,
+    });
+    if (this.orchestrator.hasRuns()) startOrchestratorRecovery();
     this.schedulePump();
     void this.reconcileNativeSlot().finally(() => this.watchWriterSlot());
   }
@@ -1285,6 +1484,11 @@ export class CodexTaskManager {
     timestamp?: string,
     paused?: boolean
   ): void {
+    queueMicrotask(() => {
+      if (!this.closed) {
+        try { void this.orchestrator?.recover().catch(() => { /* Recovery timer retries persisted intent. */ }); } catch { /* Recovery timer retries persisted intent. */ }
+      }
+    });
     if (!this.onTaskLifecycleEvent) return;
     try {
       this.onTaskLifecycleEvent({
@@ -1304,6 +1508,12 @@ export class CodexTaskManager {
     return this.nativeClient ??= new ZcodeNativeClient(loadZcodeNativeConfig());
   }
 
+  /** Lazy DSH native service for the orchestrated local-model lane. */
+  private dshService(): DshNativeService {
+    this.dshServiceInstance ??= new DshNativeService(this.stateDir);
+    return this.dshServiceInstance;
+  }
+
   private assertNativeWorkspace(workspaceId: string): void {
     if (workspaceId !== this.workspace.id) {
       throw new TaskError("TASK_NOT_AUTHORIZED", "Native task requires the authorized workspace");
@@ -1318,7 +1528,22 @@ export class CodexTaskManager {
 
   submitNative(input: Parameters<ZcodeNativeClient["submitTask"]>[0], beforeDispatch?: () => void): Promise<ZcodeNativeTaskView> {
     this.assertNativeWorkspace(input.workspace_id);
-    return this.dispatchNative(input.write_scope !== "readonly", hook => this.native().submitTask(input, () => { beforeDispatch?.(); hook(); }));
+    return this.dispatchNative(
+      input,
+      input.write_scope !== "readonly",
+      nativeRequestFingerprint,
+      (keyed, hook) => this.native().submitTask(keyed, () => { beforeDispatch?.(); hook(); }),
+    );
+  }
+
+  /**
+   * The A2C → native workspace projection seam (the injected/lazy native
+   * client's authoritative mapping). Callers that independently re-verify
+   * durable upstream proofs (continuation review) must verify against the
+   * projected NATIVE payload — the payload Z2C hashed at admission.
+   */
+  projectNativeWorkspace(workspaceId: string, write = false): Promise<{ nativeWorkspaceId: string; canonicalPath: string }> {
+    return this.native().projectWorkspace(workspaceId, write);
   }
 
   /** Read-only fingerprints: no reconciliation, slot acquisition, or scheduling. */
@@ -1338,33 +1563,69 @@ export class CodexTaskManager {
 
   resumeNative(input: Parameters<ZcodeNativeClient["resumeSession"]>[0]): Promise<ZcodeNativeTaskView> {
     this.assertNativeWorkspace(input.workspace_id);
-    return this.dispatchNative(true, hook => this.native().resumeSession({ ...input, expected_workspace_path: this.workspace.root }, hook));
+    const withPath = { ...input, expected_workspace_path: this.workspace.root };
+    return this.dispatchNative(
+      withPath,
+      true,
+      nativeResumeFingerprint,
+      (keyed, hook) => this.native().resumeSession(keyed, hook),
+    );
   }
 
-  /** Reserve, dispatch and bind the same workspace slot to the native task. */
-  private async dispatchNative(write: boolean, invoke: (beforeDispatch: () => void) => Promise<ZcodeNativeTaskView>): Promise<ZcodeNativeTaskView> {
+  /**
+   * Reserve, dispatch and bind the same workspace slot to the native task.
+   *
+   * The reservation carries durable correlation evidence (idempotency key +
+   * request fingerprint) recorded BEFORE the upstream dispatch leaves, so a
+   * lost response is later resolved by OBSERVATION (key lookup / queue-empty
+   * proof) — never by re-submitting. A failure before dispatch releases
+   * immediately; a failure after dispatch keeps the reservation (fail closed)
+   * until reconcileNativeSlot's bounded recovery proves the upstream outcome.
+   */
+  private async dispatchNative<T extends { idempotency_key?: string; workspace_id: string }>(
+    input: T,
+    write: boolean,
+    fingerprintOf: (keyed: T) => string,
+    invoke: (keyedInput: T, beforeDispatch: () => void) => Promise<ZcodeNativeTaskView>,
+  ): Promise<ZcodeNativeTaskView> {
     this.assertNativeQueue();
     if (write) {
       this.reconcileActiveSlot();
       if (this.active || this.collectorBusy) throw new TaskError("TASK_IN_PROGRESS", "Workspace writer is busy");
     }
     const reservation = write ? acquireWorkspaceSlot(this.workspace.id, randomUUID(), this.stateDir, "z2c") : null;
+    if (reservation) this.nativeDispatches.add(reservation.taskId);
     if (reservation) this.nativeSlotStatus = "unresolved";
+    const idempotencyKey = input.idempotency_key
+      ?? `a2cw${(reservation?.taskId ?? randomUUID()).replaceAll("-", "")}`.slice(0, 128);
+    const keyedInput = { ...input, idempotency_key: idempotencyKey };
     let dispatched = false;
     try {
-      const task = await invoke(() => {
+      // Durable correlation evidence must be the fingerprint Z2C computed at
+      // admission — i.e. over the projected NATIVE workspace payload, not the
+      // public A2C id. A projection failure is a PRE-dispatch failure: the
+      // catch below releases the reservation (fail closed, never a leak).
+      const projection = await this.native().projectWorkspace(input.workspace_id, write);
+      const requestFingerprint = fingerprintOf(Object.assign({}, keyedInput, { workspace_id: projection.nativeWorkspaceId }));
+      const task = await invoke(keyedInput, () => {
         this.assertNativeQueue();
+        if (reservation) {
+          markReservationDispatched(this.workspace.id, reservation.taskId, { idempotencyKey, requestFingerprint }, this.stateDir);
+        }
         dispatched = true;
       });
       if (reservation) {
-        bindWorkspaceSlot(this.workspace.id, reservation.taskId, task.task_id, task.session_id!, this.stateDir);
-        this.observeNativeTask(task);
+        if (!this.observeNativeTask(task)) {
+          bindWorkspaceSlot(this.workspace.id, reservation.taskId, task.task_id, task.session_id ?? null, this.stateDir);
+          this.observeNativeTask(task);
+        }
       }
       return task;
     } catch (error) {
       if (reservation && !dispatched) releaseWorkspaceSlot(this.workspace.id, reservation.taskId, this.stateDir);
       throw error;
     } finally {
+      if (reservation) this.nativeDispatches.delete(reservation.taskId);
       this.watchWriterSlot();
       this.schedulePump();
     }
@@ -1398,8 +1659,27 @@ export class CodexTaskManager {
     // keeps terminal observation working across the bind boundary and for
     // sessions whose session id was not yet known at bind time.
     const identityMatches = slot.taskId === task.task_id
-      || slot.nativeTaskId === task.task_id;
+      || slot.nativeTaskId === task.task_id
+      || (!!slot.idempotencyKey && !!slot.requestFingerprint
+        && task.idempotency?.protocol === "workspace-task-v1"
+        && task.idempotency.key === slot.idempotencyKey
+        && task.idempotency.request_fingerprint === slot.requestFingerprint);
     if (!identityMatches) return false;
+
+    // A-fix-timeout: a Z2C "failed" status whose exit_status indicates the
+    // upstream turn TIMED OUT is NOT a confirmed terminal: the 15-min
+    // provider.send timeout deletes the waiter and sets the task to "failed"
+    // with exit_status containing "turn timeout", but the real Desktop turn
+    // was never interrupted and may still be running. Releasing the writer
+    // slot here would allow a second writer while the first is still active,
+    // causing repository conflicts. Keep the slot occupied ("busy_timeout")
+    // until reconciliation observes genuine idle or a reliably terminal
+    // status (completed, cancelled, interrupted by the runtime itself).
+    if (isNativeTimeoutFailure(task)) {
+      this.nativeSlotStatus = "busy_timeout";
+      return false;
+    }
+
     this.nativeSlotStatus = ["queued", "running", "cancelling"].includes(task.status) ? task.status : "unresolved";
     if (!TERMINAL_STATUSES.has(task.status as TaskStatus)) return false;
     const released = releaseWorkspaceSlot(this.workspace.id, slot.taskId, this.stateDir);
@@ -1408,11 +1688,18 @@ export class CodexTaskManager {
   }
 
   /** Restart and completion polling query the task bound in the workspace slot. */
-  async reconcileNativeSlot(): Promise<{ status: string; released: boolean }> {
+  reconcileNativeSlot(): Promise<{ status: string; released: boolean }> {
+    return this.nativeReconciliation ??= this.reconcileNativeSlotOnce().finally(() => {
+      this.nativeReconciliation = undefined;
+    });
+  }
+
+  private async reconcileNativeSlotOnce(): Promise<{ status: string; released: boolean }> {
     const slot = readWorkspaceSlot(this.workspace.id, this.stateDir);
     if (slot?.provider !== "z2c") return { status: "none", released: false };
+    if (this.nativeDispatches.has(slot.taskId)) return { status: "unresolved", released: false };
     this.nativeSlotStatus = "unresolved";
-    if (!slot.sessionId && !slot.nativeTaskId) return { status: "unresolved", released: false };
+    if (!slot.sessionId && !slot.nativeTaskId && !slot.taskId.startsWith("z2c_")) return this.recoverUnresolvedReservation(slot);
     try {
       const queryTaskId = slot.nativeTaskId ?? slot.taskId;
       const task = await this.native().getTask({ workspace_id: slot.workspaceId, task_id: queryTaskId });
@@ -1424,6 +1711,9 @@ export class CodexTaskManager {
         throw new ZcodeNativeError("ZCODE_NATIVE_NAMESPACE_MISMATCH", "Native status must match the workspace slot task/session");
       }
       const released = this.observeNativeTask(task);
+      if (!released && this.nativeSlotStatus === "busy_timeout") {
+        return await this.recoverTimeoutHeldSlot(slot, task);
+      }
       return { status: released ? task.status : this.nativeSlotStatus, released };
     } catch {
       this.nativeSlotStatus = "unresolved";
@@ -1431,7 +1721,134 @@ export class CodexTaskManager {
     }
   }
 
+  /**
+   * Timeout-held writer recovery (closes the A-fix-timeout loop).
+   *
+   * A task frozen as failed/"turn timeout" never updates its snapshot again,
+   * so the slot can only be released by observing the EXACT bound session's
+   * own runtime state. Every uncertainty holds (fail closed):
+   *  - no bound session id → no exact observation is possible (reportable
+   *    interface limit of legacy binds);
+   *  - no session-status adapter on the client → no evidence exists;
+   *  - the probe throws (lane down, session vanished) or reports any status
+   *    other than the runtime's exact "idle", or an unattested owner → not
+   *    idle evidence.
+   * Queue-empty and the frozen task-level "failed" are NEVER sufficient.
+   * A genuine idle releases the slot exactly once; the upstream's final
+   * visible output is captured best-effort for audit and never blocks the
+   * release. There is no TTL: without idle evidence the hold is permanent.
+   */
+  private async recoverTimeoutHeldSlot(slot: WorkspaceSlotLock, task: ZcodeNativeTaskView): Promise<{ status: string; released: boolean }> {
+    if (!slot.sessionId) return { status: "busy_timeout", released: false };
+    const client = this.native();
+    if (typeof client.sessionRuntimeStatus !== "function") return { status: "busy_timeout", released: false };
+    let observed: { session_id: string; workspace_id: string; runtime_status: string | null; locally_owned: boolean };
+    try {
+      observed = await client.sessionRuntimeStatus({ workspace_id: slot.workspaceId, session_id: slot.sessionId });
+    } catch {
+      return { status: "busy_timeout", released: false };
+    }
+    if (observed.locally_owned !== true || !isSessionIdleEvidence(observed.runtime_status)) {
+      return { status: "busy_timeout", released: false };
+    }
+    if (typeof task.output_id === "string" && task.output_id) {
+      try {
+        const out = await client.executionOutput({ workspace_id: slot.workspaceId, task_id: task.task_id, output_id: task.output_id });
+        saveExecutionOutput(this.workspace.id, {
+          command: "timeout-recovery capture",
+          raw: out.text,
+          exitCode: null,
+          taskId: task.task_id,
+          iteration: 1,
+        }, this.stateDir);
+      } catch {
+        // Best-effort capture: writer safety wins over audit completeness.
+      }
+    }
+    const released = releaseWorkspaceSlot(this.workspace.id, slot.taskId, this.stateDir);
+    if (released) this.schedulePump();
+    this.nativeSlotStatus = released ? "released_timeout_idle" : "busy_timeout";
+    return { status: released ? "released_timeout_idle" : "busy_timeout", released };
+  }
+
+  /**
+   * Bounded, fail-closed recovery for a z2c writer reservation whose dispatch
+   * outcome is unknown (no native task or session was ever bound). The
+   * reservation is NEVER resolved by re-submitting; the upstream outcome is
+   * proven by observation only:
+   *
+   *  1. Keyed reservations (current code always records one before dispatch):
+   *     after the bounded window, resolve the durable idempotency key on Z2C.
+   *     Bound → re-bind the slot to the recovered task/session. Unbound → the
+   *     submit never persisted; the queue-empty proof runs as defense in depth
+   *     and the reservation is released.
+   *  2. Legacy reservations without correlation evidence: after the bounded
+   *     window measured from acquisition, a healthy upstream reporting an
+   *     empty workspace queue (no active, no queued task) proves no orphan
+   *     writer work exists upstream; release.
+   *
+   * Any upstream error, unhealthy provider, non-empty queue, or an unexpired
+   * window keeps the reservation (fail closed).
+   */
+  private async recoverUnresolvedReservation(slot: WorkspaceSlotLock): Promise<{ status: string; released: boolean }> {
+    const now = Date.now();
+    const reference = Number.isFinite(Date.parse(slot.dispatchedAt ?? "")) ? Date.parse(slot.dispatchedAt!) : Date.parse(slot.acquiredAt);
+    if (!Number.isFinite(reference) || now - reference < this.nativeReservationRecoveryMs) {
+      return { status: "unresolved", released: false };
+    }
+    try {
+      if (slot.idempotencyKey) {
+        let task: ZcodeNativeTaskView | null;
+        try {
+          task = await this.native().resolveKeyedTask(
+            { workspace_id: slot.workspaceId, idempotency_key: slot.idempotencyKey },
+            slot.requestFingerprint,
+          );
+        } catch (error) {
+          // An idempotency conflict did not admit this request. Do not bind
+          // the conflicting task; the healthy, empty lane must still prove
+          // that no writer exists before releasing this reservation.
+          if (!(error instanceof ZcodeNativeError) || error.upstreamCode !== "IDEMPOTENCY_INVALID") throw error;
+          task = null;
+        }
+        if (task) {
+          if (task.workspace_id !== slot.workspaceId) throw new Error("Native recovery workspace mismatch");
+          // Terminal proof can release a UUID reservation directly, even if
+          // the failed admission never produced a bindable native session.
+          if (this.observeNativeTask(task)) return { status: task.status, released: true };
+          bindWorkspaceSlot(this.workspace.id, slot.taskId, task.task_id, task.session_id ?? null, this.stateDir);
+          const released = this.observeNativeTask(task);
+          return { status: task.status, released };
+        }
+        // Key unbound: the submit was never durably admitted upstream. Prove
+        // the lane is idle before releasing (defense in depth, never the sole
+        // evidence when the key already proves absence).
+        const lane = await this.native().taskLaneStatus(slot.workspaceId);
+        if (!lane.provider_healthy || lane.active_task !== null || lane.queued_task_count !== 0 || !Number.isFinite(lane.queued_task_count)) {
+          return { status: "unresolved", released: false };
+        }
+        const released = releaseWorkspaceSlot(this.workspace.id, slot.taskId, this.stateDir);
+        if (released) this.schedulePump();
+        this.nativeSlotStatus = released ? "released" : "unresolved";
+        return { status: "released_key_unbound", released };
+      }
+      // Legacy reservation (pre-evidence code): queue-empty proof only.
+      const lane = await this.native().taskLaneStatus(slot.workspaceId);
+      if (!lane.provider_healthy || lane.active_task !== null || lane.queued_task_count !== 0 || !Number.isFinite(lane.queued_task_count)) {
+        return { status: "unresolved", released: false };
+      }
+      const released = releaseWorkspaceSlot(this.workspace.id, slot.taskId, this.stateDir);
+      if (released) this.schedulePump();
+      this.nativeSlotStatus = released ? "released" : "unresolved";
+      return { status: "released_queue_drained", released };
+    } catch {
+      this.nativeSlotStatus = "unresolved";
+      return { status: "unresolved", released: false };
+    }
+  }
+
   private watchWriterSlot(): void {
+    this.watchLeaseHeartbeat();
     if (this.closed || this.writerSlotTimer || readWorkspaceSlot(this.workspace.id, this.stateDir)?.provider !== "z2c") return;
     this.writerSlotTimer = setTimeout(() => {
       this.writerSlotTimer = undefined;
@@ -1440,19 +1857,47 @@ export class CodexTaskManager {
     this.writerSlotTimer.unref();
   }
 
+  private watchLeaseHeartbeat(): void {
+    if (this.closed || this.leaseHeartbeatTimer || !readWorkspaceSlot(this.workspace.id, this.stateDir)) return;
+    this.leaseHeartbeatTimer = setInterval(() => {
+      const lease = readWorkspaceSlot(this.workspace.id, this.stateDir);
+      if (!lease) { clearInterval(this.leaseHeartbeatTimer); this.leaseHeartbeatTimer = undefined; return; }
+      const active = this.active?.record;
+      if ((active?.taskId === lease.taskId && !TERMINAL_STATUSES.has(active.status)) || this.nativeDispatches.has(lease.taskId) || lease.provider === "z2c") {
+        try { renewWorkspaceSlot(this.workspace.id, lease.taskId, this.stateDir); } catch { /* retain lease; health exposes expiry */ }
+      }
+    }, 15_000);
+    this.leaseHeartbeatTimer.unref();
+  }
+
   submit(rawInput: unknown, access: TaskAccessContext = {}): CodexTaskView {
+    if (productDispatchPaused(this.stateDir)) throw new TaskError("TASK_NOT_AUTHORIZED", "Product dispatch is paused by the operator");
     const lock = path.join(ensureDir(path.join(this.stateDir, "queues")), `${this.workspace.id}.admission.lock`);
-    let fd: number;
-    try { fd = fs.openSync(lock, "wx", 0o600); } catch { throw new TaskError("QUEUE_FULL", "Workspace admission is busy; retry after reconciliation"); }
-    try {
-      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid }));
-      return this.submitUnderQueueLock(rawInput, access);
-    } finally { fs.closeSync(fd); fs.unlinkSync(lock); }
+    let release: () => void;
+    try { release = acquireStateLock(lock); } catch { throw new TaskError("QUEUE_FULL", "Workspace admission is busy; retry after reconciliation"); }
+    try { return this.submitUnderQueueLock(rawInput, access); }
+    finally { release(); }
   }
 
   private submitUnderQueueLock(rawInput: unknown, access: TaskAccessContext): CodexTaskView {
     if (this.closed) throw new TaskError("CODEX_UNAVAILABLE", "The C2C bridge is shutting down");
     const input = validateCodexTask(this.workspace, rawInput, { fullAccess: this.fullAccess });
+    if (access.orchestratorKey) {
+      if (!access.ownerId || access.workspaceId !== this.workspace.id || !/^[A-Za-z0-9_-]{1,64}:\d+:\d+$/.test(access.orchestratorKey))
+        throw new TaskError("INVALID_TASK", "Invalid orchestrator admission");
+      const dir = path.dirname(taskFile(this.workspace.id, "c2c_00000000", this.stateDir));
+      if (fs.existsSync(dir)) for (const name of fs.readdirSync(dir).filter(n => /^c2c_[a-f0-9]+\.json$/.test(n))) {
+        const saved = readJsonIfExists<PersistedTaskRecord>(path.join(dir, name));
+        if (saved?.orchestratorKey !== access.orchestratorKey) continue;
+        this.assertAccess(saved, access);
+        if (saved.instructionHash !== input.instructionHash || JSON.stringify(saved.writeScope) !== JSON.stringify(input.writeScope)
+          || saved.network !== input.network || saved.runTests !== input.runTests
+          || (saved.requestedSelection?.model ?? null) !== (input.model ?? null) || (saved.requestedSelection?.effort ?? null) !== (input.effort ?? null))
+          throw new TaskError("INVALID_TASK", "Orchestrator admission scope mismatch");
+        this.tasks.set(saved.taskId, saved);
+        return publicView(saved);
+      }
+    }
     if (access.continuation) {
       const pin = access.continuation;
       if (this.getQueueState().paused) throw new TaskError("TASK_NOT_AUTHORIZED", "Workspace queue is paused");
@@ -1573,6 +2018,7 @@ export class CodexTaskManager {
         : { model: input.model ?? null, effort: input.effort ?? null }
       : null;
     const record: PersistedTaskRecord = {
+      orchestratorKey: access.orchestratorKey,
       continuation: access.continuation ? { idempotencyKey: access.continuation.idempotencyKey, model: access.continuation.model, effort: access.continuation.effort, timeoutMs: access.continuation.timeoutMs } : undefined,
       selection,
       requestedSelection,
@@ -1872,6 +2318,8 @@ export class CodexTaskManager {
     this.closed = true;
     if (this.writerSlotTimer) clearTimeout(this.writerSlotTimer);
     this.continuationController?.close();
+    if (this.orchestratorTimer) clearInterval(this.orchestratorTimer);
+    if (this.leaseHeartbeatTimer) clearInterval(this.leaseHeartbeatTimer);
     const runtime = this.active;
     if (runtime && !TERMINAL_STATUSES.has(runtime.record.status)) {
       runtime.shutdownRequested = true;
@@ -2046,6 +2494,7 @@ export class CodexTaskManager {
   }
 
   private pump(): void {
+    if (productDispatchPaused(this.stateDir)) return;
     this.queuePauseState = readWorkspaceQueuePauseState(this.workspace.id, this.stateDir);
     if (this.closed || this.recovering || this.collectorBusy || this.active || this.queuePauseState.paused) return;
     // Native reservations share this writer domain, including after restart.
@@ -2055,6 +2504,8 @@ export class CodexTaskManager {
     const next = this.nextQueuedTask();
     if (!next) return;
     try {
+      if (next.orchestratorKey && next.ownerId !== "local" && (!next.ownerId || !this.continuationAuthorize?.(next.ownerId, next.workspaceId, "execution.submit")))
+        throw new TaskError("TASK_NOT_AUTHORIZED", "Orchestrator authorization revoked or unavailable");
       if (next.continuation && !this.continuationController?.authorizesTask(next)) throw new TaskError("TASK_NOT_AUTHORIZED", "Approved continuation task no longer matches its lease");
       const prepared = this.pendingInputs.get(next.taskId) ?? this.prepareQueuedTask(next);
       if (!prepared) return;
@@ -2465,7 +2916,7 @@ export class CodexTaskManager {
   }
 
   private writeTask(record: PersistedTaskRecord): void {
-    writeSecureJson(taskFile(this.workspace.id, record.taskId, this.stateDir), record);
+    writeSecureJson(taskFile(this.workspace.id, record.taskId, this.stateDir), record, { durable: Boolean(record.orchestratorKey) });
   }
 
   private async getAppServer(network: boolean): Promise<AppServerClient> {
@@ -2527,6 +2978,7 @@ export class CodexTaskManager {
     try {
       acquireWorkspaceSlot(this.workspace.id, record.taskId, this.stateDir, record.provider ?? "codex");
       runtime.slotAcquired = true;
+      this.watchLeaseHeartbeat();
     } catch (error) {
       const slotError = error instanceof WorkspaceSlotError
         ? new TaskError("TASK_IN_PROGRESS", "The workspace already has an active task")
@@ -3105,8 +3557,31 @@ export class CodexTaskManager {
       record.providerModel = result.providerModel ?? record.providerModel;
       record.requestedProvider = result.requestedProvider ?? "gemini";
       record.requestedModel = result.requestedModel ?? record.providerModel ?? null;
+      if (result.requestedSelection !== undefined) {
+        record.requestedSelection = result.requestedSelection;
+      }
+      if (result.dispatchedSelection !== undefined) {
+        record.dispatchedSelection = result.dispatchedSelection as any;
+      }
       record.actualProvider = result.actualProvider ?? null;
       record.actualModel = result.actualModel ?? "UNKNOWN";
+      if (result.observedSelection !== undefined) {
+        record.observedSelection = result.observedSelection;
+      }
+      if (result.failureDetails !== undefined) {
+        record.failureDetails = result.failureDetails;
+      }
+      if (result.error) {
+        record.error = {
+          code: result.error.code,
+          message: result.error.message,
+          ...(result.error.pool ? { pool: result.error.pool } : {}),
+          ...(result.error.retryAfter !== undefined ? { retryAfter: result.error.retryAfter } : {}),
+          ...(result.error.resetAt !== undefined ? { resetAt: result.error.resetAt } : {}),
+          ...(result.error.reason ? { reason: result.error.reason } : {}),
+          ...(result.error.evidenceSource ? { evidenceSource: result.error.evidenceSource } : {}),
+        };
+      }
       if (result.phaseDurations) {
         record.phaseDurations = { ...result.phaseDurations };
       }
@@ -3645,7 +4120,7 @@ export class CodexTaskManager {
       try {
         const evidence = observeNativeModel(record.threadId, record.startedAt, record.turnId);
         if (evidence) {
-          const dispatchedModel = record.dispatchedSelection.turn?.model ?? record.dispatchedSelection.thread.model ?? null;
+          const dispatchedModel = record.dispatchedSelection.turn?.model ?? record.dispatchedSelection.thread?.model ?? null;
           const dispatchedEffort = record.dispatchedSelection.turn?.effort ?? null;
           const modelMismatch = typeof dispatchedModel === "string" && evidence.model !== dispatchedModel;
           const effortMismatch = typeof dispatchedEffort === "string"

@@ -1,7 +1,7 @@
 /**
  * Provider-neutral shared session/activity plane tools (A2C public MCP).
  *
- * These tools make Codex, Gemini/Antigravity, and ZCode/GLM work mutually
+ * These tools make Codex, Gemini/Antigravity, ZCode/GLM, and DSH work mutually
  * observable through ONE projection while keeping CONTROL owner-bound in each
  * provider's own enforcement path:
  *
@@ -26,6 +26,7 @@ import {
   type ZcodeSessionOwnership,
 } from "../execution/zcode-session-ownership.js";
 import { ZcodeSessionError } from "../execution/zcode-session-client.js";
+import { DshNativeClient, DshNativeError } from "../execution/dsh-native-client.js";
 import { AgentPlane, AgentPlaneError } from "../session-plane/plane.js";
 import type {
   AgentProviderName,
@@ -83,6 +84,7 @@ function planeFor(deps: AgentPlaneToolDeps): AgentPlane {
       stateDir,
       workspaces: () => deps.visibleWorkspaces(undefined),
       zcodeClient: client,
+      dshClient: new DshNativeClient(),
       ownership: cachedOwnership,
     });
   }
@@ -165,16 +167,17 @@ export function registerAgentPlaneTools(server: McpServer, deps: AgentPlaneToolD
     if (error instanceof ZcodeSessionError) {
       return fail(error.code, error.upstreamCode ? `[${error.upstreamCode}] ${error.message}` : error.message);
     }
+    if (error instanceof DshNativeError) return fail(error.code, error.message);
     return mapError(error);
   };
 
   server.registerTool("agent_session_list", {
     title: "List shared agent sessions",
     description:
-      "Provider-neutral session projection across Codex, Gemini/Antigravity, and ZCode/GLM — including native/" +
+      "Provider-neutral session projection across Codex, Gemini/Antigravity, ZCode/GLM, and DSH — including native/" +
       "Desktop-originated ZCode sessions discovered from runtime state. Observe-only; control stays owner-bound. " + deps.untrustedNote,
     inputSchema: {
-      provider: z.enum(["codex", "gemini", "zcode"]).optional(),
+      provider: z.enum(["codex", "gemini", "zcode", "dsh"]).optional(),
       origin: z.enum(["a2c", "native", "desktop"]).optional(),
       workspace_id: workspaceIdField.optional(),
       limit: z.number().int().min(1).max(100).optional(),
@@ -203,7 +206,7 @@ export function registerAgentPlaneTools(server: McpServer, deps: AgentPlaneToolD
     title: "Read shared agent session",
     description:
       "Sanitized projection of one shared session (provider, origin, workspace binding, owner/controller projection, " +
-      "model, effort/thought, status, tasks, verification metadata). ZCode sessions are live-enriched. Observe-only.",
+      "model, effort/thought, status, tasks, verification metadata). ZCode and DSH sessions are live-enriched. Observe-only.",
     inputSchema: { session_id: sessionIdField },
     annotations: { readOnlyHint: true },
   }, async (args, extra) => {
@@ -243,7 +246,7 @@ export function registerAgentPlaneTools(server: McpServer, deps: AgentPlaneToolD
       "Bounded activity feed (session created/updated/discovered, task lifecycle) across providers with a " +
       "seq-cursor for pagination. Observe-only.",
     inputSchema: {
-      provider: z.enum(["codex", "gemini", "zcode"]).optional(),
+      provider: z.enum(["codex", "gemini", "zcode", "dsh"]).optional(),
       session_id: sessionIdField.optional(),
       workspace_id: workspaceIdField.optional(),
       after_seq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),

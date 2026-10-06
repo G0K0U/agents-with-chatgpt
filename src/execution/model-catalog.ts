@@ -6,6 +6,7 @@ import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
 import { CodexAppServerClient, resolveCodexExecutable } from "./app-server.js";
 import { TaskError } from "./tasks.js";
+import type { DshNativeCatalog, DshNativeIdentity } from "./dsh-native-client.js";
 
 /**
  * Live, account-scoped model catalog for the three execution backends.
@@ -16,8 +17,8 @@ import { TaskError } from "./tasks.js";
  * surface advertised — "listed in the catalog" is not "inference-verified".
  */
 
-export type CatalogAgent = "codex" | "antigravity" | "zcode";
-export const CATALOG_AGENTS: readonly CatalogAgent[] = ["codex", "antigravity", "zcode"];
+export type CatalogAgent = "codex" | "antigravity" | "zcode" | "dsh";
+export const CATALOG_AGENTS: readonly CatalogAgent[] = ["codex", "antigravity", "zcode", "dsh"];
 
 export const CATALOG_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_CATALOG_TTL_MS = 5 * 60_000;
@@ -45,6 +46,13 @@ export interface CatalogModelEntry {
   deprecation: { upgrade_to: string | null; retires_at: string | null; note: string | null } | null;
   evidence_source: string;
   observed_at: string;
+  context_window?: number | null;
+  backend?: string | null;
+  profile?: string | null;
+  slot?: string | null;
+  model_selection_scope?: "transactional-global-lease" | null;
+  effort_selection_scope?: "task-under-lease" | null;
+  multimodal_evidence?: string | null;
 }
 
 export interface AgentCatalogSection {
@@ -80,6 +88,7 @@ export interface AgentCatalogSection {
   current_selection?: { provider_id: string | null; model_id: string | null; thought_level: string | null } | null;
   /** Configured preference from the source; config evidence, never a verified entry. */
   configured_identity?: { modelId?: unknown; thoughtLevel?: unknown; providerId?: unknown } | null;
+  capabilities?: Record<string, unknown> | null;
 }
 
 export interface ModelCatalog {
@@ -506,6 +515,8 @@ export class ModelCatalogService {
       ttlMs?: number;
       /** Injected Z2C semantic client; reuses the existing loopback transport. */
       zcodeModelCatalog?: () => Promise<ZcodeCatalogSnapshot>;
+      dshModelCatalog?: () => Promise<DshNativeCatalog>;
+      dshHealth?: () => Promise<DshNativeIdentity>;
       codexExecutableResolver?: () => string;
       /** Test seam; production constructs the official App Server client. */
       codexClientFactory?: () => Pick<CodexAppServerClient, "initialize" | "request" | "close"> & { initializeResult?: Record<string, unknown> | null };
@@ -687,9 +698,47 @@ export class ModelCatalogService {
     }
   }
 
+  private async fetchDshSection(): Promise<AgentCatalogSection> {
+    const observedAt = nowIso();
+    if (!this.opts.dshModelCatalog || !this.opts.dshHealth) {
+      return { agent: "dsh", source: "dsh-native-adapter:models", runtime_version: null,
+        auth_mode: null, completeness: "unknown", error: "DSH native adapter is not wired",
+        models: [], observed_at: observedAt };
+    }
+    try {
+      const [identity, catalog] = await Promise.all([this.opts.dshHealth(), this.opts.dshModelCatalog()]);
+      if (identity.generation !== catalog.generation) throw new Error("DSH runtime generation changed during model discovery");
+      const models: CatalogModelEntry[] = catalog.groups.flatMap((group) => group.models.map((model) => ({
+        agent: "dsh" as const, provider_id: group.id, provider_label: group.name,
+        model_id: model.id, display_name: model.name,
+        supported_efforts: (model.reasoning?.efforts ?? []).map((item) => ({ effort: item.id, description: item.name ?? null })),
+        default_effort: catalog.default.model === model.id ? catalog.default.reasoningEffort ?? null : null,
+        is_default: catalog.default.provider === group.id && catalog.default.model === model.id,
+        input_modalities: model.inputModalities ?? [], service_tiers: [], hidden: false,
+        deprecation: null, evidence_source: model.multimodalEvidence
+          ? `dsh-native-adapter:models; ${model.multimodalEvidence}` : "dsh-native-adapter:models",
+        observed_at: observedAt, context_window: model.contextWindow ?? null,
+        backend: model.backend ?? null, profile: model.profile ?? null, slot: model.slot ?? null,
+        model_selection_scope: model.slot ? "transactional-global-lease" as const : null,
+        effort_selection_scope: model.slot ? "task-under-lease" as const : null,
+        multimodal_evidence: model.multimodalEvidence ?? null,
+      })));
+      return { agent: "dsh", source: "dsh-native-adapter:models", runtime_version: identity.dshVersion,
+        auth_mode: "authenticated loopback native adapter", completeness: models.length ? "complete" : "partial",
+        error: models.length ? null : "DSH catalog has no models", models, observed_at: observedAt,
+        identity_key: identity.generation,
+        capabilities: { ...identity.capabilities, selection_lease: identity.selectionLease ?? null } };
+    } catch (error) {
+      return { agent: "dsh", source: "dsh-native-adapter:models", runtime_version: null,
+        auth_mode: null, completeness: "unknown", error: sanitizeError(error),
+        models: [], observed_at: observedAt };
+    }
+  }
+
   private fetchSection(agent: CatalogAgent): Promise<AgentCatalogSection> {
     if (agent === "codex") return this.fetchCodexSection();
     if (agent === "antigravity") return this.fetchAgySection();
+    if (agent === "dsh") return this.fetchDshSection();
     return this.fetchZcodeSection();
   }
 
@@ -712,7 +761,7 @@ export class ModelCatalogService {
     // identity key includes the app-server child pid (it changes on every
     // z2c service respawn). Without any identity signal the key degrades to
     // a legacy bucket whose TTL is the only conservative validity bound.
-    return `zcode|${section.identity_key ?? `legacy:${section.runtime_version ?? "unknown"}`}`;
+    return `${agent}|${section.identity_key ?? `legacy:${section.runtime_version ?? "unknown"}`}`;
   }
 
   /** One refresh per agent at a time; concurrent callers share the same promise. */
@@ -758,7 +807,7 @@ export class ModelCatalogService {
       // the observation is read-only, single-flight-deduplicated, and
       // budget-bounded. codex/agy keep TTL caching (their identity signals —
       // executable path/mtimes, auth/config mtimes — ARE locally checkable).
-      const usable = cached && agent !== "zcode" && !options.forceRefresh && Date.now() < cached.expiresAtMs;
+      const usable = cached && agent !== "zcode" && agent !== "dsh" && !options.forceRefresh && Date.now() < cached.expiresAtMs;
       if (usable) {
         // Served from cache: served_at is NOW, but fetched_at / expires_at
         // stay the cached entry's real times — a cache hit never re-extends
@@ -802,7 +851,8 @@ export class ModelCatalogService {
         anyStale = true;
         sections.push({
           agent,
-          source: agent === "codex" ? "codex-app-server:model/list" : agent === "antigravity" ? "agy-cli:models" : "z2c-service:zcode_model_catalog",
+          source: agent === "codex" ? "codex-app-server:model/list" : agent === "antigravity" ? "agy-cli:models"
+            : agent === "dsh" ? "dsh-native-adapter:models" : "z2c-service:zcode_model_catalog",
           runtime_version: null,
           auth_mode: null,
           completeness: "unknown",
@@ -822,7 +872,7 @@ export class ModelCatalogService {
         served_at: nowIso(),
         // zcode evidence is never served from cache (re-observed per request),
         // so it carries no cache validity beyond this response.
-        expires_at: agent === "zcode" ? nowIso() : refreshed ? new Date(refreshed.expiresAtMs).toISOString() : new Date(Date.now() + this.ttlMs).toISOString(),
+        expires_at: agent === "zcode" || agent === "dsh" ? nowIso() : refreshed ? new Date(refreshed.expiresAtMs).toISOString() : new Date(Date.now() + this.ttlMs).toISOString(),
         served_from_stale_cache: undefined,
       });
     }

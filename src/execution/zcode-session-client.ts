@@ -22,6 +22,7 @@ import type { ZcodeModelCatalogToolResult } from "./model-catalog.js";
  */
 
 export const ZCODE_SESSION_EXPECTED_SERVICE = "z2c-service";
+export const ZCODE_SESSION_PROTOCOL = "1";
 
 export class ZcodeSessionError extends Error {
   constructor(
@@ -37,6 +38,8 @@ export class ZcodeSessionError extends Error {
       | "ZCODE_SESSION_OUTCOME_UNKNOWN",
     message: string,
     public readonly upstreamCode?: string,
+    public readonly failureLayer?: string,
+    public readonly nativeSessionState?: "NOT_PERSISTED" | "INACTIVE",
   ) {
     super(message);
     this.name = "ZcodeSessionError";
@@ -221,6 +224,13 @@ export class ZcodeSessionClient {
     const text = (typed.content ?? []).map((part) => (typeof part.text === "string" ? part.text : "")).join("\n");
     if (typed.isError) {
       const cleaned = this.scrub(text);
+      try {
+        const cause = JSON.parse(cleaned) as { error_code?: unknown; safe_message?: unknown; failure_layer?: unknown; native_session_state?: unknown };
+        if (typeof cause.error_code === "string" && /^[A-Z_]{3,64}$/.test(cause.error_code)) {
+          throw new ZcodeSessionError("ZCODE_SESSION_UPSTREAM", typeof cause.safe_message === "string" ? cause.safe_message : "Z2C rejected the operation", cause.error_code, typeof cause.failure_layer === "string" ? cause.failure_layer : undefined,
+            cause.native_session_state === "NOT_PERSISTED" || cause.native_session_state === "INACTIVE" ? cause.native_session_state : undefined);
+        }
+      } catch (error) { if (error instanceof ZcodeSessionError) throw error; }
       const sep = cleaned.indexOf(": ");
       const looksCoded = sep > 0 && /^[A-Z][A-Z0-9_]+$/.test(cleaned.slice(0, sep));
       throw new ZcodeSessionError(
@@ -274,6 +284,11 @@ export class ZcodeSessionClient {
             "ZCODE_SESSION_SERVICE_MISMATCH",
             `expected ${ZCODE_SESSION_EXPECTED_SERVICE} MCP handshake, got ${version?.name ?? "unknown"}`,
           );
+        }
+
+        // Check generation fence: if generation changed during connect, this client is unassigned
+        if (version.version !== ZCODE_SESSION_PROTOCOL) {
+          throw Object.assign(new ZcodeSessionError("ZCODE_SESSION_SERVICE_MISMATCH", "Z2C protocol version mismatch"), { observedVersion: version.version });
         }
 
         // Check generation fence: if generation changed during connect, this client is unassigned
@@ -393,7 +408,9 @@ export class ZcodeSessionClient {
   async ensureGrant(canonicalPath: string, write: boolean): Promise<ZcodeWorkspaceGrant> {
     const existing = await this.findGrantByPath(canonicalPath);
     if (process.env.A2C_ZCODE_DEBUG) console.error(`[zcode-session] findGrantByPath(${canonicalPath}) →`, JSON.stringify(existing));
-    if (existing) return existing;
+    // A read projection must not prevent a later authorized write upgrade.
+    // Never downgrade an existing write grant for an observational call.
+    if (existing && (!write || existing.permissions?.write === true)) return existing;
     let res: Response;
     try {
       res = await fetch(`${this.config.apiBase}/api/workspaces/authorize`, {
@@ -419,11 +436,13 @@ export class ZcodeSessionClient {
   }
 
   async createSession(input: {
+    operation_id?: string;
     workspace_id: string;
     access: "readonly" | "write";
     model?: string;
     thought_level?: string;
     provider?: string;
+    entitlement_plan?: "DEFAULT" | "START" | "INDIVIDUAL";
   }, timeoutMs?: number): Promise<ZcodeSessionState> {
     return (await this.callTool("zcode_session_create", input as Record<string, unknown>, timeoutMs)) as ZcodeSessionState;
   }

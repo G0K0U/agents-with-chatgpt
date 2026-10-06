@@ -135,6 +135,7 @@ describe("persistent per-workspace queue pause", () => {
       workspace_id: workspace.id,
       instruction: "hold the already running writer",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
     });
     for (let i = 0; i < 100 && manager.get(running.taskId).status !== "running"; i++) {
@@ -153,12 +154,14 @@ describe("persistent per-workspace queue pause", () => {
       workspace_id: workspace.id,
       instruction: "first task after the freeze",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
     });
     const secondQueued = manager.submit({
       workspace_id: workspace.id,
       instruction: "second task after the freeze",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
     });
     expect(firstQueued).toMatchObject({ status: "queued", queuePosition: expect.any(Number) });
@@ -196,6 +199,7 @@ describe("persistent per-workspace queue pause", () => {
       workspace_id: firstWorkspace.id,
       instruction: "wait for an explicit queue resume",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
     });
     expect(queued.status).toBe("queued");
@@ -223,6 +227,7 @@ describe("persistent per-workspace queue pause", () => {
       workspace_id: secondWorkspace.id,
       instruction: "run while the first workspace is frozen",
       write_scope: ["src"],
+      network: false,
       run_tests: false,
     });
     expect((await waitForTerminal(independent, independentTask.taskId)).status).toBe("completed");

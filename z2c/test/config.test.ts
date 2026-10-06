@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   parseRegQueryOutput,
   loadConfig,
@@ -52,7 +52,14 @@ describe("ZCode CLI resolution and spawning", () => {
   it("resolves current 0.16.9 on the real machine when installed", () => {
     const cfg = loadConfig();
     assert.ok(existsSync(cfg.zcodeCliPath), `Resolved CLI path should exist: ${cfg.zcodeCliPath}`);
-    assert.match(cfg.zcodeCliPath, /resources[\\/]glm[\\/]zcode\.cjs$/i);
+    // Z2C_ZCODE_CLI is the documented explicit override (highest precedence);
+    // on hosts that pin a dev-tree CLI the default-layout assertion does not
+    // apply. Without the override the packaged 0.16.9 layout must resolve.
+    if (process.env.Z2C_ZCODE_CLI?.trim()) {
+      assert.equal(cfg.zcodeCliPath, resolve(process.env.Z2C_ZCODE_CLI.trim()));
+    } else {
+      assert.match(cfg.zcodeCliPath, /resources[\\/]glm[\\/]zcode\.cjs$/i);
+    }
   });
 
   it("resolves legacy supported layouts when current layout is absent", () => {
@@ -90,12 +97,12 @@ describe("ZCode CLI resolution and spawning", () => {
   });
 
   it("resolves and handles paths containing spaces correctly", () => {
-    const mockAppData = "C:\\Users\\Sample User\\AppData\\Local";
+    const mockAppData = "C:\\Users\\Peter Pan\\AppData\\Local";
     const expected = join(mockAppData, "Programs", "ZCode", "resources", "glm", "zcode.cjs");
     const mockExists = (p: string) => p.toLowerCase() === expected.toLowerCase();
     const resolved = resolveZcodeCliPath({ LOCALAPPDATA: mockAppData }, mockExists);
     assert.equal(resolved, expected);
-    assert.ok(resolved.includes("Sample User"));
+    assert.ok(resolved.includes("Peter Pan"));
 
     // Spawning a JS/CJS CLI with spaces must use node and keep path as a single arg
     const spawnJs = resolveCliSpawn("C:\\Program Files\\ZCode App\\resources\\glm\\zcode.cjs", ["app-server", "--stdio"]);

@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "A2C Local ChatGPT Wake",
+  "version": "0.1.0",
+  "minimum_chrome_version": "120",
+  "permissions": ["alarms", "storage", "scripting"],
+  "host_permissions": ["https://chatgpt.com/*", "http://127.0.0.1/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "options_page": "options.html",
+  "action": { "default_title": "Configure A2C wake" },
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'none'; connect-src http://127.0.0.1:47831" }
+}

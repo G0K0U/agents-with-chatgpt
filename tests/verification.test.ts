@@ -46,7 +46,8 @@ describe("typed bridge verification profiles", () => {
     expect(path.isAbsolute(profile?.executable ?? "")).toBe(true);
     expect(fs.existsSync(profile?.executable ?? "")).toBe(true);
     expect(path.isAbsolute(profile?.argv[0] ?? "")).toBe(true);
-    expect(profile?.argv.some((arg) => /(?:pnpm|corepack|vitest|vite|esbuild|git|powershell|cmd\.exe)/i.test(arg))).toBe(false);
+    // Check executable names, not parent-directory substrings (e.g. a GitHub checkout).
+    expect(profile?.argv.some((arg) => /^(?:pnpm(?:\.cmd)?|corepack(?:\.cmd)?|vitest|vite|esbuild|git(?:\.exe)?|powershell(?:\.exe)?|cmd\.exe)$/i.test(path.basename(arg)))).toBe(false);
   });
 
   it("fails closed when the bridge Node resolution input is unavailable", () => {

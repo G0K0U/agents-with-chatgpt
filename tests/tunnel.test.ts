@@ -22,7 +22,10 @@ import {
 import { hostnameSlug, parseZoneInput, suggestedNamedHostname } from "../src/tunnel/hostname.js";
 import {
   chooseQuickTunnel,
+  cloudflaredCredentialPath,
   isBenignRouteError,
+  inspectNamedTunnelCredentials,
+  namedTunnelCredentialRepairMessage,
   parseCreatedTunnel,
   parseTunnelList,
   provisionNamedTunnel,
@@ -42,6 +45,8 @@ import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
 const stateDirs: string[] = [];
 const previousStateDir = process.env.C2C_STATE_DIR;
 const previousCloudflaredPath = process.env.C2C_CLOUDFLARED_PATH;
+const previousOriginCert = process.env.TUNNEL_ORIGIN_CERT;
+const previousCredentialFile = process.env.TUNNEL_CRED_FILE;
 const QUICK_URL = "https://random-words-here-1234.trycloudflare.com";
 type FetchImpl = NonNullable<CloudflaredQuickTunnelOptions["fetchImpl"]>;
 
@@ -64,6 +69,7 @@ function setupTunnel(fetchImpl: FetchImpl, startTimeoutMs = 1_000) {
     spawnImpl,
     fetchImpl,
     startTimeoutMs,
+    initialHealthDelayMs: 0,
   });
   return { child, spawnImpl, tunnel };
 }
@@ -83,6 +89,10 @@ afterEach(() => {
   else process.env.C2C_STATE_DIR = previousStateDir;
   if (previousCloudflaredPath === undefined) delete process.env.C2C_CLOUDFLARED_PATH;
   else process.env.C2C_CLOUDFLARED_PATH = previousCloudflaredPath;
+  if (previousOriginCert === undefined) delete process.env.TUNNEL_ORIGIN_CERT;
+  else process.env.TUNNEL_ORIGIN_CERT = previousOriginCert;
+  if (previousCredentialFile === undefined) delete process.env.TUNNEL_CRED_FILE;
+  else process.env.TUNNEL_CRED_FILE = previousCredentialFile;
 });
 
 describe("findBinary", () => {
@@ -116,6 +126,31 @@ describe("parseQuickTunnelUrl", () => {
 });
 
 describe("CloudflaredQuickTunnel", () => {
+  it("waits initialHealthDelayMs before the first health probe", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn(async () => healthResponse());
+      const child = new FakeCloudflaredProcess();
+      const spawnImpl = vi.fn(() => child as unknown as ChildProcess);
+      const tunnel = new CloudflaredQuickTunnel(undefined, "cloudflared", {
+        spawnImpl,
+        fetchImpl,
+        startTimeoutMs: 60_000,
+        initialHealthDelayMs: 5_000,
+      });
+      const starting = tunnel.start(3333);
+      child.stderr.write(`INF ${QUICK_URL}\n`);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(starting).resolves.toBe(QUICK_URL);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      await tunnel.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("resolves only after the public health endpoint identifies the bridge", async () => {
     const fetchImpl = vi.fn(async () => healthResponse());
     const { child, spawnImpl, tunnel } = setupTunnel(fetchImpl);
@@ -126,7 +161,7 @@ describe("CloudflaredQuickTunnel", () => {
     expect(spawnImpl).toHaveBeenCalledWith(
       "cloudflared",
       ["tunnel", "--url", "http://127.0.0.1:3333", "--no-autoupdate"],
-      { stdio: ["ignore", "pipe", "pipe"] }
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
     );
     expect(fetchImpl).toHaveBeenCalledWith(`${QUICK_URL}/health`, {
       redirect: "error",
@@ -134,6 +169,21 @@ describe("CloudflaredQuickTunnel", () => {
     });
     expect(tunnel.status()).toMatchObject({ running: true, url: QUICK_URL });
     await tunnel.stop();
+  });
+
+  it("passes --protocol when C2C_TUNNEL_PROTOCOL is set", async () => {
+    vi.stubEnv("C2C_TUNNEL_PROTOCOL", "http2");
+    const { child, spawnImpl, tunnel } = setupTunnel(async () => healthResponse());
+    const starting = tunnel.start(3333);
+    announceUrl(child);
+    await expect(starting).resolves.toBe(QUICK_URL);
+    expect(spawnImpl).toHaveBeenCalledWith(
+      "cloudflared",
+      ["tunnel", "--url", "http://127.0.0.1:3333", "--no-autoupdate", "--protocol", "http2"],
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
+    );
+    await tunnel.stop();
+    vi.unstubAllEnvs();
   });
 
   it("keeps consuming cloudflared errors after the tunnel is ready", async () => {
@@ -218,6 +268,27 @@ describe("CloudflaredQuickTunnel", () => {
     expect(calls).toBe(2);
     expect(cancelBody).toHaveBeenCalledTimes(1);
     await tunnel.stop();
+  });
+});
+
+describe("tunnel transport protocol", () => {
+  it("keeps cloudflared's default when C2C_TUNNEL_PROTOCOL is unset or empty", () => {
+    expect(resolveTunnelProtocol({})).toBeNull();
+    expect(resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "  " })).toBeNull();
+    expect(tunnelProtocolArgs(null)).toEqual([]);
+  });
+
+  it("accepts the cloudflared protocol names case-insensitively", () => {
+    expect(resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "HTTP2" })).toBe("http2");
+    expect(resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: " quic " })).toBe("quic");
+    expect(resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "auto" })).toBe("auto");
+    expect(tunnelProtocolArgs("http2")).toEqual(["--protocol", "http2"]);
+  });
+
+  it("rejects unknown protocols instead of silently falling back", () => {
+    expect(() => resolveTunnelProtocol({ C2C_TUNNEL_PROTOCOL: "tcp" })).toThrow(
+      /C2C_TUNNEL_PROTOCOL must be one of auto, quic, http2/
+    );
   });
 });
 
@@ -1022,8 +1093,9 @@ describe("CloudflaredNamedTunnel external observation without process control", 
 
 describe("C2C_TUNNEL_PROTOCOL", () => {
   it("defaults to auto and passes no protocol flags", () => {
-    expect(resolveTunnelProtocol({})).toBe("auto");
-    expect(tunnelProtocolArgs("auto")).toEqual([]);
+    expect(resolveTunnelProtocol({})).toBeNull();
+    expect(tunnelProtocolArgs(null)).toEqual([]);
+    expect(tunnelProtocolArgs("auto")).toEqual(["--protocol", "auto"]);
   });
 
   it("resolves quic and passes --protocol quic", () => {
@@ -1060,6 +1132,7 @@ describe("C2C_TUNNEL_PROTOCOL", () => {
       spawnImpl,
       fetchImpl,
       startTimeoutMs: 1_000,
+      initialHealthDelayMs: 0,
       env: { C2C_TUNNEL_PROTOCOL: "quic" },
     });
     const starting = tunnel.start(4000);
@@ -1068,7 +1141,7 @@ describe("C2C_TUNNEL_PROTOCOL", () => {
     expect(spawnImpl).toHaveBeenCalledWith(
       "cloudflared",
       ["tunnel", "--url", "http://127.0.0.1:4000", "--no-autoupdate", "--protocol", "quic"],
-      { stdio: ["ignore", "pipe", "pipe"] }
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }
     );
   });
 
@@ -1076,5 +1149,66 @@ describe("C2C_TUNNEL_PROTOCOL", () => {
     const args = namedTunnelLaunchArgs("/path/to/config.yml", "11111111-2222-3333-4444-555555555555", "http2");
     expect(args).toContain("--protocol");
     expect(args).toContain("http2");
+  });
+});
+
+describe("named tunnel credential diagnostics", () => {
+  const tunnelId = "11111111-1111-4111-8111-111111111111";
+
+  it("requires the account certificate before checking tunnel credentials", () => {
+    const dir = makeTmpDir("named-credentials-no-cert");
+    stateDirs.push(dir);
+    process.env.TUNNEL_ORIGIN_CERT = path.join(dir, "missing-cert.pem");
+    process.env.TUNNEL_CRED_FILE = path.join(dir, `${tunnelId}.json`);
+    expect(inspectNamedTunnelCredentials(tunnelId).status).toBe("missing_account_certificate");
+  });
+
+  it("distinguishes a missing tunnel credential from a missing certificate", () => {
+    const dir = makeTmpDir("named-credentials-missing");
+    stateDirs.push(dir);
+    process.env.TUNNEL_ORIGIN_CERT = write(dir, "cert.pem", "synthetic cert");
+    process.env.TUNNEL_CRED_FILE = path.join(dir, `${tunnelId}.json`);
+    expect(inspectNamedTunnelCredentials(tunnelId).status).toBe("missing_credentials");
+    expect(cloudflaredCredentialPath(tunnelId)).toBe(path.join(dir, `${tunnelId}.json`));
+  });
+
+  it("classifies malformed and mismatched credentials without returning their contents", () => {
+    const dir = makeTmpDir("named-credentials-invalid");
+    stateDirs.push(dir);
+    process.env.TUNNEL_ORIGIN_CERT = write(dir, "cert.pem", "synthetic cert");
+    const credential = path.join(dir, `${tunnelId}.json`);
+    process.env.TUNNEL_CRED_FILE = credential;
+
+    write(dir, `${tunnelId}.json`, "not json");
+    expect(inspectNamedTunnelCredentials(tunnelId)).toMatchObject({ status: "invalid_credentials" });
+
+    write(
+      dir,
+      `${tunnelId}.json`,
+      JSON.stringify({ TunnelID: "22222222-2222-4222-8222-222222222222", TunnelSecret: "synthetic" })
+    );
+    expect(inspectNamedTunnelCredentials(tunnelId).status).toBe("mismatched_credentials");
+
+    write(dir, `${tunnelId}.json`, JSON.stringify({ TunnelID: tunnelId }));
+    expect(inspectNamedTunnelCredentials(tunnelId).status).toBe("invalid_credentials");
+
+    process.env.TUNNEL_CRED_FILE = path.join(dir, "credential-directory");
+    fs.mkdirSync(process.env.TUNNEL_CRED_FILE);
+    expect(inspectNamedTunnelCredentials(tunnelId).status).toBe("unreadable_credentials");
+  });
+
+  it("accepts a matching credential and gives bounded repair guidance", () => {
+    const dir = makeTmpDir("named-credentials-ready");
+    stateDirs.push(dir);
+    process.env.TUNNEL_ORIGIN_CERT = write(dir, "cert.pem", "synthetic cert");
+    process.env.TUNNEL_CRED_FILE = path.join(dir, `${tunnelId}.json`);
+    write(
+      dir,
+      `${tunnelId}.json`,
+      JSON.stringify({ TunnelID: tunnelId, TunnelSecret: "synthetic" })
+    );
+    expect(inspectNamedTunnelCredentials(tunnelId).status).toBe("ready");
+    expect(namedTunnelCredentialRepairMessage("missing_credentials")).toContain("cloudflared tunnel token");
+    expect(namedTunnelCredentialRepairMessage("missing_credentials")).not.toContain("synthetic");
   });
 });

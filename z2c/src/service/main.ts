@@ -23,7 +23,7 @@ import { Z2C_PROTOCOL_VERSION } from "../version.js";
  * See docs/z2c-local-service.md for the full lifecycle contract.
  */
 
-const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000];
+const BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 20_000];
 
 interface ServicePidFile {
   version: 1;
@@ -121,12 +121,8 @@ export async function startService(opts?: { port?: number }): Promise<RunningSer
   if (opts?.port) cfg.port = opts.port;
   const stateDir = cfg.stateDir;
 
-  const previous = existingService(stateDir);
-  if (previous) {
-    throw new Error(`Z2C service is already running (pid ${previous.pid}); use 'z2c stop' first`);
-  }
-  const orphans = await cleanupOrphanChildren(stateDir);
-  if (orphans > 0) console.error(`[z2c] cleaned up ${orphans} orphaned app-server child(ren) from a previous crash`);
+  // The listener is the atomic single-owner gate. A recorded PID may have
+  // been reused after reboot, so it cannot prevent startup or authorize a kill.
 
   const audit = new FileAuditLog(join(stateDir, "audit"));
   const store = new Persistence(stateDir);
@@ -138,48 +134,64 @@ export async function startService(opts?: { port?: number }): Promise<RunningSer
   const grants = loadWorkspaceGrants(stateDir);
   const pairing = loadPairing(stateDir);
   const ownership = loadSessionOwnership(stateDir);
-  const sessions = new SessionService({ provider, grants, ownership, audit });
+  const sessions = new SessionService({ provider, grants, ownership, audit, stateDir });
 
-  await provider.start();
-  if (provider.status !== "healthy") {
-    // Fail loudly: no silent degradation, no legacy downgrade.
-    throw new Error(`official provider failed to start: ${provider.statusDetail ?? provider.status}`);
-  }
+  // Cold-start linkage: the durable task engine's workspace registry is synced
+  // from the AUTHORITATIVE grant registry (native ws_* ids) at startup and on
+  // demand for grants created while the service runs, so the A2C native lane
+  // can consistently forward the projected native id instead of relying on
+  // historical id coincidences. Revoked grants are never registered; an
+  // existing engine entry is left untouched.
+  const syncGrantRegistry = (workspaceId?: string): void => {
+    for (const grant of grants.list()) {
+      if (workspaceId !== undefined && grant.workspaceId !== workspaceId) continue;
+      try { workspaces.get(grant.workspaceId); continue; } catch { /* not registered yet */ }
+      try {
+        workspaces.register(grant.workspaceId, grant.canonicalPath, grant.displayName);
+        store.data.workspaces = workspaces.toList();
+        store.save();
+        audit.record("info", "workspace.registered_from_grant", { workspaceId: grant.workspaceId });
+      } catch (error) {
+        audit.record("warn", "workspace.register_from_grant_failed", { workspaceId: grant.workspaceId, error: String((error as Error)?.message ?? error).slice(0, 120) });
+      }
+    }
+  };
+  syncGrantRegistry();
 
   let stopping = false;
   let supervisionTimer: NodeJS.Timeout | undefined;
   let lastRestartAt = 0;
   let backoffIndex = 0;
   let shutdownPromise: Promise<void> | null = null;
+  let restartInFlight = false;
 
   const recordChild = (): void => {
     const pid = provider.childPid;
     if (pid === null) return;
     saveJsonAtomic(join(stateDir, "children.json"), { version: 1, children: [{ pid, recordedAt: Date.now() }] });
   };
-  recordChild();
 
   const restartProvider = async (): Promise<void> => {
+    restartInFlight = true;
     audit.record("warn", "service.provider_restart", { attempt: backoffIndex + 1, status: provider.status });
     try {
       await provider.stop();
       await provider.start();
-      backoffIndex = 0;
       recordChild();
     } catch {
-      backoffIndex = Math.min(backoffIndex + 1, BACKOFF_MS.length - 1);
-    }
+      // Readiness remains degraded and readable.
+    } finally { backoffIndex++; restartInFlight = false; }
   };
 
   // Supervision: bounded-backoff restart of the official provider when it
   // degrades. No legacy downgrade, no unlimited spin.
   supervisionTimer = setInterval(() => {
-    if (stopping || provider.status === "healthy") return;
+    if (stopping || provider.status === "healthy" || restartInFlight || backoffIndex >= BACKOFF_MS.length) return;
     if (Date.now() - lastRestartAt >= BACKOFF_MS[backoffIndex]!) {
       lastRestartAt = Date.now();
       void restartProvider();
     }
-  }, 10_000);
+  }, 1_000);
 
   const shutdown = (): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
@@ -206,12 +218,19 @@ export async function startService(opts?: { port?: number }): Promise<RunningSer
     grants,
     ownership,
     audit,
+    ensureWorkspaceRegistered: (workspaceId) => syncGrantRegistry(workspaceId),
     onShutdownRequest: () => void shutdown().then(() => process.exit(0)),
   });
   await new Promise<void>((resolve, reject) => {
     service.httpServer.once("error", (err) => reject(err));
     service.httpServer.listen(cfg.port, cfg.host, () => resolve());
   });
+  // Health must remain readable during missing credentials/provider startup.
+  // Only the bound listener may launch a child; no second service can race it.
+  restartInFlight = true;
+  try { await provider.start(); recordChild(); }
+  catch { audit.record("warn", "service.provider_degraded", { status: provider.status }); }
+  finally { restartInFlight = false; }
 
   const pidFile: ServicePidFile = { version: 1, pid: process.pid, installId: security.state.installId, startedAt: Date.now(), port: cfg.port, protocolVersion: Z2C_PROTOCOL_VERSION };
   saveJsonAtomic(pidFilePath(stateDir), pidFile);

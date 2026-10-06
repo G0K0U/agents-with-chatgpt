@@ -14,6 +14,7 @@ import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { CodexTaskManagerPool } from "../execution/pool.js";
 import { ModelCatalogService } from "../execution/model-catalog.js";
+import { DshNativeClient } from "../execution/dsh-native-client.js";
 import { zcodeSessionClient } from "../mcp/zcode-session-tools.js";
 import { EngineeringAiAuditMaintainer } from "../execution/audit-maintenance.js";
 import { startZcodeCoordinatorFromEnvironment, type ZcodeCoordinator } from "../execution/zcode-coordinator.js";
@@ -26,11 +27,12 @@ import type { TunnelProvider } from "../tunnel/provider.js";
 import { waitForPublicMcp, type PublicFetch, type PublicProbeResult } from "../tunnel/probe.js";
 import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { reconcileUnknownWorkspaceSlots } from "../execution/slot.js";
+import { localWakeSecret, pendingWakeEvents, startChatWake } from "../execution/chat-wake.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT, resolveStateDir, writeSecureJson } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
-import { currentRuntimeDir, resolveRuntimeIdentity, type RuntimeIdentity } from "./runtime-identity.js";
+import { currentRuntimeDir, installationRoot, resolveRuntimeIdentity, type RuntimeIdentity } from "./runtime-identity.js";
 import {
   acquireStateDomainOwner,
   resolveOwnedAuthStorage,
@@ -38,6 +40,9 @@ import {
   type StateDomainOwner,
 } from "./state-owner.js";
 import type { BridgeProcessInspector } from "./runtime.js";
+import { dispatchPolicyStatus, pauseProductDispatch, productDispatchPaused, resumeProductDispatch } from "../config/dispatch-policy.js";
+import { ControlPlaneLifecycle } from "./control-plane.js";
+import { ControlPlaneError, safeCause } from "./control-plane-error.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger, stateDir: string, expectedReleaseId?: string): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId, stateDir));
@@ -115,7 +120,7 @@ export interface Bridge {
   close(): Promise<void>;
 }
 
-const BRIDGE_REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const BRIDGE_REPOSITORY_ROOT = installationRoot();
 
 /**
  * Listen on the preferred port; on EADDRINUSE fall back to an ephemeral port.
@@ -149,7 +154,15 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
   }
-  const registry = new WorkspaceRegistry({ file: opts.workspaceRegistryFile, stateDir });
+  let registry: WorkspaceRegistry;
+  let registryFailure: unknown;
+  try { registry = new WorkspaceRegistry({ file: opts.workspaceRegistryFile, stateDir }); }
+  catch (error) {
+    registryFailure = new ControlPlaneError("WORKSPACE_REGISTRY_UNAVAILABLE", "workspace_registry", "bridge");
+    logger.error("Workspace registry unavailable", safeCause(registryFailure));
+    // Empty runtime projection only: never replace corrupt durable grants.
+    registry = new WorkspaceRegistry({ initial: [], stateDir });
+  }
   const bridgeRoot = new Workspace(BRIDGE_REPOSITORY_ROOT);
   const bootstrapEntries = [
     {
@@ -161,7 +174,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   if (bridgeRoot.id !== workspace.id) {
     bootstrapEntries.push({ name: "a2c-bridge", canonicalPath: bridgeRoot.root, id: bridgeRoot.id });
   }
-  registry.bootstrap(bootstrapEntries);
+  if (!registryFailure) registry.bootstrap(bootstrapEntries);
   const authorizedWorkspaceIds = registry.enabledIds().filter((workspaceId) => {
     try {
       registry.getWorkspace(workspaceId);
@@ -194,7 +207,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     stateDir,
     legacyFiles: legacyAuthFiles,
     authorizedWorkspaceIds,
-    migrateLegacyWorkspaceBindings: true,
+    migrateLegacyWorkspaceBindings: !registryFailure,
     generationFence: stateOwner,
     legacyFilesReadOnly: Boolean(ownedAuthStorage),
   });
@@ -243,6 +256,8 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     workspaceRoot: bridgeRoot.root,
     stateDir,
     zcodeModelCatalog: () => zcodeSessionClient().modelCatalog(),
+    dshModelCatalog: () => new DshNativeClient().modelCatalog(),
+    dshHealth: () => new DshNativeClient().health(),
   });
 
   const taskManagers = new CodexTaskManagerPool(registry, sessions, {
@@ -295,7 +310,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   // Test-style bridges (persistRuntime: false) never auto-start it so tests
   // can never write worker-state into a real configured queue root.
   let zcodeCoordinator: ZcodeCoordinator | undefined;
-  const wantCoordinator = opts.zcodeCoordinator ?? opts.persistRuntime !== false;
+  const wantCoordinator = !productDispatchPaused(stateDir) && (opts.zcodeCoordinator ?? opts.persistRuntime !== false);
   if (wantCoordinator) {
     try {
       zcodeCoordinator = startZcodeCoordinatorFromEnvironment({
@@ -314,6 +329,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   }
 
   let publicBaseUrl: string | null = null;
+  let lastAuthenticatedMcpAt: number | null = null;
   let publicProbe: PublicProbeResult | null = null;
 
   // Deterministic runtime identity: which source tree produced the code this
@@ -341,9 +357,27 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     return `${proto}://${hostHeader}`;
   };
 
+  const controlPlane = new ControlPlaneLifecycle({
+    stateDir, workspace, registry, registryFailure, generation: stateOwner?.generation,
+    routeReady: async () => {
+      // A current-generation authenticated MCP request is authoritative route
+      // evidence even when the deployment uses the host relay, not a public URL.
+      if (lastAuthenticatedMcpAt !== null && Date.now() - lastAuthenticatedMcpAt < 90_000) return true;
+      const saved = namedTunnelBinding(readTunnelState(workspace.id, stateDir));
+      const base = publicBaseUrl ?? (saved ? `https://${saved.hostname}` : null);
+      if (!base) return false;
+      try {
+        const response = await fetch(`${base}/health`, { signal: AbortSignal.timeout(4000), redirect: "error" });
+        const remote = await response.json() as { instanceId?: unknown; service?: unknown };
+        return response.ok && remote.instanceId === instanceId && remote.service === SERVICE_NAME;
+      } catch { return false; }
+    },
+  });
+
   // ---- Health (public but minimal) ---------------------------------------
 
   app.get("/health", (_req, res) => {
+    const health = controlPlane.snapshot();
     res.setHeader("Cache-Control", "no-store");
     res.json({
       service: SERVICE_NAME,
@@ -352,6 +386,8 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
       workspaceId: workspace.id,
       workspaceCount: authorizedWorkspaceIds.length,
       status: "ok",
+      ready: health.READY,
+      control_plane: { READY_STATE: health.READY_STATE, LAST_ERROR_CODE: health.LAST_ERROR_CODE, LAST_FAILURE_LAYER: health.LAST_FAILURE_LAYER, GENERATION: health.GENERATION },
       release: releaseSummary,
     });
   });
@@ -384,6 +420,8 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
       fullAccess: opts.fullAccess,
       oneDriveRoot: opts.oneDriveRoot,
       modelCatalog,
+      controlPlaneHealth: () => controlPlane.snapshot(),
+      registryFailure,
     }),
     logger
   );
@@ -396,8 +434,11 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
       authorizedWorkspaceIds,
       getBaseUrl,
       logger,
+      allowUnboundHealth: Boolean(registryFailure),
     }),
     (req: Request, res: Response) => {
+      lastAuthenticatedMcpAt = Date.now();
+      if (opts.persistRuntime !== false) void controlPlane.authenticatedRouteObserved(lastAuthenticatedMcpAt).catch(() => undefined);
       void mcpHandler(req, res);
     }
   );
@@ -422,6 +463,30 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     const session = pairing.create();
     logger.info("Created pairing session");
     res.json({ code: session.code, expiresAt: session.expiresAt });
+  });
+  app.get("/admin/dispatch-policy", adminGuard, (_req, res) => {
+    res.json(dispatchPolicyStatus(stateDir));
+  });
+  app.post("/admin/dispatch-policy", adminGuard, express.json({ limit: "4kb" }), (req, res) => {
+    const action = req.body?.action;
+    if (action !== "pause" && action !== "resume") { res.status(400).json({ error_code: "INVALID_ACTION" }); return; }
+    try {
+      stateOwner?.assertCurrent();
+      if (action === "pause") pauseProductDispatch(stateDir); else resumeProductDispatch(stateDir);
+      const status = dispatchPolicyStatus(stateDir);
+      const blocked = action === "resume" && status.envOverride.active;
+      logger.info(`Operator dispatch policy: ${action}; effectivePaused=${status.effectivePaused}; envOverride=${status.envOverride.active}`);
+      res.status(blocked ? 409 : 200).json({ ...status, ok: !blocked,
+        error_code: blocked ? "ENV_OVERRIDE_ACTIVE" : null,
+        restartRequired: blocked,
+        managedProviderRestartRequired: action === "resume" });
+    } catch {
+      res.status(503).json({ ok: false, error_code: "POLICY_WRITE_FAILED", ...dispatchPolicyStatus(stateDir) });
+    }
+  });
+  app.get("/admin/health", adminGuard, async (req, res) => {
+    if (req.query.reconcile === "1") await controlPlane.reconcile();
+    res.json(controlPlane.snapshot());
   });
 
   app.post("/admin/continuation", adminGuard, express.json({ limit: "128kb" }), async (req, res) => {
@@ -535,6 +600,27 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
   const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
+  // ---- Chat-wake sidecar (loopback-only dedicated listener) ------------------
+  // Serving WAITING_AUDIT wake events to the browser extension. Never mounted
+  // on the public bridge; bearer-secret-gated; a busy port (another
+  // workspace's sidecar already on 47831) must never take the bridge down.
+  let chatWake: Awaited<ReturnType<typeof startChatWake>> | null = null;
+  if (opts.persistRuntime !== false) {
+    try {
+      const wakeDir = path.join(stateDir, "chat-wake");
+      chatWake = await startChatWake({
+        dir: wakeDir,
+        secret: localWakeSecret(wakeDir),
+        pending: () => pendingWakeEvents(stateDir, workspace.id),
+        port: Number(process.env.A2C_CHAT_WAKE_PORT ?? 47831),
+      });
+      logger.info(`Chat-wake sidecar listening on 127.0.0.1:${chatWake.port}`);
+    } catch (error) {
+      chatWake = null;
+      logger.warn(`Chat-wake sidecar unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   const persistRuntime = (): void => {
     if (opts.persistRuntime === false) return;
     const state: RuntimeState = {
@@ -555,12 +641,14 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
     writeRuntimeState(state, stateDir);
   };
   persistRuntime();
+  if (opts.persistRuntime !== false) controlPlane.start();
 
   let closed = false;
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
     try {
+      await controlPlane.close();
       // Stop claiming new scheduled-queue work before anything else rejects
       // submissions; the coordinator finalizes its own heartbeat state.
       await zcodeCoordinator?.stop().catch((error) => {
@@ -581,6 +669,7 @@ async function startBridgeInternal(opts: BridgeOptions, stateOwner?: StateDomain
           );
         });
       }
+      await chatWake?.close().catch(() => undefined);
       await tunnel.stop().catch(() => undefined);
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (opts.persistRuntime !== false) clearRuntimeState(workspace.id, {

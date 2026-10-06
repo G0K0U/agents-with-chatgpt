@@ -31,3 +31,14 @@ jobs:
           # Hosted Windows TEMP may be an 8.3 alias. Use the canonical runner temp.
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
+      - run: npm ci
+        working-directory: z2c
+      - run: npm run typecheck
+        working-directory: z2c
+      - run: npm run build
+        working-directory: z2c
+      - run: npm test
+        working-directory: z2c
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}

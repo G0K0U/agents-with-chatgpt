@@ -144,6 +144,47 @@ export function stateSubdir(name: string): string {
 }
 
 /**
+ * Windows briefly denies the replace-rename with EPERM/EACCES/EBUSY while
+ * another process holds a handle on the destination without FILE_SHARE_DELETE
+ * (e.g. the fs.realpathSync.native window in readRestartHandoff's regular()
+ * guard). Retry the identical atomic replace with bounded backoff — never
+ * unlink the destination, never retry indefinitely; persistent failures
+ * rethrow. Mirrors the rename retry already used for lock quarantine.
+ */
+// A hot restart-status reader can continuously reopen the destination for
+// longer than 335ms. Keep the last committed file intact throughout a bounded
+// 2.4s retry window; exhausted retries still propagate the sharing violation.
+const RENAME_BUSY_RETRY_DELAYS_MS = [10, 25, 50, 100, 150, 250, 400, 600, 800];
+
+function isBusyRenameCode(code: string | undefined): boolean {
+  return code === "EPERM" || code === "EACCES" || code === "EBUSY";
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function renameReplace(temporary: string, file: string): void {
+  try {
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    if (!isBusyRenameCode((error as NodeJS.ErrnoException).code)) throw error;
+    let last = error;
+    for (const delay of RENAME_BUSY_RETRY_DELAYS_MS) {
+      sleepSync(delay);
+      try {
+        fs.renameSync(temporary, file);
+        return;
+      } catch (retry) {
+        if (!isBusyRenameCode((retry as NodeJS.ErrnoException).code)) throw retry;
+        last = retry;
+      }
+    }
+    throw last;
+  }
+}
+
+/**
  * Write a JSON file with owner-only permissions.
  *
  * State files are read by a second bridge process after a restart.  Writing
@@ -167,7 +208,7 @@ export function writeSecureJson(file: string, data: unknown, options: { durable?
       // best effort on platforms without chmod semantics
     }
     try {
-      fs.renameSync(temporary, file);
+      renameReplace(temporary, file);
     } catch (error) {
       if (options.durable) throw error; // Never delete the last durable intent.
       // Node replaces regular files atomically on POSIX and current Windows

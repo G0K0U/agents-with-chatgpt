@@ -4,8 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
-import { AntigravityBackend, projectAntigravityFailure } from "../src/execution/antigravity.js";
+import { spawn, execSync, execFile, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  AntigravityBackend,
+  projectAntigravityFailure,
+  canonicalizeAntigravityModel,
+  extractAntigravityFailureDetails,
+  parseAntigravityDuration,
+  resolveAntigravityModelEvidence,
+} from "../src/execution/antigravity.js";
 import type { BackendExecutionRequest } from "../src/execution/backend.js";
 import { CodexTaskManager } from "../src/execution/tasks.js";
 import type { VerificationProfile } from "../src/execution/verification.js";
@@ -14,7 +22,9 @@ import { Workspace } from "../src/workspace/manager.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, spawn: vi.fn(), execSync: vi.fn(() => Buffer.from("")) };
+  const file = vi.fn();
+  Object.defineProperty(file, Symbol.for("nodejs.util.promisify.custom"), { value: vi.fn() });
+  return { ...actual, spawn: vi.fn(), execFile: file, execSync: vi.fn(() => Buffer.from("")) };
 });
 const roots: string[] = [];
 const childExits: (number | null)[] = [];
@@ -93,6 +103,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   vi.mocked(spawn).mockReset();
+  vi.mocked(promisify(execFile)).mockReset();
   childExits.length = 0;
   for (const root of roots.splice(0)) {
     const resolved = path.resolve(root);
@@ -102,6 +113,36 @@ afterEach(() => {
 });
 
 describe("G3 Antigravity full-workspace contract", () => {
+  it.each([
+    { model: "claude-opus-5-5-low", listing: "claude-opus-5-5-low\tLow\nclaude-opus-5-5-high\tHigh", code: "EFFORT_POLICY_VIOLATION" },
+    { model: "claude-opus-5-5-high", listing: "gemini-3.8-flash-high\tHigh", code: "HIGHEST_EFFORT_UNVERIFIED" },
+    { model: "claude-opus-5-5-high", listing: null, code: "HIGHEST_EFFORT_UNVERIFIED" },
+  ])("does not launch Opus inference when its live highest-effort contract fails: $code / $model", async ({ model, listing, code }) => {
+    const { backend, request } = fixture();
+    const query = vi.mocked(promisify(execFile));
+    if (listing === null) query.mockRejectedValue(new Error("synthetic-private-account-diagnostic"));
+    else query.mockResolvedValue({ stdout: listing, stderr: "" });
+    const result = await backend.execute({ ...request, model });
+    expect(query).toHaveBeenCalledWith(process.execPath, ["models"], expect.objectContaining({ timeout: 15000, windowsHide: true }));
+    expect(result).toMatchObject({ status: "failed", actualProvider: null, actualModel: "UNKNOWN", error: { code } });
+    expect(JSON.stringify(result)).not.toContain("synthetic-private-account-diagnostic");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("launches the exact live Opus high model and preserves observed identity", async () => {
+    const { backend, request } = fixture();
+    const model = "claude-opus-5-5-high";
+    vi.mocked(promisify(execFile)).mockResolvedValue({ stdout: `${model}\tClaude Opus 5.5 High`, stderr: "" });
+    const child = manualChild();
+    const pending = backend.execute({ ...request, model });
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    const argv = vi.mocked(spawn).mock.calls[0][1] as string[];
+    expect(argv[argv.indexOf("--model") + 1]).toBe(model);
+    child.stdout.write(JSON.stringify({ type: "init", session_id: "opus-contract-session", model }) + "\n");
+    child.stdout.write(JSON.stringify({ type: "result", result: { status: "SUCCESS", response: "fixture completed" } }) + "\n");
+    child.emit("close", 0);
+    expect(await pending).toMatchObject({ status: "completed", requestedModel: model, actualProvider: "antigravity", actualModel: model });
+  });
   it("uses the constructor startup timeout while the child remains pre-session", async () => {
     const { parent, request } = fixture();
     const backend = new AntigravityBackend({ executablePath: process.execPath, stateDir: path.join(parent, "timeout-state"), sessionStartupTimeoutMs: 50 });
@@ -542,6 +583,45 @@ describe("G3 Antigravity full-workspace contract", () => {
     expect(projectAntigravityFailure("exit code 2 token=fixture-secret")).toBe("CLI_EXIT_UNCLASSIFIED");
     expect(projectAntigravityFailure("unknown flag: --private=fixture-secret")).toBe("INVALID_ARGUMENTS");
     expect(projectAntigravityFailure("workspace does not exist: private-path")).toBe("WORKSPACE_UNAVAILABLE");
+  });
+
+  it("classifies real-world quota wording without misreading auth errors", () => {
+    expect(projectAntigravityFailure("quota exhausted for today, resets in 5h 30m")).toBe("QUOTA_EXHAUSTED");
+    expect(projectAntigravityFailure("You have reached your usage limit")).toBe("QUOTA_EXHAUSTED");
+    expect(projectAntigravityFailure("Account usage limit exceeded, please retry later")).toBe("QUOTA_EXHAUSTED");
+    expect(projectAntigravityFailure("insufficient_quota: You exceeded your current quota")).toBe("QUOTA_EXHAUSTED");
+    expect(projectAntigravityFailure("HTTP 429: too many requests")).toBe("RATE_LIMITED");
+    expect(projectAntigravityFailure("fatal error: panic: runtime error")).toBe("CRASH");
+    // Auth evidence wins even when the message also mentions quota/limits.
+    expect(projectAntigravityFailure("authentication failed: usage limit exceeded")).toBe("AUTH_ERROR");
+    expect(projectAntigravityFailure("unauthorized: quota exhausted")).toBe("AUTH_ERROR");
+    // Model identity dominates a combined model+quota sentence (test parity).
+    expect(projectAntigravityFailure("model gemini-unknown not found or quota exhausted")).toBe("MODEL_UNAVAILABLE");
+  });
+
+  it("model evidence comes from real artifacts; unknown effort stays null, never a status string", () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-g3-test-"));
+    roots.push(parent);
+    // Protocol echo of a base model id keeps the decimal version and leaves effort unset.
+    expect(resolveAntigravityModelEvidence({ protocolModel: "gemini-3.8-flash", isolatedHome: parent }))
+      .toMatchObject({ modelId: "gemini-3.8-flash", effort: null, effortStatus: "unverified" });
+    expect(resolveAntigravityModelEvidence({ protocolModel: "gemini-3.8-flash-high", isolatedHome: parent }))
+      .toMatchObject({ modelId: "gemini-3.8-flash-high", effort: "high", effortStatus: "verified" });
+    // CLI log lines: full label keeps the decimal version; a base-model line must not invent effort.
+    const logDir = path.join(parent, ".gemini", "antigravity-cli", "log");
+    fs.mkdirSync(logDir, { recursive: true });
+    const fullLabelLog = path.join(logDir, "cli-1.log");
+    fs.writeFileSync(fullLabelLog, 'Propagating selected model override to backend: label="Gemini 3.8 Flash High"\n');
+    const stale = new Date(Date.now() - 60_000);
+    fs.utimesSync(fullLabelLog, stale, stale);
+    fs.writeFileSync(path.join(logDir, "cli-2.log"), 'Print mode: starting (model="gemini-3.8-flash")\n');
+    // Recent logs without exact conversation ownership are not evidence.
+    expect(resolveAntigravityModelEvidence({ isolatedHome: parent })).toBeNull();
+    expect(resolveAntigravityModelEvidence({ isolatedHome: parent, startedAt: Date.now() - 120_000, protocolModel: null })).toBeNull();
+    const conversationId = "12345678-1234-1234-1234-123456789abc";
+    fs.writeFileSync(path.join(logDir, "cli-3.log"), `${conversationId} Print mode: starting (model="gemini-3.8-flash")\n`);
+    expect(resolveAntigravityModelEvidence({ isolatedHome: parent, conversationId }))
+      .toMatchObject({ modelId: "gemini-3.8-flash", effort: null, effortStatus: "unverified", evidenceSource: "cli_log" });
   });
 
   it("isolated config serializes only policy and scrubs synthetic bridge credentials", () => {

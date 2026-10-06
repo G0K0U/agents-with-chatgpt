@@ -68,6 +68,7 @@ function makeHarness(opts: {
   const spawnCalls: Array<{ cmd: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv }> = [];
   const healthyProbes: Partial<SupervisorProbes> = {
     bridgeHealth: async () => ({
+      ready: true,
       workspaceId: "111111111111",
       releaseId: "0.2.0-deadbeef",
       sourceParity: "ok",
@@ -434,9 +435,10 @@ describe("takeover bootstrap (R1.1)", () => {
 
 describe("R1.1 registration layout compatibility", () => {
   it("derives the same registration file name the Z2C proxy publishes", () => {
-    // Golden value for a synthetic workspace (the proxy hashes lower-cased cwd).
-    const file = registrationPathFor("F:\\ExampleWork\\codex-with-chatgpt", { LOCALAPPDATA: "C:\\u" } as NodeJS.ProcessEnv);
-    expect(file.toLowerCase()).toBe("c:\\u\\z2c\\desktop-agents\\agent-30358ad5b5f74dca.json");
+    // Golden value from the live registration on this machine for the
+    // supervised workspace (the proxy hashes the lower-cased cwd).
+    const file = registrationPathFor("F:\\AI Startup\\codex-with-chatgpt", { LOCALAPPDATA: "C:\\u" } as NodeJS.ProcessEnv);
+    expect(file.toLowerCase()).toBe("c:\\u\\z2c\\desktop-agents\\agent-24ed64cef8d57d1c.json");
   });
 });
 

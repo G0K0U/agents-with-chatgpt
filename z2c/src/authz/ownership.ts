@@ -18,6 +18,13 @@ export interface OwnedSession {
   accessMode: WorkspaceAccess;
   createdAt: number;
   lastUsedAt: number;
+  /**
+   * Set when the runtime reports the session no longer active (e.g. after a
+   * runtime/app-server restart invalidated pre-restart sessions). A stale
+   * record keeps its history for audit but is demoted from "current truth";
+   * any successful live use clears it.
+   */
+  staleAt?: number;
 }
 
 interface OwnershipState {
@@ -39,6 +46,8 @@ export interface SessionOwnership {
    *  a paired client only its own (sharing is a future explicit action). */
   assertCanAccess(principal: Principal, sessionId: string, access: WorkspaceAccess): OwnedSession;
   touch(sessionId: string): void;
+  /** Demote a session the authoritative runtime reports as no longer active. */
+  markStale(sessionId: string): void;
   forget(sessionId: string): void;
   listFor(principal: Principal): OwnedSession[];
 }
@@ -85,6 +94,18 @@ export function loadSessionOwnership(stateDir: string): SessionOwnership {
       const owned = state.sessions.find((s) => s.sessionId === sessionId);
       if (owned) {
         owned.lastUsedAt = Date.now();
+        // Any successful live use clears a previous stale demotion: the
+        // runtime has positively served this session again.
+        if (owned.staleAt !== undefined) {
+          delete owned.staleAt;
+        }
+        save();
+      }
+    },
+    markStale(sessionId) {
+      const owned = state.sessions.find((s) => s.sessionId === sessionId);
+      if (owned && owned.staleAt === undefined) {
+        owned.staleAt = Date.now();
         save();
       }
     },

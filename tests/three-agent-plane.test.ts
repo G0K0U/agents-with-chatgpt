@@ -30,9 +30,10 @@ import { saveExecutionOutput } from "../src/execution/output.js";
  */
 
 const TEST_TOKEN = "z2cs_three_agent_test_token_0123456789";
-const WS_ENG_PATH = "f:\\examplework\\engineering-ai";
-const WS_OTHER_PATH = "f:\\examplework\\other-project";
+const WS_ENG_PATH = "f:\\ai startup\\engineering-ai";
+const WS_OTHER_PATH = "f:\\ai startup\\other-project";
 const EXTERNAL_DESKTOP_ID = "sess_00000000-aaaa-bbbb-cccc-111111111111";
+const LEGACY_DESKTOP_ID = "sess_00000000-aaaa-bbbb-cccc-222222222222";
 
 const fakeState = {
   serverUrl: "",
@@ -44,6 +45,8 @@ const fakeState = {
       { info: { role: "assistant" }, parts: [{ type: "thinking", text: "PRIVATE_THOUGHT_LEAK_TEST" }] },
     ]],
   ]),
+  /** session_id → upstream coded error injected by zcode_session_observe. */
+  observeErrors: new Map<string, string>(),
   discover: [
     {
       session_id: EXTERNAL_DESKTOP_ID,
@@ -52,6 +55,20 @@ const fakeState = {
       status: "idle",
       title: "manual desktop session",
       updated_at: "2026-09-22T04:00:00.000Z",
+      controlled_by_z2c: false,
+      owner_client_id: null,
+      access_mode: null,
+      runtime_origin: "external",
+    },
+    {
+      // Legacy session: discovery-listed but the runtime no longer considers
+      // it live-readable (pre-restart app-server generation).
+      session_id: LEGACY_DESKTOP_ID,
+      workspace_id: "ws_grant_eng",
+      workspace_path: WS_ENG_PATH,
+      status: "idle",
+      title: "pre-restart desktop session",
+      updated_at: "2026-09-21T04:00:00.000Z",
       controlled_by_z2c: false,
       owner_client_id: null,
       access_mode: null,
@@ -182,6 +199,8 @@ async function startFakeService(): Promise<void> {
         return toolResult({ sessions: fakeState.discover.concat(createdEntries) });
       });
       mcp.registerTool("zcode_session_observe", { inputSchema: { workspace_id: z.string(), session_id: z.string() } }, async (args) => {
+        const injected = fakeState.observeErrors.get(args.session_id);
+        if (injected) return upstreamError(injected);
         return toolResult({
           session_id: args.session_id,
           workspace_id: args.workspace_id,
@@ -197,6 +216,8 @@ async function startFakeService(): Promise<void> {
       mcp.registerTool("zcode_session_observe_messages", {
         inputSchema: { workspace_id: z.string(), session_id: z.string(), limit: z.number().optional() },
       }, async (args) => {
+        const injected = fakeState.observeErrors.get(args.session_id);
+        if (injected) return upstreamError(injected);
         const msgs = fakeState.nativeMessages.get(args.session_id) ?? [];
         return toolResult({ messages: msgs });
       });
@@ -379,6 +400,40 @@ describe("Three-Agent Session/Activity Plane", () => {
     const jsonStr = JSON.stringify(msgData);
     assert.ok(!jsonStr.includes("PRIVATE_THOUGHT_LEAK_TEST"), "hidden reasoning must never leak");
     assert.ok(!jsonStr.includes("thinking"), "thinking role must never appear in visible messages");
+  });
+
+  // ── Acceptance: legacy (pre-restart) ZCode sessions read coherently ──
+  it("projects a discovery-listed legacy session as stale-runtime, and lane failures as errors — never as fake health", async () => {
+    // Legacy session: discovery-listed, but the runtime answers every exact
+    // read with the session-level "not associated" denial.
+    fakeState.observeErrors.set(LEGACY_DESKTOP_ID,
+      "SESSION_NOT_FOUND: session sess_00000000… is not associated with this workspace");
+    try {
+      const readRes = await callTool("agent_session_read", { session_id: LEGACY_DESKTOP_ID }, authInfo("client-observer", ["ws_eng"]));
+      assert.equal(readRes.isError, undefined, readRes.content.map((c) => c.text).join());
+      const readData = dataOf(readRes) as { live_read_status?: string; last_live_error?: string | null };
+      assert.equal(readData.live_read_status, "stale-runtime", "legacy session must read as stale-runtime, not error");
+      assert.ok(readData.last_live_error?.includes("not live-readable"), readData.last_live_error ?? "");
+
+      const msgRes = await callTool("agent_session_messages", { session_id: LEGACY_DESKTOP_ID }, authInfo("client-observer", ["ws_eng"]));
+      assert.equal(msgRes.isError, undefined);
+      const msgData = dataOf(msgRes) as { live_read_status?: string; messages_readable?: boolean; messages: unknown[] };
+      assert.equal(msgData.live_read_status, "stale-runtime");
+      assert.equal(msgData.messages_readable, false);
+      assert.deepEqual(msgData.messages, []);
+
+      // Lane-level failure (z2c observation surface temporarily unavailable):
+      // stays a plain error so a downed lane is never mistaken for a legacy session.
+      fakeState.observeErrors.set(EXTERNAL_DESKTOP_ID,
+        "SESSION_READ_UNAVAILABLE: session state read is temporarily unavailable (lane failure, not a session answer)");
+      const laneRes = await callTool("agent_session_read", { session_id: EXTERNAL_DESKTOP_ID }, authInfo("client-observer", ["ws_eng"]));
+      assert.equal(laneRes.isError, undefined);
+      const laneData = dataOf(laneRes) as { live_read_status?: string };
+      assert.equal(laneData.live_read_status, "error", "lane failures must stay errors");
+    } finally {
+      fakeState.observeErrors.delete(LEGACY_DESKTOP_ID);
+      fakeState.observeErrors.delete(EXTERNAL_DESKTOP_ID);
+    }
   });
 
   // ── Acceptance 1 & 5: Mixed-agent aggregation across Codex, Gemini, ZCode ──
