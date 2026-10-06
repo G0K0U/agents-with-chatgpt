@@ -1,4 +1,4 @@
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 /**
  * A2C (Agents-to-ChatGPT) is the shared platform name. C2C (Codex-to-ChatGPT)
  * refers ONLY to the Codex provider lane. The bridge service name moved to

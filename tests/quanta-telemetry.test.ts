@@ -51,7 +51,7 @@ describe("Quanta Usage Telemetry Client & Normalization", () => {
       label: "Antigravity",
       available: true,
       plan: "Ultra Pro",
-      email: "sample@example.invalid",
+      email: "personal-google@gmail.com",
       windows: [
         {
           label: "Gemini 5h窗口",
@@ -202,7 +202,7 @@ describe("Quanta Usage Telemetry Client & Normalization", () => {
 
     expect(serialized).not.toContain("user-secret@example.com");
     expect(serialized).not.toContain("stale-account@example.com");
-    expect(serialized).not.toContain("sample@example.invalid");
+    expect(serialized).not.toContain("personal-google@gmail.com");
     expect(serialized).not.toContain("valid-secret-token");
   });
 

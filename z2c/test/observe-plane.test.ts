@@ -34,7 +34,7 @@ const ATTESTATION: Omit<SessionStateAttestation, "sessionId" | "workspaceKey" | 
   bindingSource: "official-session-read",
   runtimeVersion: "0.16.9",
   status: "idle",
-  observedAt: "test",
+  observedAt: "test",  availableModels: [{ providerId: "zai-api", modelId: "GLM-5.3-Flash", reasoningLevels: ["low", "high", "max"], reasoningDefaultLevel: "max" }],
 };
 
 class ObserveFakeProvider {
@@ -62,12 +62,17 @@ class ObserveFakeProvider {
       .map((s) => ({ ...s }));
   }
   async readSessionState(sessionId: string, ws: { workspaceKey: string; workspacePath: string }): Promise<SessionStateAttestation> {
+    // Test seam: inject lane-level failures (transport/timeout) for a session id.
+    const injected = this.readFailure?.(sessionId) ?? null;
+    if (injected) throw injected;
     const native = this.nativeSessions.find((s) => s.sessionId === sessionId);
     if (!native || !native.workspacePath.toLowerCase().startsWith(ws.workspacePath.toLowerCase())) {
       throw new Error(`session ${sessionId.slice(0, 12)} is not associated with this workspace`);
     }
     return { ...ATTESTATION, sessionId, workspaceKey: ws.workspaceKey, workspacePath: native.workspacePath };
   }
+
+  readFailure: ((sessionId: string) => Error | null) | null = null;
   async readSessionMessages(sessionId: string, opts?: { limit?: number }) {
     const all = this.messages.get(sessionId) ?? [];
     return opts?.limit ? all.slice(0, opts.limit) : all;
@@ -133,6 +138,24 @@ describe("native session discovery (shared plane)", () => {
     }
   });
 
+  it("ownership staleness: markStale demotes a session and any live use clears it", async () => {
+    const { ownership, dir } = build();
+    try {
+      const sid = "sess_22222222-2222-2222-2222-222222222222";
+      ownership.record({ sessionId: sid, workspaceId: "ws_x", clientId: "cli_owner", accessMode: "write" });
+      assert.equal(ownership.get(sid)?.staleAt, undefined);
+      ownership.markStale(sid);
+      assert.ok(typeof ownership.get(sid)?.staleAt === "number", "staleAt set by markStale");
+      ownership.touch(sid);
+      assert.equal(ownership.get(sid)?.staleAt, undefined, "live use clears the demotion");
+      // markStale on an unknown session is a no-op (no fabrication).
+      ownership.markStale("sess_33333333-3333-3333-3333-333333333333");
+      assert.equal(ownership.get("sess_33333333-3333-3333-3333-333333333333"), undefined);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("denies paired clients discovery, observation, and message observation (observe ≠ control, fail closed)", async () => {
     const { service, dir } = build();
     try {
@@ -183,6 +206,81 @@ describe("native session observation (shared plane)", () => {
       await assert.rejects(
         () => service.observeMessages(LOCAL_PRINCIPAL, { workspace_id: workspaceId, session_id: "sess_22222222-2222-2222-2222-222222222222" }),
         /not associated with this workspace/,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a provable lane failure as SESSION_READ_UNAVAILABLE, never disguised as a session answer", async () => {
+    const { service, provider, dir, workspaceId } = build();
+    try {
+      provider.readFailure = () => new Error("connect ECONNREFUSED 127.0.0.1:8766");
+      await assert.rejects(
+        () => service.observe(LOCAL_PRINCIPAL, { workspace_id: workspaceId, session_id: "sess_11111111-1111-1111-1111-111111111111" }),
+        (err: SessionServiceError) => err.code === "SESSION_READ_UNAVAILABLE" && err.httpStatus === 503,
+      );
+      provider.readFailure = () => new Error("timeout waiting for session/read");
+      await assert.rejects(
+        () => service.observeMessages(LOCAL_PRINCIPAL, { workspace_id: workspaceId, session_id: "sess_11111111-1111-1111-1111-111111111111" }),
+        (err: SessionServiceError) => err.code === "SESSION_READ_UNAVAILABLE" && err.httpStatus === 503,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a not-active session as SESSION_NOT_ACTIVE/410 with an honest, resume-free message", async () => {
+    const { service, provider, dir, workspaceId } = build();
+    try {
+      // A pre-restart/legacy session: the runtime reports it not active. This
+      // is a session-level answer about THIS runtime's readability — NOT a
+      // lane failure, NOT proof the workspace binding is wrong, and NOT a
+      // promise that a resume will succeed.
+      provider.readFailure = () => new Error("ZCode Protocol error -32004: Session is not active: sess_legacy");
+      await assert.rejects(
+        () => service.observe(LOCAL_PRINCIPAL, { workspace_id: workspaceId, session_id: "sess_11111111-1111-1111-1111-111111111111" }),
+        (err: SessionServiceError) => err.code === "SESSION_NOT_ACTIVE" && err.httpStatus === 410
+          && /not readable in the current runtime/.test(err.message)
+          && !/resume/i.test(err.message)
+          && !/not associated/.test(err.message),
+      );
+      await assert.rejects(
+        () => service.observeMessages(LOCAL_PRINCIPAL, { workspace_id: workspaceId, session_id: "sess_11111111-1111-1111-1111-111111111111" }),
+        (err: SessionServiceError) => err.code === "SESSION_NOT_ACTIVE" && err.httpStatus === 410,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a proven session-not-found as the established session-level 404 denial", async () => {
+    const { service, provider, dir, workspaceId } = build();
+    try {
+      provider.readFailure = () => new Error("session not found: sess_gone");
+      await assert.rejects(
+        () => service.observe(LOCAL_PRINCIPAL, { workspace_id: workspaceId, session_id: "sess_11111111-1111-1111-1111-111111111111" }),
+        (err: SessionServiceError) => err.code === "SESSION_NOT_FOUND" && err.httpStatus === 404
+          && /not associated with this workspace/.test(err.message),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on an unclassifiable read error with a neutral message (no workspace-mismatch claim)", async () => {
+    const { service, provider, dir, workspaceId } = build();
+    try {
+      provider.readFailure = () => new Error("runtime exploded unexpectedly");
+      await assert.rejects(
+        () => service.observe(LOCAL_PRINCIPAL, { workspace_id: workspaceId, session_id: "sess_11111111-1111-1111-1111-111111111111" }),
+        (err: SessionServiceError) => err.code === "SESSION_NOT_FOUND" && err.httpStatus === 404
+          && /could not be confirmed in this runtime/.test(err.message)
+          && !/not associated/.test(err.message),
+      );
+      await assert.rejects(
+        () => service.observeMessages(LOCAL_PRINCIPAL, { workspace_id: workspaceId, session_id: "sess_11111111-1111-1111-1111-111111111111" }),
+        (err: SessionServiceError) => err.code === "SESSION_NOT_FOUND" && err.httpStatus === 404,
       );
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -308,5 +406,30 @@ describe("native session observation (shared plane)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("catalog observation candidate outcomes (cold-start reconciliation)", () => {
+  it("invokes onCandidateOutcome with FULL session ids and classified outcomes", async () => {
+    const { observeZcodeCatalog } = await import("../src/service/server.js");
+    const attempts: Array<{ sessionId: string; outcome: string }> = [];
+    const port = {
+      listSessions: async () => [
+        { sessionId: "sess_aaaaaaaaaa-1111-1111-1111-111111111111", updatedAt: 2 },
+        { sessionId: "sess_bbbbbbbbbb-2222-2222-2222-222222222222", updatedAt: 1 },
+      ],
+      observeSessionSettings: async (sessionId: string) => {
+        if (sessionId.startsWith("sess_aa")) {
+          throw new Error("ZCode Protocol error -32004: Session is not active: " + sessionId);
+        }
+        return { settings: { model: { current: { providerId: "zai-api", modelId: "GLM-5.3-Flash" }, available: [{ ref: { providerId: "zai-api", modelId: "GLM-5.3-Flash" }, reasoning: { levels: ["low", "high", "max"], defaultLevel: "max" } }] }, thoughtLevel: { enabled: true, current: "max", available: [{ value: "low" }, { value: "high" }, { value: "max" }] } } };
+      },
+    };
+    const result = await observeZcodeCatalog(port, { budgetMs: 8000, maxCandidates: 5, onCandidateOutcome: (sid, outcome) => attempts.push({ sessionId: sid, outcome }) });
+    assert.equal(result.evidenceSource, "session-settings-observed");
+    assert.deepEqual(attempts, [
+      { sessionId: "sess_aaaaaaaaaa-1111-1111-1111-111111111111", outcome: "session-not-active" },
+      { sessionId: "sess_bbbbbbbbbb-2222-2222-2222-222222222222", outcome: "observed" },
+    ]);
   });
 });

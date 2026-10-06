@@ -27,6 +27,7 @@ import {
   loadZcodeNativeConfig,
 } from "../execution/zcode-native.js";
 import { safeOutput } from "./zcode-tools.js";
+import { errorToolResult } from "../bridge/control-plane-error.js";
 import type { CodexTaskManager } from "../execution/tasks.js";
 import {
   loadZcodeSessionOwnership,
@@ -73,7 +74,7 @@ const workspaceIdField = z
   .string()
   .min(3)
   .max(64)
-  .describe("Governed native workspace id enabled for Z2C forwarding via ZCODE_NATIVE_ALLOWED_WORKSPACES");
+  .describe("Authorized A2C workspace id; enabled for native Z2C forwarding via ZCODE_NATIVE_ALLOWED_WORKSPACES (translated to the mapped native workspace upstream)");
 const instructionField = z
   .string()
   .min(1)
@@ -87,9 +88,12 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
 
   const mapErr = (error: unknown): ToolResult => {
     if (error instanceof ZcodeNativeError) {
-      return fail(error.code, error.upstreamCode ? `[${error.upstreamCode}] ${error.message}` : error.message);
+      return errorToolResult(error, "z2c", "native_session");
     }
     const maybeCoded = error as { code?: string };
+    if (maybeCoded?.code === "ENTITLEMENT_UNAVAILABLE" || maybeCoded?.code === "INVALID_ENTITLEMENT_PLAN") {
+      return fail(maybeCoded.code, (error as Error).message);
+    }
     if (typeof maybeCoded?.code === "string" && maybeCoded.code.startsWith("ZCODE_")) {
       return fail(maybeCoded.code, (error as Error).message);
     }
@@ -137,6 +141,7 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
       const canCancel = !requireScope(extra.authInfo, "execution.cancel");
       const evidence = await nativeSelfTest(args.workspace_id, {
         providerStatus: id => zcodeNativeClient().providerStatus(id),
+        projectWorkspace: id => zcodeNativeClient().projectWorkspace(id),
         submitNative: input => manager.submitNative(input, () => deps.taskGate(args.workspace_id, extra.authInfo, false)),
         snapshot: () => deps.nativeAdmissionSnapshot!(args.workspace_id, extra.authInfo),
         ...(canCancel ? { cancel: (input: { workspace_id: string; task_id: string }) => manager.cancelNative(input, true) } : {}),
@@ -184,17 +189,28 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
       description:
         "Dispatch a realtime native ZCode task through Z2C in an authorized governed " +
         "workspace enabled via ZCODE_NATIVE_ALLOWED_WORKSPACES. Honors the shared workspace " +
-        "queue pause/freeze and writer slot. Z2C admits the task only after observing " +
-        "the sanctioned Desktop-managed binding (the required identity per the C2C compatibility manifest) on the " +
-        "exact created session, and the returned task " +
-        "binding is re-verified here — fails closed, never falls back to the scheduled queue. " +
+        "queue pause/freeze and writer slot. An optional model/effort request is a HARD " +
+        "constraint: Z2C resolves both against the exact session's own advertised catalog " +
+        "(settings.model.available[] + per-model reasoning.levels) and the OBSERVED binding " +
+        "must match the request exactly — no silent substitution, downgrade, or upgrade; " +
+        "unsupported values fail closed. Without a request, the admissible binding is the " +
+        "runtime's own advertised selection. entitlement_plan START/INDIVIDUAL selects a " +
+        "billing entitlement for THIS session only when the connected runtime advertises " +
+        "entitlement selection and the exact-session registry readback attests it; without " +
+        "that capability the request fails closed (ENTITLEMENT_UNAVAILABLE) and nothing is " +
+        "dispatched. DEFAULT keeps current behavior. Never falls back to the scheduled queue. " +
         deps.untrustedNote,
       inputSchema: {
         workspace_id: workspaceIdField,
         instruction: instructionField,
+        entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional(),
         idempotency_key: z.string().regex(ZCODE_IDEMPOTENCY_KEY).optional(),
         write_scope: z.enum(["workspace", "readonly"]).optional().describe("Default: workspace"),
         mode: z.enum(["plan", "build", "edit"]).optional().describe("Default: build"),
+        model_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).optional()
+          .describe("Explicit native model (e.g. GLM-5.3-Flash, GLM-5.3). Must be advertised by the live runtime for this session."),
+        thought_level: z.string().regex(/^[a-z0-9_-]{1,20}$/).optional()
+          .describe("Explicit reasoning/effort level for the TARGET model (e.g. low, high, max). Must be in the target model's advertised reasoning.levels."),
       },
       annotations: { readOnlyHint: false },
     },
@@ -311,6 +327,7 @@ export function registerZcodeNativeTools(server: McpServer, deps: ZcodeNativeToo
         workspace_id: workspaceIdField,
         session_id: z.string().regex(/^sess_[0-9a-f-]{36}$/i),
         instruction: instructionField,
+        entitlement_plan: z.enum(["DEFAULT", "START", "INDIVIDUAL"]).optional(),
       },
       annotations: { readOnlyHint: false },
     },

@@ -19,6 +19,8 @@ describe("detached restart handoff (offline)", () => {
     deps = {
       observe: vi.fn(async () => started ? replacement : old), processStart: vi.fn(() => "helper-start"),
       launch: vi.fn(async () => {}), stop: vi.fn(async () => true),
+      // Synthetic runtime PIDs have no relationship to the host process tree.
+      isTaskDescendant: vi.fn(() => false),
       ensure: vi.fn(async () => { started = true; return { spawned: true, runtime: { ...replacement, service: "c2c", version: "test",
         workspaceRoot: root, workspaceId: stableWorkspaceId(root), stateDir: state, adminToken: "SECRET-ADMIN", publicUrl: null } }; }),
       tunnel: vi.fn(async () => true),
@@ -28,6 +30,20 @@ describe("detached restart handoff (offline)", () => {
   const request = (tunnel = false) => requestRestart(root, { stateDir: state, tunnel }, deps);
   const handoffFile = () => path.join(state, "runtime", "restart-handoff.json");
   const lockDir = () => path.join(state, "runtime", "restart-handoff.lock");
+  it.each([
+    ["Bridge ownership is uncertain (owner_process_unknown); private-token=fixture-secret", "bridge_stop_ownership_uncertain:owner_process_unknown"],
+    ["Bridge ownership changed before shutdown; private-token=fixture-secret", "bridge_stop_owner_changed_before_shutdown"],
+    ["Bridge ownership changed during shutdown; private-token=fixture-secret", "bridge_stop_owner_changed_during_shutdown"],
+    ["Bridge did not stop cleanly (pid999, port123); private-token=fixture-secret", "bridge_stop_timeout"],
+  ])("preserves a safe precise stop cause for %s", async (message, detail) => {
+    vi.mocked(deps.stop).mockRejectedValueOnce(new Error(message));
+    const record = await request();
+    const result = await runRestartHelper(record.id, state, deps);
+    expect(result.state).toBe("failed"); expect(result.error).toBe("STOP_FAILED");
+    expect(result.failureDetail).toBe(detail);
+    expect(JSON.stringify(result)).not.toContain("fixture-secret");
+    expect(deps.ensure).not.toHaveBeenCalled();
+  });
   async function abandoned(overrides: Partial<RestartHandoff> = {}) {
     const record = await request();
     const stale = { ...record, createdAt: Date.now() - 180_001, expiresAt: Date.now() - 1,
@@ -158,6 +174,7 @@ describe("detached restart handoff (offline)", () => {
           } return old;
         },
         processIdentity: pid => pid === old.pid ? 'same' : 'gone', processStart: () => 'fixture',
+        isTaskDescendant: () => false,
         launch: async id => fs.appendFileSync(${JSON.stringify(starts)}, id + '\\n')
       }); } catch (error) { fs.writeFileSync(ready[Number(process.argv[2])] + '.error', String(error.message)); process.exitCode = 2; }`);
     const children = [0, 1].map(index => spawn(process.execPath, ["--import", "tsx", fixture, String(index)], { windowsHide: true, stdio: "ignore" }));
@@ -435,12 +452,19 @@ describe("detached restart handoff (offline)", () => {
     fs.writeFileSync(parentFile, `import { spawn } from 'node:child_process'; import { requestRestart } from ${JSON.stringify(moduleUrl)};
       await requestRestart(${JSON.stringify(root)}, { stateDir: ${JSON.stringify(state)}, tunnel: false }, {
         observe: async () => (${JSON.stringify(old)}), processStart: () => 'fixture-parent-start',
+        isTaskDescendant: () => false,
         launch: async id => { const child = spawn(process.execPath, [${JSON.stringify(childFile)}, id], { detached: true, windowsHide: true, stdio: 'ignore' }); child.unref();
           await new Promise((r,j) => { child.once('spawn',r); child.once('error',j); }); process.kill(process.pid, 'SIGTERM'); }
       });`);
     const parent = spawn(process.execPath, [parentFile], { windowsHide: true, stdio: "ignore" });
     await new Promise<void>((resolve, reject) => { parent.once("exit", () => resolve()); parent.once("error", reject); });
-    await vi.waitFor(() => expect(readRestartHandoff(state).state).toBe("complete"), { timeout: 10_000 });
+    await vi.waitFor(() => {
+      const record = readRestartHandoff(state);
+      // Bounded failure evidence: only the sanitized control-plane fields, so a
+      // terminal "failed" names its stage instead of timing out opaquely.
+      expect(record.state, `restart outcome: ${JSON.stringify({ state: record.state, error: record.error,
+        failureDetail: record.failureDetail, helperClaimed: record.helper !== null })}`).toBe("complete");
+    }, { timeout: 10_000 });
     expect(fs.readFileSync(countFile, "utf8")).toBe("start\n");
   }, 15_000);
 
@@ -484,5 +508,71 @@ describe("detached restart handoff (offline)", () => {
       { pid: 9999, parentPid: 1 },
     ] as ReadonlyArray<{ pid: number; parentPid?: number }> };
     expect(isTaskDescendant(1234, 5678, safeInspector)).toBe(false);
+  });
+});
+
+describe("restart helper readiness semantics (eventual success is not START_FAILED)", () => {
+  let base: string, root: string, state: string, deps: RestartDeps;
+  const old = { pid: 2001, port: 48765, startedAt: "2026-09-06T01:00:00.000Z", stateDomainGeneration: randomUUID(), processStartIdentity: "old-start" };
+  const replacement = { ...old, pid: 2002, stateDomainGeneration: randomUUID(), processStartIdentity: "new-start", startedAt: "2026-09-06T02:00:00.000Z" };
+  beforeEach(() => {
+    base = makeTmpDir(); root = path.join(base, "workspace"); state = path.join(base, "state"); fs.mkdirSync(root);
+    deps = {
+      observe: vi.fn(async () => old), processStart: vi.fn(() => "helper-start"),
+      launch: vi.fn(async () => {}), stop: vi.fn(async () => true),
+      ensure: vi.fn(async () => { throw new Error("Bridge did not become healthy within 20s. See log"); }),
+      isTaskDescendant: vi.fn(() => false),
+      tunnel: vi.fn(async () => true),
+    };
+  });
+  afterEach(() => { vi.restoreAllMocks(); cleanup(base); });
+
+  it("a slow-but-successful replacement completes instead of failing: ensure times out, the authoritative re-observation proves the new runtime", async () => {
+    const record = await requestRestart(root, { stateDir: state, tunnel: false }, deps);
+    // The old runtime stopped; the replacement became healthy only AFTER the
+    // ensure budget expired. The helper's authoritative observe (health + owner
+    // + identity) is the readiness condition — not the ensure timeout.
+    vi.mocked(deps.observe).mockImplementation(async () => {
+      // First observe (pre-stop) sees the old runtime; after stop, the new one.
+      return (deps.stop as ReturnType<typeof vi.fn>).mock.calls.length > 0 ? replacement : old;
+    });
+    deps.resolveRuntimeState = vi.fn(async (_ws, _root, dir) => {
+      expect(dir).toBe(state);
+      return { ...replacement, service: "c2c", version: "test", workspaceRoot: root,
+        workspaceId: stableWorkspaceId(root), stateDir: state, adminToken: "SECRET-ADMIN", publicUrl: null };
+    });
+    const done = await runRestartHelper(record.id, state, deps);
+    expect(done.state).toBe("complete");
+    expect(done.error).toBeNull();
+    expect(done.replacement?.pid).toBe(replacement.pid);
+    expect(done.failureDetail).toBeNull();
+  });
+
+  it("a genuinely failed start still fails closed with the classified detail", async () => {
+    const record = await requestRestart(root, { stateDir: state, tunnel: false }, deps);
+    // Nothing ever comes up: observe keeps failing after the start timeout.
+    vi.mocked(deps.observe).mockImplementation(async () => {
+      if ((deps.stop as ReturnType<typeof vi.fn>).mock.calls.length === 0) return old;
+      throw new Error("no bridge");
+    });
+    const done = await runRestartHelper(record.id, state, deps);
+    expect(done).toMatchObject({ state: "failed", error: "START_FAILED", failureDetail: "bridge_start_timeout" });
+    expect(done.replacement).toBeNull();
+  });
+
+  it("the helper passes its remaining handoff budget (not the 20s default) to ensure", async () => {
+    const record = await requestRestart(root, { stateDir: state, tunnel: false }, deps);
+    vi.mocked(deps.observe).mockImplementation(async () => {
+      return (deps.stop as ReturnType<typeof vi.fn>).mock.calls.length > 0 ? replacement : old;
+    });
+    vi.mocked(deps.ensure).mockImplementationOnce(async (_root, opts) => {
+      expect((opts as { startTimeoutMs?: number }).startTimeoutMs).toBeGreaterThan(20_000);
+      return { spawned: true, runtime: { ...replacement, service: "c2c", version: "test", workspaceRoot: root,
+        workspaceId: stableWorkspaceId(root), stateDir: state, adminToken: "SECRET-ADMIN", publicUrl: null } };
+    });
+    deps.resolveRuntimeState = vi.fn(async () => ({ ...replacement, service: "c2c", version: "test", workspaceRoot: root,
+      workspaceId: stableWorkspaceId(root), stateDir: state, adminToken: "SECRET-ADMIN", publicUrl: null }));
+    const done = await runRestartHelper(record.id, state, deps);
+    expect(done.state).toBe("complete");
   });
 });

@@ -26,7 +26,7 @@ import {
  */
 
 const TEST_TOKEN = "z2cs_test_token_0123456789abcdef";
-const CANONICAL = "f:\\examplework\\engineering-ai";
+const CANONICAL = "f:\\ai startup\\engineering-ai";
 const DESKTOP_SESSION = "sess_dddddddd-4444-4444-4444-444444444444";
 
 const fake = {

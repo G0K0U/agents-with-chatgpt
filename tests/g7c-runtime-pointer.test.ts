@@ -132,7 +132,15 @@ describe("G7C runtime pointer lifecycle (hermetic)", () => {
     expect(fs.readFileSync(file, "utf8")).toBe("{");
     fs.unlinkSync(file); options.probe = async () => null; rows[0].listeningPorts = [];
     expect(await observe()).toMatchObject({ state: "unknown", reason: "runtime_initializing" });
-    await expect(ensureBridge(workspace.root, options)).rejects.toThrow(/runtime_initializing/);
+    await expect(ensureBridge(workspace.root, { ...options, startTimeoutMs: 5_000 })).rejects.toThrow(/runtime_initializing/);
+  });
+
+  it("joins an identity-verified initializing owner without duplicate spawn", async () => {
+    fs.unlinkSync(file); rows[0].listeningPorts = [];
+    options.probe = async () => rows[0].listeningPorts.length ? { service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" } : null;
+    const publish = setTimeout(() => { rows[0].listeningPorts = [runtime.port]; writeRuntimeState(runtime, stateDir); }, 100);
+    try { expect(await ensureBridge(workspace.root, { ...options, startTimeoutMs: 5_000 })).toMatchObject({ spawned: false, runtime }); }
+    finally { clearTimeout(publish); }
   });
 
   it("runtime publication failure keeps the previous credential instead of unlink/retry", () => {

@@ -34,13 +34,19 @@ type Identity = z.infer<typeof identity>;
 /** Persist only known control-plane error classes, never raw exception text. */
 function failureDetail(error: unknown): string {
   const message = error instanceof Error ? error.message : "";
+  const stopOwner = /^Bridge ownership is uncertain \(([a-z_]+)\)/.exec(message);
+  if (stopOwner) return `bridge_stop_ownership_uncertain:${stopOwner[1]}`;
+  if (message.startsWith("Bridge ownership changed before shutdown")) return "bridge_stop_owner_changed_before_shutdown";
+  if (message.startsWith("Bridge ownership changed during shutdown")) return "bridge_stop_owner_changed_during_shutdown";
+  if (message.startsWith("Bridge did not stop cleanly")) return "bridge_stop_timeout";
+  if ((error as NodeJS.ErrnoException)?.code === "EPERM" || (error as NodeJS.ErrnoException)?.code === "EACCES") return "bridge_stop_permission_denied";
   const uncertain = /^Bridge state is uncertain \(([a-z_]+)\)/.exec(message);
   if (uncertain) return `bridge_state_uncertain:${uncertain[1]}`;
   const owner = /^C2C state-domain ownership is uncertain \(([a-z_]+)\)/.exec(message);
   if (owner) return `state_domain_uncertain:${owner[1]}`;
   if (message.startsWith("C2C state domain is already owned")) return "state_domain_active";
   if (message.startsWith("A bridge for workspace") && message.includes("already listening")) return "old_listener_present";
-  if (message.startsWith("Bridge did not become healthy within 20s")) return "bridge_start_timeout";
+  if (/^Bridge did not become healthy within \d+s/.test(message)) return "bridge_start_timeout";
   const exit = /^Bridge process exited with code (\d+)/.exec(message);
   if (exit) return `bridge_process_exit:${exit[1]}`;
   if (message.startsWith("Ambiguous restart runtime ownership")) return "ambiguous_restart_owner";
@@ -313,12 +319,25 @@ export function isTaskDescendant(
   return false;
 }
 
+/**
+ * Full runtime-state resolution for the eventual-success recovery path: the
+ * healthy observation proves the replacement; this yields the RuntimeState
+ * (admin token included) the tunnel stage needs. Production reads the same
+ * runtime pointer the observation proved.
+ */
+async function resolveRuntimeStateDefault(workspaceId: string, workspaceRoot: string, stateDir: string): Promise<RuntimeState> {
+  const observation = await findBridgeObservation(workspaceId, workspaceRoot, { stateDir, repairRuntime: false });
+  if (observation.state !== "healthy") throw new Error("Replacement runtime state unavailable");
+  return observation.runtime;
+}
+
 /** Dependency seam only for local tests; hidden entry exposes no dependency arguments. */
 export interface RestartDeps {
   observe: typeof observe; processStart: typeof processStart; launch: typeof launch;
   stop: typeof stopBridge; ensure: typeof ensureBridge; tunnel: typeof tunnel;
   resolveTarget?: typeof resolveRestartTarget;
   processIdentity?: typeof inspectRestartProcessIdentity;
+  resolveRuntimeState?: typeof resolveRuntimeStateDefault;
   isTaskDescendant?: (currentPid: number, bridgePid: number) => boolean;
 }
 /** Shared restart affects all authorized workspaces and relaunches the actual
@@ -328,7 +347,7 @@ export async function resolveRestartTarget(root: string, stateDir: string, opts:
   if (observation.state !== "healthy") throw new Error("Ambiguous restart runtime ownership");
   return observation;
 }
-const production: RestartDeps = { observe, processStart, processIdentity: inspectRestartProcessIdentity, launch, stop: stopBridge, ensure: ensureBridge, tunnel, resolveTarget: resolveRestartTarget, isTaskDescendant };
+const production: RestartDeps = { observe, processStart, processIdentity: inspectRestartProcessIdentity, launch, stop: stopBridge, ensure: ensureBridge, tunnel, resolveTarget: resolveRestartTarget, resolveRuntimeState: resolveRuntimeStateDefault, isTaskDescendant };
 
 export async function requestRestart(workspaceRoot: string, opts: { stateDir?: string; tunnel: boolean }, deps: RestartDeps = production): Promise<RestartHandoff> {
   if (process.env.A2C_RESTART_HELPER === "1" || process.env.C2C_RESTART_HELPER === "1") throw new Error("Recursive restart forbidden");
@@ -444,15 +463,52 @@ export async function runRestartHelper(id: string, stateDir: string, deps: Resta
     if (!await deps.stop(record.requestedWorkspace?.root ?? record.workspaceRoot, { stateDir, expectedRuntime: record.old })) throw new Error("Old runtime did not stop");
     assertFresh();
     record.state = "starting"; save(record); stage = "START_FAILED";
-    const replacement = await deps.ensure(record.workspaceRoot, { stateDir, port: record.old.port });
+    // The start budget is the REMAINING handoff TTL minus a reserve for the
+    // optional tunnel stage — the handoff TTL is the system's own designed
+    // bound for a full restart, so a cold replacement may use it. The
+    // readiness CONDITION is unchanged: a healthy observation of the
+    // replacement (findLiveBridge + identity), never a blind sleep.
+    const startBudgetMs = Math.max(
+      20_000,
+      Math.min(170_000, record.expiresAt - Date.now() - (record.tunnel ? 100_000 : 5_000)),
+    );
+    let replacement: RuntimeState;
+    try {
+      replacement = (await deps.ensure(record.workspaceRoot, { stateDir, port: record.old.port, startTimeoutMs: startBudgetMs })).runtime;
+    } catch (startError) {
+      // Eventual-success recovery: the helper must not report START_FAILED for
+      // a replacement that became healthy between the budget deadline and this
+      // re-observation. The authoritative readiness proof is the same
+      // observation the helper requires for completion — a healthy bridge with
+      // a NEW identity (never the old runtime).
+      let recovered: Identity | null = null;
+      try {
+        const candidate = await deps.observe(record.workspaceRoot, stateDir);
+        if (candidate.pid !== record.old.pid ||
+            candidate.processStartIdentity !== record.old.processStartIdentity ||
+            candidate.startedAt !== record.old.startedAt ||
+            candidate.stateDomainGeneration !== record.old.stateDomainGeneration) {
+          recovered = candidate;
+        }
+      } catch { /* still not observable — genuine start failure */ }
+      if (!recovered) throw startError;
+      // Full runtime state (admin token included) comes from the same runtime
+      // pointer the healthy observation just proved; the identity must match.
+      const full = await (deps.resolveRuntimeState ?? resolveRuntimeStateDefault)(record.workspaceId, record.workspaceRoot, stateDir);
+      if (full.pid !== recovered.pid || full.startedAt !== recovered.startedAt ||
+          full.stateDomainGeneration !== recovered.stateDomainGeneration) {
+        throw startError;
+      }
+      replacement = full;
+    }
     record.replacement = await deps.observe(record.workspaceRoot, stateDir);
-    if (record.replacement.pid !== replacement.runtime.pid || record.replacement.startedAt !== replacement.runtime.startedAt ||
-        record.replacement.stateDomainGeneration !== replacement.runtime.stateDomainGeneration) throw new Error("Replacement identity changed");
+    if (record.replacement.pid !== replacement.pid || record.replacement.startedAt !== replacement.startedAt ||
+        record.replacement.stateDomainGeneration !== replacement.stateDomainGeneration) throw new Error("Replacement identity changed");
     if (record.replacement.pid === record.old.pid && record.replacement.processStartIdentity === record.old.processStartIdentity) throw new Error("Old runtime still running");
     save(record);
     if (record.tunnel) {
       assertFresh(); record.state = "tunnel"; save(record); stage = "TUNNEL_FAILED";
-      record.tunnelReady = await deps.tunnel(replacement.runtime);
+      record.tunnelReady = await deps.tunnel(replacement);
       if (!record.tunnelReady) throw new Error("Tunnel not ready");
     }
     assertFresh();

@@ -207,6 +207,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: workspaceId,
         instruction: "hold the fixture workspace writer",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));
@@ -218,6 +219,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: workspaceId,
         instruction: "remain queued until the first fixture task is cancelled",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));
@@ -267,6 +269,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: remoteWorkspaceId,
         instruction: "hold the non-default bridge workspace writer",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));
@@ -278,6 +281,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: remoteWorkspaceId,
         instruction: "remain queued in the non-default workspace",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));
@@ -304,6 +308,7 @@ describe("C2C stabilization routing and lifecycle", () => {
         workspace_id: workspaceId,
         instruction: "seed a task for the unauthorized workspace regression",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));

@@ -17,16 +17,19 @@ interface Harness {
   envWithSecret: boolean;
 }
 
-async function buildHarness(opts?: { envSecret?: boolean; requestedModelId?: string | null; requestedThoughtLevel?: string | null }): Promise<Harness> {
+async function buildHarness(opts?: { envSecret?: boolean; requestedModelId?: string | null; requestedThoughtLevel?: string | null; highest?: boolean }): Promise<Harness> {
   const stateDir = mkdtempSync(join(tmpdir(), "z2c-official-"));
   const workspace = mkdtempSync(join(tmpdir(), "z2c-official-ws-"));
   const logPath = join(stateDir, "fixture-log.jsonl");
   process.env.FAKE_APP_SERVER_LOG = logPath;
   process.env.FAKE_APP_SERVER_STATE = join(stateDir, "fixture-state.json");
+  const policy = join(stateDir, "worker-effort-policy.json");
+  if (opts?.highest) writeFileSync(policy, JSON.stringify({ schema: 1, glmAndGemini: "highest" }));
   const cfg = {
     ...loadConfig(),
     stateDir,
     zcodeCliPath: FAKE_APP_SERVER,
+    workerEffortPolicyFile: opts?.highest ? policy : undefined,
     // If the parent env carries the legacy key material, the provider must
     // scrub it before spawn; the fixture reports what it actually saw.
     requestedModelId: opts && opts.requestedModelId !== undefined ? opts.requestedModelId : "GLM-5.3-Flash",
@@ -62,6 +65,35 @@ function readFixtureLog(h: Harness): Array<{ method: string; hasKeyMaterial: boo
 }
 
 describe("ZcodeOfficialProvider (official open-source app-server contract)", () => {
+  it("highest policy applies to omitted selections and rejects explicit lower levels before sending", async () => {
+    const h = await buildHarness({ requestedModelId: null, requestedThoughtLevel: null, highest: true });
+    try {
+      const id = await h.provider.createSession(h.workspace, {});
+      const binding = await h.provider.readSessionState(id, h.workspace);
+      assert.equal(binding.thoughtLevel, "max");
+      const sendsBefore = readFixtureLog(h).filter(r => r.method === "session/send").length;
+      await assert.rejects(h.provider.createSession(h.workspace, { modelId: "GLM-5.3-Flash", thoughtLevel: "high" }), /EFFORT_POLICY_VIOLATION/);
+      assert.equal(readFixtureLog(h).filter(r => r.method === "session/send").length, sendsBefore);
+    } finally { await stopHarness(h); }
+  });
+  it("checks previously admitted sessions again when the operator policy becomes active", async () => {
+    const h = await buildHarness({ requestedModelId: null, requestedThoughtLevel: null, highest: true });
+    try {
+      const policy = join(h.stateDir, "worker-effort-policy.json");
+      // A historical low session can exist, but enabling the policy cannot launch it.
+      writeFileSync(policy, JSON.stringify({ schema: 1, glmAndGemini: "highest" }));
+      const id = await h.provider.createSession(h.workspace, {});
+      const persisted = JSON.parse(readFileSync(join(h.stateDir, "fixture-state.json"), "utf8"));
+      // Directly set the real fixture runtime through its public model switch.
+      await h.provider.stop();
+      persisted[id].thoughtLevel = "high";
+      writeFileSync(join(h.stateDir, "fixture-state.json"), JSON.stringify(persisted));
+      await h.provider.start();
+      const sendsBefore = readFixtureLog(h).filter(r => r.method === "session/send").length;
+      await assert.rejects(h.provider.send({ sessionId: id, instruction: "must not launch", inputId: "effort-policy-test", timeoutMs: 1000 }), /EFFORT_POLICY_VIOLATION/);
+      assert.equal(readFixtureLog(h).filter(r => r.method === "session/send").length, sendsBefore);
+    } finally { await stopHarness(h); }
+  });
   it("starts healthy via runtime/capabilities discovery", async () => {
     const h = await buildHarness();
     try {
@@ -88,6 +120,10 @@ describe("ZcodeOfficialProvider (official open-source app-server contract)", () 
       assert.match(sessionId, /^sess_[0-9a-f-]{36}$/);
       const att = await h.provider.readSessionState(sessionId, h.workspace);
       assert.equal(att.sessionId, sessionId);
+      // Session-plane readback with no runtime entitlement evidence: the
+      // request side stays UNPROVEN (null) — "DEFAULT" would fabricate a
+      // request fact; the task plane attests concrete plans separately.
+      assert.deepEqual(att.entitlement, { requested: null, observed: null, access_mode: null, source: "unavailable" });
       assert.equal(att.workspaceKey, h.workspace.workspaceKey);
       assert.equal(att.workspacePath, h.workspace.workspacePath);
       assert.equal(att.providerId, "zai-api"); // resolved from ZCode's own state (same-provider request), never hardcoded
@@ -136,12 +172,12 @@ describe("ZcodeOfficialProvider (official open-source app-server contract)", () 
     }
   });
 
-  it("fails closed when the requested thought level is not supported", async () => {
+  it("fails closed when the requested thought level is not advertised for the current model", async () => {
     const h = await buildHarness();
     try {
       await assert.rejects(
         async () => h.provider.createSession(h.workspace, { thoughtLevel: "ultra" }),
-        /thought level ultra is not supported/,
+        /thought level ultra is not advertised/,
       );
     } finally {
       await stopHarness(h);
@@ -520,4 +556,16 @@ describe("ZcodeOfficialProvider (official open-source app-server contract)", () 
       }
     });
   });
+});
+
+
+it("official provider rejects explicit billing plans before any protocol dispatch", async () => {
+  const provider = new ZcodeOfficialProvider(loadConfig());
+  const ws = { workspacePath: process.cwd(), workspaceKey: process.cwd() };
+  for (const entitlementPlan of ["START", "INDIVIDUAL"] as const) {
+    await assert.rejects(provider.createSession(ws, { entitlementPlan }), { code: "ENTITLEMENT_UNAVAILABLE" });
+    await assert.rejects(provider.resumeSession(ws, "sess_00000000-0000-0000-0000-000000000001", { entitlementPlan }), { code: "ENTITLEMENT_UNAVAILABLE" });
+    await assert.rejects(provider.send({ sessionId: "unused", instruction: "OK", inputId: "input", timeoutMs: 100, entitlementPlan }), { code: "ENTITLEMENT_UNAVAILABLE" });
+  }
+  assert.equal(provider.childPid, null);
 });

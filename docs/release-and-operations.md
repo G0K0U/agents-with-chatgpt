@@ -73,37 +73,38 @@ re-signed.
 
 ## Candidate gate and switch
 
-From a clean committed checkout, install A2C and Z2C dependencies from their
-locks, run both typechecks and the Z2C suite, then build A2C. Run
-`node dist/cli/index.js release activate` to execute the A2C release gate
-(typecheck, build, manifest, full tests), promote an immutable release tree,
-and update that checkout's LKG. `release activate` takes **no release ID** and
-rebuilds; use the resulting manifest and ID, not an earlier dist hash.
+Run `scripts/release-readiness.ps1` in PowerShell 7 with `-NodePath` when Node
+is outside PATH. The default mode is one fail-closed source/candidate
+transaction: both typechecks, focused and full suites, builds, repeated
+critical regressions, a candidate release copy, isolated status, and isolated
+bridge health, local OAuth pairing, authenticated MCP tool discovery, and
+unauthenticated MCP challenge smoke. Every native exit code and raw output is recorded in
+`artifacts/a2c-release-readiness/`; the source fingerprints must stay fixed.
+The previous LKG pointer is checked again before the candidate is accepted.
+Candidate release directories are immutable: an existing different or
+incomplete release ID is refused.
 
-Run `scripts/candidate-smoke.mjs` against the named immutable release CLI with
-an existing private evidence directory. It checks the release tree hash,
-compiled catalog mapper and rejection redaction, the ambiguous resolver,
-isolated bridge health, unauthenticated MCP 401 and an ephemeral read-scoped
-OAuth client. It revokes that client's token and closes the isolated bridge.
-This local client is not evidence that the user's ChatGPT connector called MCP.
+`-Activate` additionally requires `-PausedWorkspaceId`, `-PublicHost`,
+`-OriginPort`, and `-ExternalTunnelService` for the local installation. It
+requires maintenance pause, idle Z2C historical queues, an absent selected
+workspace writer lock, exact live process ownership, and a running external
+Cloudflared service fixed to the selected loopback port. It
+checks the old LKG process, activates the exact candidate, then performs three
+bounded bridge restarts through the detached helper. Each cycle checks the
+new PID, release and instance identity, local/public health, authenticated MCP
+with the six shared plane tools, and the public 401 challenge. `-Activate`
+requires `A2C_ACCEPTANCE_BEARER` to be set to a previously authorized bearer;
+it never creates a public OAuth client or enters a pairing code. The isolated
+candidate fixture exercises local pairing only in its temporary state. A final
+30-sample read-only observation checks process counts, queues, and listener
+stability. The independent Cloudflared service is never restarted.
 
-For a separate existing installation whose `src/` content matches the
-activated source, `installActivatedRelease(sourceRoot, targetRoot)` in
-`src/process/release.ts` verifies the clean source commit, active pointer,
-source and build hashes in both checkouts, copies that **exact** release tree,
-and records the old pointer for rollback before switching LKG. It refuses a
-tampered or incomplete release. Back up the other components separately.
-Check maintenance pause, queue/writer state, and process ownership before a
-single controlled restart; then compare new process ID, release/instance
-identity, health and authenticated MCP. Restart Z2C or Quanta only if their
-own code changed. Do not modify tunnel/DNS state as part of this switch.
-
-`ownership_unknown` is a hard stop. The Windows process inspector first reads
-WMI and fills missing Node executable/argv fields only when a limited-access
-native handle confirms the same OS creation time. If proof remains unavailable,
-stop before moving LKG. A failure after pointer activation is a partial
-activation; inspect the exact stage and runtime before rollback. Do not delete
-locks or force-stop a PID.
+`ownership_unknown` is a hard stop. The Windows process inspector uses native user-session process queries
+without WMI/CIM or administrator privileges. Process ownership requires the
+matching executable/argv and OS creation time, not a recorded PID alone. If proof remains unavailable,
+the switch stops before moving LKG. A failure after pointer activation is
+recorded as a partial activation; inspect the exact gate stage and current
+runtime before any rollback. Do not delete locks or force-stop a PID.
 
 `node bin/a2c.js release rollback` validates and restores the previous LKG
 **pointer**. It is a runtime release operation, not a source tree rollback or

@@ -17,6 +17,7 @@ import { visibleText } from "../redact.js";
  */
 
 const SESSION_ID_PATTERN = /^c2cs_[0-9a-zA-Z_-]{8,64}$/;
+const DSH_SESSION_ID_PATTERN = /^session-d2c-[0-9a-f]{32}$/;
 const MAX_TASKS_PER_WORKSPACE = 200;
 
 interface TaskFileLike {
@@ -28,6 +29,8 @@ interface TaskFileLike {
   instructionHash?: unknown;
   provider?: unknown;
   providerModel?: unknown;
+  effort?: unknown;
+  selectionScope?: unknown;
   providerSessionId?: unknown;
   threadId?: unknown;
   status?: unknown;
@@ -43,6 +46,8 @@ interface TaskFileLike {
   networkEffective?: unknown;
   continuation?: { effort?: unknown };
   actionEvidence?: { turnCompleted?: unknown; changedFiles?: unknown; finalOutputCaptured?: unknown };
+  nativeEvidence?: { terminalSeq?: unknown; terminalReason?: unknown; toolCalls?: unknown; toolResults?: unknown;
+    servedModel?: unknown; servedEffort?: unknown; servedProvider?: unknown };
   verification?: { status?: unknown; exitCode?: unknown; completedAt?: unknown; outputId?: unknown };
   error?: { code?: unknown; message?: unknown };
 }
@@ -69,7 +74,7 @@ function readTaskFile(file: string): TaskFileLike | null {
 
 function providerOf(record: TaskFileLike): AgentProviderName | null {
   const provider = str(record.provider);
-  if (provider === "codex" || provider === "gemini") return provider;
+  if (provider === "codex" || provider === "gemini" || provider === "dsh") return provider;
   return null;
 }
 
@@ -166,7 +171,12 @@ export function projectProviderTasks(input: {
     });
 
     const sessionId = str(record.sessionId);
-    if (!sessionId || !SESSION_ID_PATTERN.test(sessionId) || sessions.has(sessionId)) continue;
+    if (!sessionId || !(SESSION_ID_PATTERN.test(sessionId) || DSH_SESSION_ID_PATTERN.test(sessionId))) continue;
+    const existing = sessions.get(sessionId);
+    if (existing) {
+      if (existing.taskIds.length < 50 && !existing.taskIds.includes(taskId)) existing.taskIds.push(taskId);
+      continue;
+    }
     const changedFiles = Array.isArray(record.changedFiles) ? record.changedFiles.map((f) => str(f)).filter((f): f is string => f !== null) : [];
     sessions.set(sessionId, {
       provider,
@@ -175,7 +185,7 @@ export function projectProviderTasks(input: {
       providerSessionId: str(record.providerSessionId) ?? str(record.threadId),
       nativeSessionId: str(record.threadId) ?? str(record.providerSessionId),
       model: str(record.providerModel),
-      thoughtLevel: str(record.continuation?.effort),
+      thoughtLevel: str(record.effort) ?? str(record.continuation?.effort),
       ownerClientId: str(record.ownerId),
       status,
       taskIds: [taskId],
@@ -230,6 +240,8 @@ export function taskView(workspaceId: string, record: TaskFileLike): AgentTaskVi
     provider: providerOf(record),
     providerSessionId: str(record.providerSessionId) ?? str(record.threadId),
     model: str(record.providerModel),
+    effort: str(record.effort),
+    selectionScope: str(record.selectionScope),
     status: str(record.status) ?? "unknown",
     exitStatus: str(record.exitStatus),
     submittedAt: str(record.submittedAt),
@@ -249,6 +261,15 @@ export function taskView(workspaceId: string, record: TaskFileLike): AgentTaskVi
           changedFiles: num(record.actionEvidence.changedFiles) ?? 0,
           finalOutputCaptured: record.actionEvidence.finalOutputCaptured === true,
         }
+      : null,
+    nativeEvidence: record.nativeEvidence
+      ? { terminalSeq: num(record.nativeEvidence.terminalSeq),
+          terminalReason: str(record.nativeEvidence.terminalReason),
+          toolCalls: num(record.nativeEvidence.toolCalls) ?? 0,
+          toolResults: num(record.nativeEvidence.toolResults) ?? 0,
+          servedModel: str(record.nativeEvidence.servedModel),
+          servedEffort: str(record.nativeEvidence.servedEffort),
+          servedProvider: str(record.nativeEvidence.servedProvider) }
       : null,
     verification: record.verification
       ? {

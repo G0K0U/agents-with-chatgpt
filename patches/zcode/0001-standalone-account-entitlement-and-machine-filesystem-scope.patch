@@ -1,0 +1,2113 @@
+diff --git a/apps/zcode-cli/packages/bootstrap/src/app/provider-registry-selection.ts b/apps/zcode-cli/packages/bootstrap/src/app/provider-registry-selection.ts
+index 9279edb..5476104 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/app/provider-registry-selection.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/app/provider-registry-selection.ts
+@@ -185,6 +185,7 @@ function toModelOption(provider: Provider, model: ProviderModel): ZCodeModelOpti
+   const properties = model.config.properties;
+   const optionSpecs = model.config.optionSpecs;
+   const reasoning = optionSpecs.reasoningLevel;
++  const access = provider.config.access;
+   return {
+     ref: { providerId: provider.providerId, modelId: model.modelId },
+     label: model.modelId,
+@@ -199,5 +200,17 @@ function toModelOption(provider: Provider, model: ProviderModel): ZCodeModelOpti
+       inputFormat: properties.inputFormat,
+       outputFormat: properties.outputFormat,
+     },
++    // 语义权益事实：账号型 Provider 携带其静态 access 约束（Registry 中的
++    // Provider 都已准入，entitled 恒为 true）；普通 API key Provider 缺省。
++    ...(access?.type === "zhipu-account" && access.accountType && access.mode && access.entitled
++      ? {
++          accountAccess: {
++            type: "zhipu-account" as const,
++            accountType: access.accountType,
++            mode: access.mode,
++            entitled: true,
++          },
++        }
++      : {}),
+   };
+ }
+diff --git a/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts b/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts
+index d3bd8df..60bf9ae 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts
+@@ -1,5 +1,5 @@
+ import { createHash } from "node:crypto";
+-import type { SharedZCodeCredentialStore } from "@zcode/adapters/auth";
++import { SHARED_ZCODE_CREDENTIAL_KEYS, type SharedZCodeCredentialStore } from "@zcode/adapters/auth";
+ import type { ProviderRuntimeHeadersPort } from "@zcode/core";
+ import {
+   createAccountProviderConfigSnapshot,
+@@ -15,10 +15,23 @@ import {
+ } from "@zcode/provider-node";
+ import type { ProviderFamilyDomain } from "@zcode/shared";
+ 
++/** Standalone 可选账号权益只有两种；team/off-peak 仍归 Desktop 托管。 */
++export type StandaloneCodingPlanMode = "individual-coding-plan" | "start-plan";
++
+ interface StandaloneCodingPlanProvider {
+   readonly family: ProviderFamilyDomain;
+   readonly modelId: string;
+   readonly providerId: string;
++  readonly mode: StandaloneCodingPlanMode;
++}
++
++/**
++ * Standalone 的 Built-in 账号目录同时声明 Individual Coding Plan 与 Start Plan
++ * Provider；两者共用同一登录身份，但请求鉴权材料不同（动态 API Key vs OAuth
++ * JWT）。team/off-peak 不进入 standalone 目录。
++ */
++function isStandaloneCodingPlanMode(mode: string): mode is StandaloneCodingPlanMode {
++  return mode === "individual-coding-plan" || mode === "start-plan";
+ }
+ 
+ export async function readStandaloneCodingPlanProviders(
+@@ -41,10 +54,11 @@ async function readStandaloneCodingPlanCatalog(
+         const access = provider.access;
+         const modelId = provider.builtinModelIds?.find((candidate) => candidate.trim())?.trim();
+         return access?.type === "zhipu-account" &&
+-          access.mode === "individual-coding-plan" &&
++          typeof access.mode === "string" &&
++          isStandaloneCodingPlanMode(access.mode) &&
+           access.accountType &&
+           modelId
+-          ? [{ family: access.accountType, modelId, providerId }]
++          ? [{ family: access.accountType, modelId, providerId, mode: access.mode }]
+           : [];
+       }),
+     };
+@@ -64,12 +78,16 @@ async function readStandaloneCodingPlanCatalog(
+   }
+ }
+ 
++/**
++ * 登录/手工 Key 连接的目标 Provider：Individual Coding Plan。Start Plan 不接受
++ * 手工 Key，也不能被登录写入流程误选；目录里每个 family 至多一个 Individual。
++ */
+ export async function resolveStandaloneCodingPlanProvider(
+   family: ProviderFamilyDomain,
+   env: Readonly<Record<string, string | undefined>>,
+ ): Promise<StandaloneCodingPlanProvider> {
+   const matches = (await readStandaloneCodingPlanProviders(env)).filter(
+-    (provider) => provider.family === family,
++    (provider) => provider.family === family && provider.mode === "individual-coding-plan",
+   );
+   if (matches.length !== 1) {
+     throw new Error(
+@@ -115,8 +133,24 @@ export async function readStandaloneAccountProviderConfigSnapshot(
+     standaloneAccountIdentityCredentialKey(providerId),
+   );
+   const identities = await credentialStore.loadMany(identityKeys);
++  // 身份来源与 Desktop host 对齐：host 从 family 的 OAuth 用户档案推导身份
++  // （loadUserProfile(oauthProviderId)?.id），从不写 per-provider identity 键。
++  // per-provider identity 键缺失时回退到同一 OAuth user_info 派生，让 host 已
++  // 缓存的 coding-plan api-key 在 standalone 形态下同样可发现。权益仍然要求
++  // api-key 真实存在——user_info 单独存在不构成任何权益。
++  const familyUserInfos = await credentialStore.loadMany([
++    SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo,
++    SHARED_ZCODE_CREDENTIAL_KEYS.bigmodelUserInfo,
++  ]);
+   const candidates = configuredProviders.flatMap(({ family, providerId }) => {
+-    const accountIdentity = identities[standaloneAccountIdentityCredentialKey(providerId)]?.trim();
++    const identityKey = standaloneAccountIdentityCredentialKey(providerId);
++    const userInfoKey =
++      family === "bigmodel"
++        ? SHARED_ZCODE_CREDENTIAL_KEYS.bigmodelUserInfo
++        : SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo;
++    const accountIdentity =
++      identities[identityKey]?.trim() ||
++      extractCredentialUserId(familyUserInfos[userInfoKey] ?? "");
+     if (!accountIdentity) return [];
+     const credentialKey = standaloneAccountProviderCredentialKey({
+       providerId,
+@@ -127,11 +161,25 @@ export async function readStandaloneAccountProviderConfigSnapshot(
+   const apiKeyByCredentialKey = await credentialStore.loadMany(
+     candidates.map(({ credentialKey }) => credentialKey),
+   );
++  // Start Plan 权益只依赖登录事实：activeProvider 指向该 family 且该 family 的
++  // OAuth JWT + 用户身份都存在。手工 API Key 路径不写 activeProvider/OAuth 材料，
++  // 因此永远不会被误判成 Start 权益。
++  const startEntitlement = await readStandaloneStartPlanEntitlementByFamily(credentialStore);
+   const candidateByProviderId = new Map(
+     candidates.map((candidate) => [candidate.providerId, candidate]),
+   );
+   const providers = new ProviderConfigMap(
+-    configuredProviders.map(({ family, providerId }) => {
++    configuredProviders.map(({ family, providerId, mode }) => {
++      if (mode === "start-plan") {
++        return [
++          providerId,
++          new ProviderConfig({
++            access: new ZhipuAccountAccessConfig({
++              entitled: startEntitlement.get(family) === true,
++            }),
++          }),
++        ] as const;
++      }
+       const candidate = candidateByProviderId.get(providerId);
+       const apiKey = candidate ? apiKeyByCredentialKey[candidate.credentialKey]?.trim() : undefined;
+       if (!candidate || !apiKey) {
+@@ -155,6 +203,48 @@ export async function readStandaloneAccountProviderConfigSnapshot(
+   return createAccountProviderConfigSnapshot(catalog.zcodeBuiltinRevision, providers);
+ }
+ 
++/**
++ * Standalone Start Plan 权益的唯一定义：Shared Credential Store 中
++ * `oauth:active_provider` 指向该 family，且该 family 的 OAuth 登录材料
++ * （JWT + 用户身份）齐全。返回值只包含布尔事实，绝不包含凭据内容。
++ */
++export async function readStandaloneStartPlanEntitlementByFamily(
++  credentialStore: Pick<SharedZCodeCredentialStore, "loadMany">,
++): Promise<Map<ProviderFamilyDomain, boolean>> {
++  const material = await credentialStore.loadMany([
++    SHARED_ZCODE_CREDENTIAL_KEYS.activeProvider,
++    SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken,
++    SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo,
++    SHARED_ZCODE_CREDENTIAL_KEYS.bigmodelUserInfo,
++  ]);
++  const activeProvider = material[SHARED_ZCODE_CREDENTIAL_KEYS.activeProvider]?.trim();
++  const jwt = material[SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken]?.trim();
++  const result = new Map<ProviderFamilyDomain, boolean>();
++  for (const family of ["zai", "bigmodel"] as const) {
++    const userInfo = material[
++      family === "zai"
++        ? SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo
++        : SHARED_ZCODE_CREDENTIAL_KEYS.bigmodelUserInfo
++    ]?.trim();
++    result.set(
++      family,
++      activeProvider === family && !!jwt && !!userInfo && extractCredentialUserId(userInfo).length > 0,
++    );
++  }
++  return result;
++}
++
++/** 从存储的 OAuth 用户信息 JSON 中提取稳定身份 id；解析失败视为材料不完整。 */
++function extractCredentialUserId(userInfoJson: string): string {
++  try {
++    const parsed = JSON.parse(userInfoJson) as { id?: unknown; user_id?: unknown };
++    const id = typeof parsed.id === "string" ? parsed.id : typeof parsed.user_id === "string" ? parsed.user_id : "";
++    return id.trim();
++  } catch {
++    return "";
++  }
++}
++
+ export async function hasStandaloneCodingPlanAccess(
+   credentialStore: Pick<SharedZCodeCredentialStore, "loadMany">,
+   env: Readonly<Record<string, string | undefined>>,
+@@ -178,12 +268,46 @@ export function createStandaloneProviderRuntimeHeadersPort(
+       input.abortSignal?.throwIfAborted();
+       const providerId = input.providerId.trim();
+       const access = input.accountAccess;
+-      if (!access || access.mode !== "individual-coding-plan") {
++      if (!access || (access.mode !== "individual-coding-plan" && access.mode !== "start-plan")) {
+         throw new Error(`Standalone Account Provider 请求身份无效: ${providerId}`);
+       }
++      if (access.mode === "start-plan") {
++        // Start Plan 请求鉴权：使用登录写入的 OAuth JWT（与 Desktop 的
++        // zcode-plan 请求材料同源），并核对该 Provider 确实是该 family 的
++        // Start Provider——跨 family/跨套餐复用材料在这里直接失败。
++        const catalog = await readStandaloneCodingPlanCatalog(env);
++        const provider = catalog.providers.find((entry) => entry.providerId === providerId);
++        if (!provider || provider.mode !== "start-plan" || provider.family !== access.accountType) {
++          throw new Error(`Standalone Start Plan Provider 身份无效: ${providerId}`);
++        }
++        const entitlement = await readStandaloneStartPlanEntitlementByFamily(credentialStore);
++        if (entitlement.get(access.accountType) !== true) {
++          throw new Error(`Standalone Start Plan 请求凭据不可用: ${providerId}`);
++        }
++        const jwt = (
++          await credentialStore.load(SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken)
++        )?.trim();
++        if (!jwt) {
++          throw new Error(`Standalone Start Plan 缺少请求凭据: ${providerId}`);
++        }
++        return {
++          headersApplied: true,
++          requestAuth: { apiKey: jwt },
++        };
++      }
++      // 身份解析与 Desktop host 对齐：host 用 family 的 OAuth 用户档案
++      // （loadUserProfile()?.id）推导 Individual 身份，per-provider identity
++      // 键只是可选的显式覆盖。两者都缺失才是凭据真正失效。
+       const currentIdentity = (
+         await credentialStore.load(standaloneAccountIdentityCredentialKey(providerId))
+-      )?.trim();
++      )?.trim() ||
++        extractCredentialUserId(
++          (await credentialStore.load(
++            access.accountType === "bigmodel"
++              ? SHARED_ZCODE_CREDENTIAL_KEYS.bigmodelUserInfo
++              : SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo,
++          )) ?? "",
++        );
+       if (!currentIdentity)
+         throw new Error(`Standalone Account Provider 凭据已经失效: ${providerId}`);
+       const apiKey = (
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-entrypoint.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-entrypoint.ts
+index 55572f3..d2d76be 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-entrypoint.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-entrypoint.ts
+@@ -13,7 +13,7 @@ import {
+   type ZCodeMcpTelemetryEvent,
+ } from "@zcode/shared";
+ import type { SqliteSessionStore } from "@zcode/adapters/storage";
+-import { traceContextToLogContext, createRootTraceContext } from "@zcode/contracts";
++import { traceContextToLogContext, createRootTraceContext, type Logger } from "@zcode/contracts";
+ import type { McpPort, ModelSelection } from "@zcode/contracts";
+ import type { PresentationSurface } from "@zcode/core";
+ import type { RunZCodeProtocolAgentOptions, ZCodeAppOptions } from "./app/types.js";
+@@ -27,7 +27,10 @@ import {
+   prepareProtocolStartupStorage,
+ } from "./zcode-protocol/storage-startup.js";
+ import { closeSessionStore, getSessionDbPath } from "./app/session-store.js";
+-import { startProcessProviderRegistryRuntime } from "./app/process-provider-registry-runtime.js";
++import {
++  startProcessProviderRegistryRuntime,
++  type ProcessProviderRegistryRuntimeOptions,
++} from "./app/process-provider-registry-runtime.js";
+ import { scheduleStartupLogRetentionCleanup } from "./log-retention.js";
+ import { StartupTimer, startupNow } from "./startup-logging.js";
+ import { installZCodeProtocolAiSdkWarningLogger } from "./zcode-protocol/ai-sdk-warning-logger.js";
+@@ -47,6 +50,7 @@ import { cleanupProtocolRuntime } from "./zcode-protocol/runtime-cleanup.js";
+ import { startProtocolResourceSampler } from "./zcode-protocol/resource-sampler.js";
+ import { acquireProtocolStartupResource } from "./zcode-protocol/startup-resource.js";
+ import type { ZCodeProcessResourceSampler } from "./process-resource-sampler.js";
++import type { ZCodeBuiltinRefreshEvent } from "@zcode/provider-node";
+ import { prepareZCodeTelemetryEnv, shutdownZCodeTelemetry } from "./telemetry-bootstrap.js";
+ 
+ function applyProtocolPresentationSurface(
+@@ -79,6 +83,58 @@ function applyProtocolProviderRegistry(
+   };
+ }
+ 
++/**
++ * 协议子进程独立账号解析的显式 opt-in 开关。
++ *
++ * 默认（未设置）保持 Desktop host 形态：进程内不读凭据，账号权益由 Host 经
++ * `zcodeProviderUpdateAccountConfig` 下发，Registry 以 fail-closed Overlay 起步。
++ * 仅当宿主（如 standalone app-server 的无桌面启动方）显式设置为 `1`/`true` 时，
++ * 进程才经 Shared Credential Store 自行解析账号权益——与交互 TUI 入口同一实现
++ * （readStandaloneAccountProviderConfigSnapshot），不引入新的权益判定路径。
++ */
++export const ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV =
++  "ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME";
++
++export function isStandaloneAccountRuntimeEnabled(
++  env: Readonly<Record<string, string | undefined>>,
++): boolean {
++  const raw = env[ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]?.trim().toLowerCase();
++  return raw === "1" || raw === "true";
++}
++
++export function standaloneAccountRuntimeOptions(
++  env: Readonly<Record<string, string | undefined>>,
++  logger: Logger,
++): ProcessProviderRegistryRuntimeOptions {
++  if (!isStandaloneAccountRuntimeEnabled(env)) return {};
++  return {
++    standalone: {
++      // 可观测性回调只记录事实，不得改变账号解析结果；stdio 是协议传输面，
++      // 一切日志走协议 logger，绝不写 stdout/stderr。
++      onAccountInitializationError: (error) => {
++        logger.warn("Standalone 账号初始化失败；Registry 保持 fail-closed", {
++          event: "zcode_protocol.provider_registry.standalone_account_error",
++          reason: error instanceof Error ? error.message : String(error),
++        });
++      },
++      onBuiltinRefreshError: (error) => {
++        logger.warn("ZCode Built-in 刷新失败", {
++          event: "zcode_protocol.provider_registry.builtin_refresh_error",
++          reason: error instanceof Error ? error.message : String(error),
++        });
++      },
++      onBuiltinRefreshResult: (event: ZCodeBuiltinRefreshEvent) => {
++        logger.info("ZCode Built-in 刷新结果", {
++          event: "zcode_protocol.provider_registry.builtin_refresh_result",
++          result: event.result,
++          ...(event.reason ? { reason: event.reason } : {}),
++          ...(event.revision === undefined ? {} : { revision: event.revision }),
++        });
++      },
++    },
++  };
++}
++
+ export async function runZCodeProtocolAgent(
+   options: RunZCodeProtocolAgentOptions = {},
+ ): Promise<void> {
+@@ -156,7 +212,11 @@ export async function runZCodeProtocolAgent(
+     providerRegistryRuntime = await acquireProtocolStartupResource({
+       signal: options.lifecycle?.signal,
+       logger,
+-      create: () => startProcessProviderRegistryRuntime(runtimeEnv),
++      create: () =>
++        startProcessProviderRegistryRuntime(
++          runtimeEnv,
++          standaloneAccountRuntimeOptions(runtimeEnv, logger),
++        ),
+       disposeLate: (runtime) => runtime.dispose(),
+     });
+     options.lifecycle?.signal.throwIfAborted();
+@@ -254,6 +314,17 @@ export async function runZCodeProtocolAgent(
+             activeProviderRegistryRuntime.runtime.registryService,
+             activeProviderRegistryRuntime.configuredDefaultModelSelection,
+           ),
++          // 独立运行形态（standalone 账号解析已 opt-in）下，账号型 Provider 的
++          // 模型请求鉴权头由本进程经 Shared Credential Store 解析，必须压过
++          // workspace 层默认装配的 Host-RPC 端口——协议子进程没有 Host 可问，
++          // 静默回退会让每个模型 turn 无认证头而失败。Desktop host 形态不注入
++          // （保持 Host 下发）。
++          ...(activeProviderRegistryRuntime.providerRuntimeHeadersPort
++            ? {
++                providerRuntimeHeadersPort:
++                  activeProviderRegistryRuntime.providerRuntimeHeadersPort,
++              }
++            : {}),
+           // 只读同进程已应用快照；不为子任务另发 Host RPC，也不在 ModelFactory 偷换模型。
+           resolveEffectiveModelSelection: (selection) => {
+             const view = modelSelectionFacade.getView(undefined, undefined, { selection });
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts
+index 4f74cb7..ab9444b 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-operations.ts
+@@ -93,6 +93,14 @@ import {
+   shouldExposeSessionEventToProtocol,
+ } from "./mapper.js";
+ import { optionalModelSelectionFromString } from "./model-mapper.js";
++import {
++  assertModelOptionMatchesEntitlement,
++  assertSessionEntitlement,
++  firstEntitlementMatchedModelOption,
++  resolveEntitlementRouteReasoningLevel,
++  sessionEntitlementReadback,
++  type SessionEntitlementPlan,
++} from "./session-entitlement.js";
+ import {
+   ProtocolRequestError,
+   assertExpectedRevision,
+@@ -1279,6 +1287,9 @@ async function createSessionWithProjection<T>(
+   const recordCreateDurationMs = Date.now() - recordStartedAt;
+   context.assertServing?.();
+   context.sessions.set(sessionId, record);
++  // 会话级语义权益：从创建那一刻起约束本会话的全部模型选择；任何失败都会走
++  // 下方统一清理（关闭半初始化会话），绝不让权益不符的会话存活。
++  record.entitlement = params.entitlement;
+   let setInitialModelDurationMs: number | undefined;
+   let setInitialThoughtLevelDurationMs: number | undefined;
+   let snapshotDurationMs = 0;
+@@ -1287,6 +1298,39 @@ async function createSessionWithProjection<T>(
+   const initialThoughtLevel = params.thoughtLevel;
+   try {
+     await runSessionModelConfigMutation(record.app, async () => {
++      if (record.entitlement) {
++        if (initialModel) {
++          // 显式模型必须声明匹配的账号访问类别；错配直接失败（无回退）。
++          assertModelOptionMatchesEntitlement(
++            record.app.getModelOption?.(initialModel),
++            record.entitlement,
++          );
++        } else {
++          // 未指定模型时确定性地选择第一个匹配权益的 Registry 候选；
++          // 没有匹配候选说明该权益在当前 runtime 不可用——按失败处理，
++          // 绝不能让会话静默落到其他权益路径的默认模型上。
++          const matched = firstEntitlementMatchedModelOption(record.app, record.entitlement);
++          if (!matched) {
++            throw new ProtocolRequestError(
++              -32002,
++              `Entitlement ${record.entitlement} is unavailable on this runtime: no entitled provider declares it`,
++            );
++          }
++          // 权益路由是程序化选择，不是配置命令：对象 Selection 走严格校验，
++          // 档位缺失会让要求 reasoning level 的模型（如 Start 计划目录模型）
++          // 在创建阶段失败。请求档位（若该模型支持）优先，否则用模型自身的
++          // 默认档位——精确语义不回退到其他档位或其他权益路径。
++          const entitlementReasoningLevel = resolveEntitlementRouteReasoningLevel(
++            matched,
++            initialThoughtLevel,
++          );
++          await record.app.setModel({
++            ...matched.ref,
++            ...(entitlementReasoningLevel ? { options: { reasoningLevel: entitlementReasoningLevel } } : {}),
++          });
++          setInitialModelDurationMs = 0;
++        }
++      }
+       if (initialModel) {
+         const setInitialModelStartedAt = Date.now();
+         await record.app.setModel(formatProtocolModelSelection(initialModel));
+@@ -1318,6 +1362,11 @@ async function createSessionWithProjection<T>(
+         });
+       }
+     });
++    // 权威回读核对：创建完成后立即从 Registry 对当前绑定做权益对账；不一致
++    // 或无证据都按创建失败处理（catch 会关闭并移除该会话）。
++    if (record.entitlement) {
++      assertSessionEntitlement(record.app, record.entitlement, "session_create");
++    }
+     if (params.importedHistory) {
+       // 历史导入过去只写 legacy snapshot，taskId 不是真实 protocol sessionId，
+       // setModel/sendPrompt 会打到不存在的 runtime。这里在创建期把历史写入 sessionStore 并 resume，
+@@ -1426,8 +1475,16 @@ export async function activateSessionForResume(
+   await context.sessionResidentPool?.waitForDeactivation(params.sessionId);
+   const existing = context.sessions.get(params.sessionId);
+   if (existing) {
++    if (params.filesystemScope !== undefined &&
++        (existing.filesystemScope ?? "workspace") !== params.filesystemScope) {
++      throw new Error("Cannot change filesystem scope of an active session");
++    }
+     return { record: existing };
+   }
++  // Cold activation has no live scope owner: require the host to re-attest it.
++  if (params.filesystemScope === undefined) {
++    throw new Error("Cold resume requires explicit filesystem scope");
++  }
+   let session = await getPersistedSession(context, params.sessionId);
+   if (!session) {
+     // 诊断：冷恢复只有在持久化记录也不存在时才会走到这里；单凭错误文本无法和
+@@ -1519,6 +1576,13 @@ export async function activateSessionForResume(
+ export async function resumeSession(context: ZCodeProtocolAgentServerContext, rawParams: unknown) {
+   const params = parseParams(zcodeSessionResumeParamsSchema, rawParams);
+   const activated = await activateSessionForResume(context, params);
++  // 会话级权益：resume 是恢复既有会话，不重新选择模型；请求的权益必须与该
++  // 会话当前绑定的 Provider access 一致——读不到证据或不一致都立即失败，
++  // 绝不允许借 resume 把会话切到另一条计费路径。
++  if (params.entitlement) {
++    activated.record.entitlement = params.entitlement;
++    assertSessionEntitlement(activated.record.app, params.entitlement, "session_resume");
++  }
+   return await snapshot(context, activated.record, activated.knownSession);
+ }
+ 
+@@ -2681,10 +2745,18 @@ export async function setModel(context: ZCodeProtocolAgentServerContext, rawPara
+   const params = parseParams(zcodeSessionSetModelParamsSchema, rawParams);
+   const record = requireSession(context, params.sessionId);
+   assertExpectedRevision(record, params.expectedRevision);
++  // 会话级权益约束：目标模型必须声明匹配的账号访问类别；错配在应用前失败。
++  if (record.entitlement) {
++    assertModelOptionMatchesEntitlement(record.app.getModelOption?.(params.model), record.entitlement);
++  }
+   await runSessionModelConfigMutation(record.app, async () => {
+     // 完整 Session 配置命令不能经身份字符串丢掉 reasoning；由共享 setter 原子校验/保存。
+     await record.app.setModel(params.model);
+   });
++  if (record.entitlement) {
++    // 应用后从 Registry 回读核对，防止并发权益状态变化造成静默漂移。
++    assertSessionEntitlement(record.app, record.entitlement, "session_set_model");
++  }
+   return await afterStateMutation(context, record, "model_changed");
+ }
+ 
+@@ -3328,12 +3400,16 @@ async function createRecord(
+   // automation-port 需要读取「本会话」的实时 model/mode/thought；record 在 app 之后才建。
+   // 用可变持有者做惰性绑定：CronCreate 在 turn 中调用 create() 时 record 早已就绪。
+   let ownSessionRecord: ZCodeProtocolSessionRecord | undefined;
++  if (params.filesystemScope === "machine" && workspace.remoteSessionId) {
++    throw new Error("Machine filesystem scope requires a local workspace");
++  }
+   const app = await createWorkspaceZCodeApp(context, workspace, {
+     env: context.deps.env,
+     eventStore,
+     resume,
+     runtimeConfig: {
+       mode: "mode" in params ? params.mode : undefined,
++      filesystemScope: params.filesystemScope ?? "workspace",
+       modelSelection: "model" in params ? toRuntimeModelSelection(initialModel) : undefined,
+       parentSessionId,
+       taskType,
+@@ -3406,6 +3482,7 @@ async function createRecord(
+   });
+   const now = Date.now();
+   const record: ZCodeProtocolSessionRecord = {
++    filesystemScope: params.filesystemScope ?? "workspace",
+     app,
+     createdAt: now,
+     eventStore,
+@@ -3570,6 +3647,7 @@ async function snapshotWithDiagnostics(
+   const builtSnapshot = await buildSessionSnapshot({
+     app: record.app,
+     deliveryKind: record.deliveryKind,
++    entitlement: record.entitlement,
+     eventSeq,
+     fallbackCreatedAt: record.createdAt,
+     fallbackUpdatedAt: record.updatedAt,
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-types.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-types.ts
+index 194247f..a5578e7 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-types.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server-types.ts
+@@ -115,6 +115,13 @@ export interface ZCodeProtocolSessionRecord {
+   restoreWarning?: { message: string; type: string };
+   /** 冷恢复候选只供初始投影；新的选模事件立即清除，不能替代 Runtime 执行绑定。 */
+   restoredModelSelection?: ModelSelection;
++  /**
++   * 会话级语义权益（session/create 或 session/resume 显式声明）。存在时，
++   * 本会话的模型选择只允许匹配该账号访问类别（zhipu planKind）；readback
++   * 通过 session/read settings.entitlement 给出 requested/observed/source。
++   */
++  entitlement?: "start-plan" | "individual-coding-plan";
++  filesystemScope?: "workspace" | "machine";
+ }
+ 
+ export interface ZCodeProtocolClientRequestOptions {
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server.ts
+index 5dee835..e67bd40 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/server.ts
+@@ -676,7 +676,7 @@ export class ZCodeProtocolAgentServer {
+       case zcodeProtocolMethods.processChildProcesses:
+         return listChildProcesses(this.context.deps.mcpTelemetry?.listProcesses() ?? []);
+       case zcodeProtocolMethods.runtimeCapabilities:
+-        return { independentPlanState: true };
++        return { independentPlanState: true, entitlementSelection: true, machineLocalFilesystem: true };
+       case zcodeProtocolMethods.pluginsMarketplaceAdd:
+         return await this.withPluginOperationSignal(request, (signal) =>
+           addPluginMarketplace(this.context, request.params, signal),
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/session-entitlement.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/session-entitlement.ts
+new file mode 100644
+index 0000000..e536c02
+--- /dev/null
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/session-entitlement.ts
+@@ -0,0 +1,121 @@
++import type {
++  ModelSelection,
++  ZCodeModelOption,
++  ZCodeSessionEntitlement,
++} from "@zcode/shared";
++import type { ZCodeApp } from "../app/types.js";
++import { ProtocolRequestError } from "./server-types.js";
++
++/**
++ * 会话级语义权益（billing entitlement）的运行时强制与权威回读。
++ *
++ * 权益语义 = zhipu 账号 planKind（"start-plan" | "individual-coding-plan"），
++ * 显式声明、显式核对；绝不从 Provider ID、模型名或请求参数推断。DEFAULT
++ * （不声明）保持历史行为，不做任何权益收窄。
++ */
++export type SessionEntitlementPlan = NonNullable<ZCodeSessionEntitlement["requested"]>;
++
++/** 权益回读里的 observed/access 事实只来自 Registry 已准入 Provider 的 access 约束。 */
++export type SessionEntitlementAccess = NonNullable<ZCodeSessionEntitlement["observed"]>;
++
++/**
++ * 当前会话绑定选择的语义权益事实。返回 null 表示本轮无法给出权益事实
++ * （未绑定模型、Provider 不是账号型，或 runtime 未暴露 access 约束）。
++ */
++export function observeSessionEntitlement(
++  app: Pick<ZCodeApp, "getModelOption" | "listModels"> & {
++    runtime: { getSessionModelSelection(): ModelSelection | undefined };
++  },
++): { observed: SessionEntitlementAccess | null; source: "provider-registry" | "unavailable" } {
++  const selection = app.runtime.getSessionModelSelection();
++  const option = selection
++    ? (app.getModelOption?.(selection) ??
++      app.listModels().find(
++        (candidate) =>
++          candidate.ref.providerId === selection.providerId &&
++          candidate.ref.modelId === selection.modelId,
++      ))
++    : undefined;
++  const access = option?.accountAccess;
++  return access?.type === "zhipu-account"
++    ? { observed: access, source: "provider-registry" }
++    : { observed: null, source: "unavailable" };
++}
++
++/** Registry 目录中第一个声明匹配权益的候选（确定性：按 Registry 顺序）。 */
++export function firstEntitlementMatchedModelOption(
++  app: Pick<ZCodeApp, "listModels">,
++  entitlement: SessionEntitlementPlan,
++): ZCodeModelOption | undefined {
++  return app.listModels().find((option) => option.accountAccess?.mode === entitlement);
++}
++
++/**
++ * 权益路由的程序化 setModel 需要的档位：请求档位优先（且必须被该模型
++ * 支持），否则用模型自身的默认档位。返回 undefined 表示该模型不要求档位，
++ * Selection 保持不带 options（严格校验仅在要求档位的模型上触发）。
++ */
++export function resolveEntitlementRouteReasoningLevel(
++  matched: ZCodeModelOption,
++  requested: string | undefined,
++): string | undefined {
++  const levels = matched.reasoning?.levels ?? [];
++  // 该模型不声明任何档位能力时不得硬塞档位（严格校验也不会要求它）。
++  if (levels.length === 0) return undefined;
++  const requestedLevel = requested?.trim();
++  if (requestedLevel && levels.some((l) => l.value === requestedLevel)) {
++    return requestedLevel;
++  }
++  return matched.reasoning?.defaultLevel ?? levels.at(-1)?.value;
++}
++
++/**
++ * 把“当前会话选择”与请求权益严格对账。不一致或缺证据都抛协议错误（fail
++ * closed），调用方负责回滚会话；不存在静默降级或跨权益回退。
++ */
++export function assertSessionEntitlement(
++  app: Parameters<typeof observeSessionEntitlement>[0],
++  entitlement: SessionEntitlementPlan,
++  phase: string,
++): void {
++  const { observed, source } = observeSessionEntitlement(app);
++  if (source !== "provider-registry" || !observed) {
++    throw new ProtocolRequestError(
++      -32002,
++      `Entitlement ${entitlement} could not be attested for this session (${phase}): no registry-backed account access fact for the current model selection`,
++    );
++  }
++  if (observed.mode !== entitlement) {
++    throw new ProtocolRequestError(
++      -32002,
++      `Entitlement mismatch for this session (${phase}): requested ${entitlement}, observed ${observed.mode}`,
++    );
++  }
++}
++
++/** setModel/初始模型前的权益约束核对：候选模型必须声明匹配的账号访问类别。 */
++export function assertModelOptionMatchesEntitlement(
++  option: ZCodeModelOption | undefined,
++  entitlement: SessionEntitlementPlan,
++): void {
++  if (!option) return; // 未知候选由 Registry 校验按原路径失败，不在这里重复报错。
++  if (option.accountAccess?.mode !== entitlement) {
++    throw new ProtocolRequestError(
++      -32002,
++      `Entitlement mismatch: requested ${entitlement}, candidate model ${option.ref.providerId}/${option.ref.modelId} is bound to ${option.accountAccess?.mode ?? "no account access"}`,
++    );
++  }
++}
++
++/** session/read settings.entitlement 回读（无凭据、可审计）。 */
++export function sessionEntitlementReadback(
++  app: Parameters<typeof observeSessionEntitlement>[0],
++  entitlement: SessionEntitlementPlan | undefined,
++): ZCodeSessionEntitlement {
++  const { observed, source } = observeSessionEntitlement(app);
++  return {
++    ...(entitlement ? { requested: entitlement } : {}),
++    observed,
++    source,
++  };
++}
+diff --git a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/session-mapper.ts b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/session-mapper.ts
+index 0085472..203eb38 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/session-mapper.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/zcode-protocol/session-mapper.ts
+@@ -45,6 +45,7 @@ import {
+ import type { ZCodeApp } from "../app/types.js";
+ import { mapMessageWithParts } from "./message-mapper.js";
+ import { formatProtocolModelSelection, optionalModelSelectionFromString } from "./model-mapper.js";
++import { sessionEntitlementReadback } from "./session-entitlement.js";
+ import {
+   buildProtocolPermissionOptions,
+   toLegacyPermissionOptionsPolicy,
+@@ -59,6 +60,7 @@ const SNAPSHOT_INLINE_IMAGE_DATA_URL_MAX_BYTES = 20 * 1024 * 1024;
+ export async function buildSessionSnapshot(input: {
+   app: ZCodeApp;
+   deliveryKind?: ZCodeDeliveryKind;
++  entitlement?: "start-plan" | "individual-coding-plan";
+   eventSeq: number;
+   fallbackCreatedAt?: number;
+   fallbackUpdatedAt?: number;
+@@ -123,6 +125,7 @@ export async function buildSessionSnapshot(input: {
+     }),
+     settings: await mapSessionSettings(input.app, {
+       currentModelContextWindow: projection.contextWindow,
++      entitlement: input.entitlement,
+       modelAvailability: input.modelAvailability,
+     }),
+     slashCommands: await listProtocolSlashCommands({
+@@ -216,6 +219,7 @@ export async function mapSessionSettings(
+   app: ZCodeApp,
+   options: {
+     currentModelContextWindow?: number;
++    entitlement?: "start-plan" | "individual-coding-plan";
+     modelAvailability?: "all" | "current";
+   } = {},
+ ): Promise<ZCodeSessionSettingsState> {
+@@ -262,6 +266,9 @@ export async function mapSessionSettings(
+       current: app.runtime.getSessionModelSelection(),
+       lastUsed: optionalModelSelectionFromString(currentModel),
+     },
++    // 权益回读：observed 恒来自当前会话绑定 Provider 的 Registry access 事实，
++    // 绝不从 Provider ID/模型名推断；runtime 不暴露该事实时 source=unavailable。
++    entitlement: sessionEntitlementReadback(app, options.entitlement),
+     permission: {
+       mode: app.getMode(),
+     },
+diff --git a/apps/zcode-cli/packages/bootstrap/test/filesystem-scope.test.ts b/apps/zcode-cli/packages/bootstrap/test/filesystem-scope.test.ts
+new file mode 100644
+index 0000000..9112dfa
+--- /dev/null
++++ b/apps/zcode-cli/packages/bootstrap/test/filesystem-scope.test.ts
+@@ -0,0 +1,23 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { activateSessionForResume } from "../src/zcode-protocol/server-operations.js";
++
++test("active scope is immutable and omitted scope preserves it", async () => {
++  for (const filesystemScope of ["workspace", "machine"] as const) {
++    const record = { filesystemScope };
++    const context = { sessions: new Map([["test", record]]), deps: {} } as any;
++    assert.equal((await activateSessionForResume(context, { sessionId: "test" } as any)).record, record);
++    assert.equal((await activateSessionForResume(context, { sessionId: "test", filesystemScope } as any)).record, record);
++    await assert.rejects(activateSessionForResume(context, { sessionId: "test", filesystemScope: filesystemScope === "machine" ? "workspace" : "machine" } as any), /Cannot change/);
++  }
++});
++test("cold resume requires explicit scope after deactivation wait", async () => {
++  const sessions = new Map([["test", { filesystemScope: "machine" }]]);
++  const context = { sessions, deps: {}, sessionResidentPool: { waitForDeactivation: async () => { sessions.clear(); } } } as any;
++  await assert.rejects(activateSessionForResume(context, { sessionId: "test" } as any), /explicit filesystem scope/);
++});
++test("scope is checked against the session present after the wait", async () => {
++  const sessions = new Map();
++  const context = { sessions, deps: {}, sessionResidentPool: { waitForDeactivation: async () => { sessions.set("test", { filesystemScope: "workspace" }); } } } as any;
++  await assert.rejects(activateSessionForResume(context, { sessionId: "test", filesystemScope: "machine" } as any), /Cannot change/);
++});
+diff --git a/apps/zcode-cli/packages/bootstrap/test/protocol-standalone-account-runtime.test.ts b/apps/zcode-cli/packages/bootstrap/test/protocol-standalone-account-runtime.test.ts
+new file mode 100644
+index 0000000..4f14823
+--- /dev/null
++++ b/apps/zcode-cli/packages/bootstrap/test/protocol-standalone-account-runtime.test.ts
+@@ -0,0 +1,201 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import type { Logger, LogContext } from "@zcode/contracts";
++import {
++  ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV,
++  isStandaloneAccountRuntimeEnabled,
++  standaloneAccountRuntimeOptions,
++} from "../src/zcode-protocol-entrypoint.js";
++
++function recordingLogger() {
++  const calls: Array<{ level: string; message: string; context?: LogContext }> = [];
++  const logger: Logger = {
++    debug(message, context) {
++      calls.push({ level: "debug", message, context });
++    },
++    info(message, context) {
++      calls.push({ level: "info", message, context });
++    },
++    warn(message, context) {
++      calls.push({ level: "warn", message, context });
++    },
++    error() {},
++    child() {
++      return logger;
++    },
++  };
++  return { logger, calls };
++}
++
++test("standalone account runtime is opt-in only (fail-closed default)", () => {
++  assert.equal(isStandaloneAccountRuntimeEnabled({}), false);
++  assert.equal(isStandaloneAccountRuntimeEnabled({ [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: "" }), false);
++  assert.equal(isStandaloneAccountRuntimeEnabled({ [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: "0" }), false);
++  assert.equal(isStandaloneAccountRuntimeEnabled({ [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: "false" }), false);
++  assert.equal(isStandaloneAccountRuntimeEnabled({ [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: "off" }), false);
++  assert.equal(isStandaloneAccountRuntimeEnabled({ [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: "yes" }), false);
++  assert.equal(isStandaloneAccountRuntimeEnabled({ [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: " true " }), true);
++  assert.equal(isStandaloneAccountRuntimeEnabled({ [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: "TRUE" }), true);
++  assert.equal(isStandaloneAccountRuntimeEnabled({ [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: "1" }), true);
++});
++
++test("desktop-host default keeps the protocol entrypoint on the host-delivered path", () => {
++  const { logger } = recordingLogger();
++  assert.deepEqual(standaloneAccountRuntimeOptions({}, logger), {});
++  assert.deepEqual(
++    standaloneAccountRuntimeOptions({ [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: "0" }, logger),
++    {},
++  );
++});
++
++test("opt-in wires observability callbacks only; no entitlement bypass is constructed", () => {
++  const { logger, calls } = recordingLogger();
++  const options = standaloneAccountRuntimeOptions(
++    { [ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME_ENV]: "1" },
++    logger,
++  );
++  const standalone = options.standalone;
++  assert.ok(standalone, "opt-in must produce a standalone block");
++  // 只允许观测回调：凭据 store、请求通道与旧配置导入都走 runtime 默认实现，
++  // 这里不允许出现任何注入面（无 credentialStore/request/legacyCliUserConfigFilePath 字段）。
++  assert.deepEqual(Object.keys(standalone).sort(), [
++    "onAccountInitializationError",
++    "onBuiltinRefreshError",
++    "onBuiltinRefreshResult",
++  ]);
++
++  // 回调只记录事实且不得抛出——观测失败不能改变账号解析结果。
++  assert.doesNotThrow(() => standalone.onAccountInitializationError?.(new Error("store unavailable")));
++  assert.doesNotThrow(() => standalone.onBuiltinRefreshError?.("boom"));
++  assert.doesNotThrow(() =>
++    standalone.onBuiltinRefreshResult?.({ result: "updated", revision: 7 }),
++  );
++  assert.equal(calls.filter((call) => call.level === "warn").length, 2);
++  const refresh = calls.find((call) => call.context?.event === "zcode_protocol.provider_registry.builtin_refresh_result");
++  assert.ok(refresh);
++  assert.equal((refresh.context as Record<string, unknown>).revision, 7);
++  // 日志只含错误消息与刷新事实，不携带任何凭据材料字段。
++  for (const call of calls) {
++    const text = JSON.stringify(call);
++    assert.match(text, /^[\s\S]{1,500}$/);
++    assert.equal(/api[-_]?key|token|jwt|secret/i.test(text), false);
++  }
++});
++
++// ── entitlement route reasoning level (standalone plan routing) ──────────
++import { resolveEntitlementRouteReasoningLevel } from "../src/zcode-protocol/session-entitlement.js";
++import type { ZCodeModelOption } from "@zcode/shared";
++
++function option(levels: string[], defaultLevel?: string): ZCodeModelOption {
++  return {
++    ref: { providerId: "account:zai-start-plan", modelId: "GLM-5.3-Flash" },
++    label: "GLM-5.3-Flash",
++    providerLabel: "account:zai-start-plan",
++    reasoning: {
++      levels: levels.map((value) => ({ value, label: value })),
++      ...(defaultLevel !== undefined ? { defaultLevel } : {}),
++    },
++  } as unknown as ZCodeModelOption;
++}
++
++test("entitlement route reasoning level: requested level wins when supported", () => {
++  const matched = option(["low", "high", "max"]);
++  assert.equal(resolveEntitlementRouteReasoningLevel(matched, "max"), "max");
++  assert.equal(resolveEntitlementRouteReasoningLevel(matched, " max "), "max");
++  // Unsupported requested level falls back to the model's own default —
++  // never to an unsupported or invented level.
++  assert.equal(resolveEntitlementRouteReasoningLevel(matched, "ultra"), "max");
++  assert.equal(resolveEntitlementRouteReasoningLevel(matched, undefined), "max");
++});
++
++test("entitlement route reasoning level: no levels or no default stays unset", () => {
++  assert.equal(resolveEntitlementRouteReasoningLevel(option([]), "max"), undefined);
++  // A model declaring levels without an explicit default uses the last level.
++  const noDefault = option(["low", "high"]);
++  assert.equal(resolveEntitlementRouteReasoningLevel(noDefault, undefined), "high");
++});
++
++// ── standalone Individual identity resolution (Desktop-host parity) ──────
++import { join } from "node:path";
++import {
++  SHARED_ZCODE_CREDENTIAL_KEYS,
++  type SharedZCodeCredentialStore,
++} from "@zcode/adapters/auth";
++import { readStandaloneAccountProviderConfigSnapshot } from "../src/app/standalone-account-provider-runtime.js";
++
++function fakeCredentialStore(initial: Record<string, string>): SharedZCodeCredentialStore {
++  const values = new Map(Object.entries(initial));
++  return {
++    filePath: "<memory>",
++    async clearZaiLoginCredentials() {},
++    async delete() {},
++    async deleteIfValue() { return false; },
++    async deleteIfValues() { return {}; },
++    async deleteManyIfValue() { return false; },
++    async load(key) { return values.get(key) ?? null; },
++    async loadMany(keys) {
++      return Object.fromEntries(keys.map((key) => [key, values.get(key) ?? null]));
++    },
++    async save() {},
++    async saveMany(entries) {
++      for (const [key, value] of Object.entries(entries)) values.set(key, value);
++    },
++    async saveReplacing() {},
++    async saveZaiLoginCredentials() {},
++  } as unknown as SharedZCodeCredentialStore;
++}
++
++const repoBuiltinConfigFile = join(
++  import.meta.dirname,
++  "../../../../../config/provider/zcode-builtin.json",
++);
++const builtinConfigEnv = { ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: repoBuiltinConfigFile };
++const INDIVIDUAL_PROVIDER = "account:zai-individual-coding-plan";
++
++function isEntitled(snapshot: { providers: Map<string, { access?: { type?: string; entitled?: boolean } }> }, providerId: string): boolean {
++  const access = snapshot.providers.get(providerId)?.access;
++  return access?.type === "zhipu-account" ? access.entitled === true : false;
++}
++
++test("individual entitlement resolves via OAuth user profile identity (host parity)", async () => {
++  // Exactly the state observed on this machine: OAuth login material + the
++  // Desktop-host-cached coding-plan api-key, but NO per-provider identity key
++  // (the host derives the identity from the profile and never writes it).
++  const store = fakeCredentialStore({
++    [SHARED_ZCODE_CREDENTIAL_KEYS.activeProvider]: "zai",
++    [SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo]: JSON.stringify({ id: "user-1" }),
++    "account-provider:coding-plan:account:zai-individual-coding-plan:account:user-1:api-key":
++      "test-individual-key",
++  });
++  const snapshot = await readStandaloneAccountProviderConfigSnapshot(store, builtinConfigEnv);
++  assert.equal(isEntitled(snapshot, INDIVIDUAL_PROVIDER), true);
++});
++
++test("individual entitlement stays fail-closed without the cached api-key", async () => {
++  const store = fakeCredentialStore({
++    [SHARED_ZCODE_CREDENTIAL_KEYS.activeProvider]: "zai",
++    [SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo]: JSON.stringify({ id: "user-1" }),
++  });
++  const snapshot = await readStandaloneAccountProviderConfigSnapshot(store, builtinConfigEnv);
++  assert.equal(isEntitled(snapshot, INDIVIDUAL_PROVIDER), false);
++});
++
++test("individual entitlement stays fail-closed without any identity source", async () => {
++  const store = fakeCredentialStore({
++    "account-provider:coding-plan:account:zai-individual-coding-plan:account:user-1:api-key":
++      "test-individual-key",
++  });
++  const snapshot = await readStandaloneAccountProviderConfigSnapshot(store, builtinConfigEnv);
++  assert.equal(isEntitled(snapshot, INDIVIDUAL_PROVIDER), false);
++});
++
++test("per-provider identity key (if written) still takes precedence", async () => {
++  const store = fakeCredentialStore({
++    [SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo]: JSON.stringify({ id: "oauth-user" }),
++    "account-provider:account:zai-individual-coding-plan:identity": "user-2",
++    "account-provider:coding-plan:account:zai-individual-coding-plan:account:user-2:api-key":
++      "test-individual-key-2",
++  });
++  const snapshot = await readStandaloneAccountProviderConfigSnapshot(store, builtinConfigEnv);
++  assert.equal(isEntitled(snapshot, INDIVIDUAL_PROVIDER), true);
++});
+diff --git a/apps/zcode-cli/packages/bootstrap/test/standalone-session-entitlement.test.ts b/apps/zcode-cli/packages/bootstrap/test/standalone-session-entitlement.test.ts
+new file mode 100644
+index 0000000..8280bc9
+--- /dev/null
++++ b/apps/zcode-cli/packages/bootstrap/test/standalone-session-entitlement.test.ts
+@@ -0,0 +1,336 @@
++import assert from "node:assert/strict";
++import { join } from "node:path";
++import test from "node:test";
++import {
++  zcodeSessionCreateParamsSchema,
++  zcodeSessionSettingsStateSchema,
++} from "@zcode/shared";
++import {
++  SHARED_ZCODE_CREDENTIAL_KEYS,
++  type SharedZCodeCredentialStore,
++} from "@zcode/adapters/auth";
++import {
++  createStandaloneProviderRuntimeHeadersPort,
++  readStandaloneAccountProviderConfigSnapshot,
++  readStandaloneCodingPlanProviders,
++  readStandaloneStartPlanEntitlementByFamily,
++} from "../src/app/standalone-account-provider-runtime.js";
++import {
++  assertModelOptionMatchesEntitlement,
++  assertSessionEntitlement,
++  sessionEntitlementReadback,
++} from "../src/zcode-protocol/session-entitlement.js";
++
++/** Minimal in-memory stand-in for the shared credential store. */
++function fakeCredentialStore(initial: Record<string, string>): SharedZCodeCredentialStore {
++  const values = new Map(Object.entries(initial));
++  return {
++    filePath: "<memory>",
++    async clearZaiLoginCredentials() {
++      for (const key of [
++        SHARED_ZCODE_CREDENTIAL_KEYS.zaiAccessToken,
++        SHARED_ZCODE_CREDENTIAL_KEYS.zaiRefreshToken,
++        SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo,
++        SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken,
++      ])
++        values.delete(key);
++    },
++    async delete(key) {
++      values.delete(key);
++    },
++    async deleteIfValue(key, expected) {
++      const deleted = values.get(key) === expected;
++      if (deleted) values.delete(key);
++      return deleted;
++    },
++    async deleteIfValues(expected) {
++      const result: Record<string, boolean> = {};
++      for (const [key, value] of Object.entries(expected)) {
++        result[key] = values.get(key) === value;
++        if (result[key]) values.delete(key);
++      }
++      return result;
++    },
++    async deleteManyIfValue(guardKey, guardValue, keys) {
++      if (values.get(guardKey) !== guardValue) return false;
++      for (const key of keys) values.delete(key);
++      return true;
++    },
++    async load(key) {
++      return values.get(key) ?? null;
++    },
++    async loadMany(keys) {
++      return Object.fromEntries(keys.map((key) => [key, values.get(key) ?? null]));
++    },
++    async save(key, value) {
++      values.set(key, value);
++    },
++    async saveMany(entries) {
++      for (const [key, value] of Object.entries(entries)) values.set(key, value);
++    },
++    async saveReplacing(key, value, replacedKeys) {
++      values.set(key, value);
++      for (const replaced of replacedKeys) if (replaced !== key) values.delete(replaced);
++    },
++    async saveZaiLoginCredentials() {
++      throw new Error("not needed in tests");
++    },
++  } as unknown as SharedZCodeCredentialStore;
++}
++
++/**
++ * 随仓库分发的 Built-in Provider 目录（与 CLI bundle 的 provider/zcode-builtin.json
++ * 同源）。直接对真实目录断言，避免 fixture 与真实 schema 漂移。
++ */
++const repoBuiltinConfigFile = join(
++  import.meta.dirname,
++  "../../../../../config/provider/zcode-builtin.json",
++);
++const builtinConfigEnv = { ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: repoBuiltinConfigFile };
++
++test("standalone catalog admits both Individual and Start providers", async () => {
++  const providers = await readStandaloneCodingPlanProviders(builtinConfigEnv);
++  const modes = [...new Set(providers.map((provider) => provider.mode))].sort();
++  assert.deepEqual(modes, ["individual-coding-plan", "start-plan"]);
++  const zaiProviders = providers.filter((provider) => provider.family === "zai");
++  assert.equal(zaiProviders.length, 2);
++  const zaiStart = zaiProviders.find((provider) => provider.mode === "start-plan");
++  assert.equal(zaiStart?.providerId, "account:zai-start-plan");
++  assert.match(zaiStart?.modelId ?? "", /^GLM-/);
++});
++
++test("Start entitlement requires activeProvider + JWT + user info for that family", async () => {
++  const env = builtinConfigEnv;
++    const complete = fakeCredentialStore({
++      [SHARED_ZCODE_CREDENTIAL_KEYS.activeProvider]: "zai",
++      [SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken]: "test-jwt",
++      [SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo]: JSON.stringify({ id: "user-1" }),
++      "account-provider:account:zai-individual-coding-plan:identity": "user-1",
++      "account-provider:coding-plan:account:zai-individual-coding-plan:account:user-1:api-key":
++        "test-individual-key",
++    });
++    const entitled = await readStandaloneStartPlanEntitlementByFamily(complete);
++    assert.equal(entitled.get("zai"), true);
++    assert.equal(entitled.get("bigmodel"), false);
++    const snapshot = await readStandaloneAccountProviderConfigSnapshot(complete, env);
++    const accessByProvider = new Map(
++      snapshot.providers.entries().map(([id, config]) => [id, config.access]),
++    );
++    assert.equal(
++      accessByProvider.get("account:zai-start-plan")?.type === "zhipu-account" &&
++        accessByProvider.get("account:zai-start-plan")!.entitled,
++      true,
++    );
++    assert.equal(
++      accessByProvider.get("account:zai-individual-coding-plan")?.type === "zhipu-account" &&
++        accessByProvider.get("account:zai-individual-coding-plan")!.entitled,
++      true,
++    );
++
++    // 手工 API Key 路径不写 activeProvider/OAuth 材料 → 不得误判成 Start 权益。
++    const manualKeyOnly = fakeCredentialStore({
++      "account-provider:account:zai-individual-coding-plan:identity": "key-abc",
++      "account-provider:coding-plan:account:zai-individual-coding-plan:account:key-abc:api-key":
++        "test-individual-key",
++    });
++    const manualEntitlement = await readStandaloneStartPlanEntitlementByFamily(manualKeyOnly);
++    assert.equal(manualEntitlement.get("zai"), false);
++    const manualSnapshot = await readStandaloneAccountProviderConfigSnapshot(manualKeyOnly, env);
++    const manualAccess = manualSnapshot.providers.get("account:zai-start-plan")?.access;
++    assert.equal(manualAccess?.type === "zhipu-account" ? manualAccess.entitled : false, false);
++    assert.equal(
++      manualSnapshot.providers.get("account:zai-individual-coding-plan")?.access?.type ===
++        "zhipu-account"
++        ? manualSnapshot.providers.get("account:zai-individual-coding-plan")!.access!.entitled
++        : false,
++      true,
++    );
++
++    // JWT 缺失（只有 activeProvider + userInfo）→ Start 无权益。
++    const missingJwt = fakeCredentialStore({
++      [SHARED_ZCODE_CREDENTIAL_KEYS.activeProvider]: "zai",
++      [SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo]: JSON.stringify({ id: "user-1" }),
++    });
++    assert.equal(
++      (await readStandaloneStartPlanEntitlementByFamily(missingJwt)).get("zai"),
++      false,
++    );
++});
++
++test("headers port authenticates Start via JWT and Individual via plan key, never cross-plan", async () => {
++  const env = builtinConfigEnv;
++    const store = fakeCredentialStore({
++      [SHARED_ZCODE_CREDENTIAL_KEYS.activeProvider]: "zai",
++      [SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken]: "test-jwt",
++      [SHARED_ZCODE_CREDENTIAL_KEYS.zaiUserInfo]: JSON.stringify({ id: "user-1" }),
++      "account-provider:account:zai-individual-coding-plan:identity": "user-1",
++      "account-provider:coding-plan:account:zai-individual-coding-plan:account:user-1:api-key":
++        "test-individual-key",
++    });
++    const port = createStandaloneProviderRuntimeHeadersPort(store, env);
++
++    const start = await port.refreshBeforeModelRequest({
++      accountAccess: { type: "zhipu-account", accountType: "zai", mode: "start-plan", entitled: true },
++      modelId: "GLM-5.3-Flash",
++      providerId: "account:zai-start-plan",
++      reason: "model-request",
++      sessionId: "sess_00000000-0000-0000-0000-000000000000" as never,
++      traceContext: {} as never,
++    });
++    assert.equal(start.headersApplied, true);
++    assert.equal(start.requestAuth?.apiKey, "test-jwt");
++
++    const individual = await port.refreshBeforeModelRequest({
++      accountAccess: {
++        type: "zhipu-account",
++        accountType: "zai",
++        mode: "individual-coding-plan",
++        entitled: true,
++      },
++      modelId: "GLM-5.3",
++      providerId: "account:zai-individual-coding-plan",
++      reason: "model-request",
++      sessionId: "sess_00000000-0000-0000-0000-000000000000" as never,
++      traceContext: {} as never,
++    });
++    assert.equal(individual.requestAuth?.apiKey, "test-individual-key");
++
++    // Start 材料指向 zai，但请求 bigmodel Start Provider → 必须失败（无跨 family 复用）。
++    await assert.rejects(
++      port.refreshBeforeModelRequest({
++        accountAccess: {
++          type: "zhipu-account",
++          accountType: "bigmodel",
++          mode: "start-plan",
++          entitled: false,
++        },
++        modelId: "GLM-5.3-Flash",
++        providerId: "account:bigmodel-start-plan",
++        reason: "model-request",
++        sessionId: "sess_00000000-0000-0000-0000-000000000000" as never,
++        traceContext: {} as never,
++      }),
++    );
++
++    // Start Provider 身份不能携带 Individual 请求（材料与 plan 不匹配 → 失败）。
++    const individualOnly = fakeCredentialStore({
++      "account-provider:account:zai-individual-coding-plan:identity": "user-1",
++      "account-provider:coding-plan:account:zai-individual-coding-plan:account:user-1:api-key":
++        "test-individual-key",
++    });
++    await assert.rejects(
++      createStandaloneProviderRuntimeHeadersPort(individualOnly, env).refreshBeforeModelRequest({
++        accountAccess: {
++          type: "zhipu-account",
++          accountType: "zai",
++          mode: "start-plan",
++          entitled: false,
++        },
++        modelId: "GLM-5.3-Flash",
++        providerId: "account:zai-start-plan",
++        reason: "model-request",
++        sessionId: "sess_00000000-0000-0000-0000-000000000000" as never,
++        traceContext: {} as never,
++      }),
++    );
++});
++
++test("session entitlement readback never fabricates observed facts", () => {
++  const app = {
++    runtime: {
++      getSessionModelSelection: () => ({
++        providerId: "account:zai-start-plan",
++        modelId: "GLM-5.3-Flash",
++      }),
++    },
++    getModelOption: (selection: { providerId: string; modelId: string }) =>
++      selection.providerId === "account:zai-start-plan"
++        ? {
++            ref: selection,
++            label: "GLM-5.3-Flash",
++            properties: { inputFormat: "text" as const, outputFormat: "text" as const },
++            accountAccess: {
++              type: "zhipu-account" as const,
++              accountType: "zai" as const,
++              mode: "start-plan" as const,
++              entitled: true,
++            },
++          }
++        : undefined,
++    listModels: () => [],
++  };
++  const readback = sessionEntitlementReadback(app, "start-plan");
++  assert.deepEqual(readback, {
++    requested: "start-plan",
++    observed: {
++      type: "zhipu-account",
++      accountType: "zai",
++      mode: "start-plan",
++      entitled: true,
++    },
++    source: "provider-registry",
++  });
++  assertSessionEntitlement(app, "start-plan", "test");
++  assert.throws(() => assertSessionEntitlement(app, "individual-coding-plan", "test"));
++
++  const unresolvable = {
++    runtime: { getSessionModelSelection: () => undefined },
++    getModelOption: () => undefined,
++    listModels: () => [],
++  };
++  const unavailable = sessionEntitlementReadback(unresolvable, undefined);
++  assert.equal(unavailable.requested, undefined);
++  assert.equal(unavailable.observed, null);
++  assert.equal(unavailable.source, "unavailable");
++  assert.throws(() => assertSessionEntitlement(unresolvable, "start-plan", "test"));
++});
++
++test("model option entitlement gate rejects cross-plan candidates before selection", () => {
++  const startOption = {
++    ref: { providerId: "account:zai-start-plan", modelId: "GLM-5.3-Flash" },
++    label: "GLM-5.3-Flash",
++    properties: { inputFormat: "text" as const, outputFormat: "text" as const },
++    accountAccess: {
++      type: "zhipu-account" as const,
++      accountType: "zai" as const,
++      mode: "start-plan" as const,
++      entitled: true,
++    },
++  };
++  const plainOption = {
++    ref: { providerId: "custom-api", modelId: "some-model" },
++    label: "some-model",
++    properties: { inputFormat: "text" as const, outputFormat: "text" as const },
++  };
++  assert.doesNotThrow(() => assertModelOptionMatchesEntitlement(startOption, "start-plan"));
++  assert.throws(() => assertModelOptionMatchesEntitlement(startOption, "individual-coding-plan"));
++  // 非账号型候选（无 access 事实）同样不得进入受权益约束的会话。
++  assert.throws(() => assertModelOptionMatchesEntitlement(plainOption, "start-plan"));
++});
++
++test("protocol schemas accept the entitlement selector and readback, reject unknown values", () => {
++  const created = zcodeSessionCreateParamsSchema.safeParse({
++    workspace: { workspaceKey: "k", workspacePath: "/tmp/w" },
++    entitlement: "start-plan",
++  });
++  assert.equal(created.success, true);
++  const rejected = zcodeSessionCreateParamsSchema.safeParse({
++    workspace: { workspaceKey: "k", workspacePath: "/tmp/w" },
++    entitlement: "builtin:zai-start-plan",
++  });
++  assert.equal(rejected.success, false);
++  // 旧字段集合（不带 entitlement）继续有效——DEFAULT 行为保持不变。
++  assert.equal(
++    zcodeSessionCreateParamsSchema.safeParse({
++      workspace: { workspaceKey: "k", workspacePath: "/tmp/w" },
++    }).success,
++    true,
++  );
++  const settings = zcodeSessionSettingsStateSchema.safeParse({
++    model: { available: [] },
++    thoughtLevel: { available: [], enabled: false },
++    mode: { current: "build" },
++    entitlement: { requested: "start-plan", observed: null, source: "unavailable" },
++  });
++  assert.equal(settings.success, true);
++});
+diff --git a/apps/zcode-cli/packages/core/src/runtime/helpers/runtime-tools.ts b/apps/zcode-cli/packages/core/src/runtime/helpers/runtime-tools.ts
+index 2c9f2ee..0e65585 100644
+--- a/apps/zcode-cli/packages/core/src/runtime/helpers/runtime-tools.ts
++++ b/apps/zcode-cli/packages/core/src/runtime/helpers/runtime-tools.ts
+@@ -216,6 +216,7 @@ function createRuntimeToolExecutor(
+     getWorkingDirectory: () => runtime.workingDirectory,
+     setWorkingDirectory: runtime.setWorkingDirectory.bind(runtime),
+     getWorkspaceRoot: () => runtime.workspaceRoot,
++    filesystemScope: runtime.config.filesystemScope,
+     workspaceIdentity: runtime.config.workspaceIdentity?.toString(),
+     remoteSessionId: runtime.config.remoteSessionId,
+     clientMode: runtime.config.clientMode,
+diff --git a/apps/zcode-cli/packages/core/src/runtime/methods/embedded-search-branch.ts b/apps/zcode-cli/packages/core/src/runtime/methods/embedded-search-branch.ts
+index f451e9a..64c6016 100644
+--- a/apps/zcode-cli/packages/core/src/runtime/methods/embedded-search-branch.ts
++++ b/apps/zcode-cli/packages/core/src/runtime/methods/embedded-search-branch.ts
+@@ -9,6 +9,8 @@ import {
+ import { isToolNameDisallowed } from "../../tool/tool-visibility.js";
+ 
+ export function resolveRuntimeEmbeddedSearchEnabled(runtime: AgentRuntimeInternal): boolean {
++  // 机器级会话需要独立的文件发现工具；嵌入式搜索分支会隐藏 Glob/Grep。
++  if (runtime.config.filesystemScope === "machine") return false;
+   const builtInToolAllowlist = resolveBuiltInToolAllowlist(runtime.config);
+   const decision = resolveEmbeddedSearchBranchCapability({
+     bashAvailable:
+diff --git a/apps/zcode-cli/packages/core/src/runtime/types.ts b/apps/zcode-cli/packages/core/src/runtime/types.ts
+index 0004408..49d14df 100644
+--- a/apps/zcode-cli/packages/core/src/runtime/types.ts
++++ b/apps/zcode-cli/packages/core/src/runtime/types.ts
+@@ -233,6 +233,7 @@ export interface AgentRuntimeConfig {
+   language?: string;
+   outputStyle?: OutputStylePromptConfig;
+   agentName?: string; // Default: "zcode-agent"
++  filesystemScope?: "workspace" | "machine";
+   workingDirectory?: string; // Required for context builder
+   /**
+    * 调用方传入的实际工作区路径表示，用于 session 持久化与本地身份恢复。
+diff --git a/apps/zcode-cli/packages/core/src/tool/executor/call-runner.ts b/apps/zcode-cli/packages/core/src/tool/executor/call-runner.ts
+index bde9a6d..125788b 100644
+--- a/apps/zcode-cli/packages/core/src/tool/executor/call-runner.ts
++++ b/apps/zcode-cli/packages/core/src/tool/executor/call-runner.ts
+@@ -59,6 +59,7 @@ import { mergeToolExecutionTelemetry, readToolExecutionTelemetry } from "../hand
+ import type { ToolExecuteOptions, ToolExecutorDeps } from "./types.js";
+ import { validateInitialModelToolInput, validateInput, validateOutput } from "./validation.js";
+ import type { ExecutableToolCall } from "../types.js";
++import { assertToolFilesystemScope } from "../filesystem-scope.js";
+ import { resolveEmbeddedSearchBranchCapability } from "../../embedded-search/capability.js";
+ import { resolveToolEntryModelContract } from "../model-contract.js";
+ 
+@@ -427,6 +428,7 @@ async function executeToolCallImpl(
+       setWorkingDirectory: deps.setWorkingDirectory,
+       workingDirectory: deps.getWorkingDirectory(),
+       workspaceRoot: deps.getWorkspaceRoot(),
++      filesystemScope: deps.filesystemScope,
+       workspaceIdentity: deps.workspaceIdentity,
+       remoteSessionId: deps.remoteSessionId,
+       clientMode: deps.clientMode,
+@@ -440,6 +442,8 @@ async function executeToolCallImpl(
+       turnId,
+     };
+ 
++    // Recheck the final input after permission hooks may have modified it.
++    await assertToolFilesystemScope(canonicalToolCall.name, executionInput, context);
+     const output = await executeWithTimeout(
+       entry.handler,
+       executionInput,
+diff --git a/apps/zcode-cli/packages/core/src/tool/executor/impl.ts b/apps/zcode-cli/packages/core/src/tool/executor/impl.ts
+index 4b8d7a4..def4f19 100644
+--- a/apps/zcode-cli/packages/core/src/tool/executor/impl.ts
++++ b/apps/zcode-cli/packages/core/src/tool/executor/impl.ts
+@@ -72,6 +72,7 @@ export class ToolExecutorImpl implements ToolExecutor {
+           options.getWorkingDirectory?.() ??
+           options.workingDirectory ??
+           "."),
++      filesystemScope: options.filesystemScope,
+       workspaceIdentity: options.workspaceIdentity,
+       remoteSessionId: options.remoteSessionId,
+       clientMode: options.clientMode,
+diff --git a/apps/zcode-cli/packages/core/src/tool/executor/permission-flow.ts b/apps/zcode-cli/packages/core/src/tool/executor/permission-flow.ts
+index 49ed540..29dadd3 100644
+--- a/apps/zcode-cli/packages/core/src/tool/executor/permission-flow.ts
++++ b/apps/zcode-cli/packages/core/src/tool/executor/permission-flow.ts
+@@ -32,6 +32,7 @@ import { recheckPermissionHookModifiedInput } from "./permission-input-recheck.j
+ import type { ToolExecutorDeps } from "./types.js";
+ import { summarizeInput } from "./utils.js";
+ import { validateInput } from "./validation.js";
++import { assertToolFilesystemScope, LOCAL_FILESYSTEM_TOOLS } from "../filesystem-scope.js";
+ import { applyMemoryFilePermission } from "./memory-file-permission.js";
+ 
+ type ToolPermissionFlowResult =
+@@ -49,6 +50,15 @@ export async function resolveToolPermission(
+   signal?: AbortSignal,
+   telemetry?: ToolExecutionSpanWriter,
+ ): Promise<ToolPermissionFlowResult> {
++  try {
++    await assertToolFilesystemScope(toolCall.name, executionInput, {
++      filesystemScope: deps.filesystemScope,
++      workingDirectory: deps.getWorkingDirectory(),
++      workspaceRoot: deps.getWorkspaceRoot(),
++    });
++  } catch {
++    return { allowed: false, result: createPermissionErrorResult(toolCall, "Filesystem scope preflight denied", { mode }) };
++  }
+   const permissionContext: PermissionContext = {
+     toolName: toolCall.name,
+     input: executionInput,
+@@ -61,6 +71,11 @@ export async function resolveToolPermission(
+     workingDirectory: deps.getWorkingDirectory(),
+   };
+   const runtimePermissionContext = resolveRuntimePermissionContext(deps);
++  const capability = resolveRuntimePermissionCapability(entry, executionInput, runtimePermissionContext);
++  if ((permissionContext.planEnabled ?? mode === "plan") &&
++      LOCAL_FILESYSTEM_TOOLS.has(toolCall.name) && (!capability.readOnly || capability.destructive)) {
++    return { allowed: false, result: createPermissionErrorResult(toolCall, "Plan mode prohibits filesystem mutation", { mode }) };
++  }
+   const rulePolicy = entry.resolvePermissionRulePolicy?.(executionInput, runtimePermissionContext);
+   const suggestedPermissionUpdates =
+     rulePolicy?.suggestedPermissionUpdates ??
+@@ -120,6 +135,12 @@ export async function resolveToolPermission(
+     toolName: toolCall.name,
+   });
+ 
++  // Machine scope still requires the host broker on every operation.
++  const machineApproval = deps.filesystemScope === "machine" && LOCAL_FILESYSTEM_TOOLS.has(toolCall.name);
++  if (machineApproval && permissionDecision.decision !== "deny") {
++    permissionDecision = { ...permissionDecision, allowed: false, decision: "ask", ruleId: "filesystem.machine", reason: "Machine-local operation requires active host grant" };
++  }
++
+   if (permissionDecision.allowed) {
+     telemetry?.setPermissionDecision("not_required");
+     return { allowed: true, executionInput };
+@@ -152,7 +173,7 @@ export async function resolveToolPermission(
+   }
+ 
+   const approval = resolveToolApproval(deps, toolCall, entry, executionInput, traceContext);
+-  if (approval.gate === "proceed") {
++  if (approval.gate === "proceed" && !machineApproval) {
+     telemetry?.setPermissionDecision("not_required");
+     return { allowed: true, executionInput };
+   }
+@@ -209,7 +230,8 @@ export async function resolveToolPermission(
+             sessionId: deps.sessionId,
+             sideEffectScope: permissionDecision.sideEffectScope,
+             suggestedPermissionUpdates,
+-            ...(approval.optionsPolicy ? { optionsPolicy: approval.optionsPolicy } : {}),
++            ...(machineApproval ? { optionsPolicy: "no-always-allow" as const } :
++              approval.optionsPolicy ? { optionsPolicy: approval.optionsPolicy } : {}),
+             toolCallId: toolCall.id as PermissionBrokerRequest["toolCallId"],
+             toolName: toolCall.name,
+             traceId: traceContext.traceId,
+@@ -222,7 +244,7 @@ export async function resolveToolPermission(
+           },
+         ),
+       runHooks: (hookSignal) =>
+-        runPermissionRequestHooks(
++        machineApproval ? Promise.resolve(undefined) : runPermissionRequestHooks(
+           deps,
+           toolCall,
+           executionInput,
+@@ -356,7 +378,11 @@ export async function resolveToolPermission(
+     };
+   }
+ 
+-  if (resolvedPermission.permissionUpdates?.length) {
++  if (machineApproval && resolvedPermission.decision !== "allow") {
++    return { allowed: false, result: createPermissionErrorResult(toolCall, "Machine-local operation requires an unchanged host grant", { mode }) };
++  }
++
++  if (!machineApproval && resolvedPermission.permissionUpdates?.length) {
+     try {
+       await persistProjectPermissionUpdates(
+         deps,
+@@ -387,7 +413,7 @@ export async function resolveToolPermission(
+     }
+   }
+ 
+-  if (resolvedPermission.sessionPermissionUpdates?.length) {
++  if (!machineApproval && resolvedPermission.sessionPermissionUpdates?.length) {
+     // 会话免确认：只进内存里的会话 ruleset，
+     // 与上面的项目级持久化互不可见。
+     deps.permissionService.grantSessionPermission(resolvedPermission.sessionPermissionUpdates);
+diff --git a/apps/zcode-cli/packages/core/src/tool/executor/types.ts b/apps/zcode-cli/packages/core/src/tool/executor/types.ts
+index 6ec8a7d..5012cef 100644
+--- a/apps/zcode-cli/packages/core/src/tool/executor/types.ts
++++ b/apps/zcode-cli/packages/core/src/tool/executor/types.ts
+@@ -123,6 +123,7 @@ export interface ToolExecutorOptions {
+   getBashShellSelection?: () => ExecutionShellSelection | undefined;
+   workingDirectory?: string;
+   workspaceRoot?: string;
++  filesystemScope?: "workspace" | "machine";
+   workspaceIdentity?: string;
+   remoteSessionId?: string;
+   clientMode?: "desktop-continuous" | "web-remote-replayable";
+@@ -229,6 +230,7 @@ export interface ToolExecutorDeps {
+   getWorkingDirectory: () => string;
+   setWorkingDirectory?: (cwd: string) => Promise<void> | void;
+   getWorkspaceRoot: () => string;
++  filesystemScope?: "workspace" | "machine";
+   workspaceIdentity?: string;
+   remoteSessionId?: string;
+   clientMode?: "desktop-continuous" | "web-remote-replayable";
+diff --git a/apps/zcode-cli/packages/core/src/tool/filesystem-scope.ts b/apps/zcode-cli/packages/core/src/tool/filesystem-scope.ts
+new file mode 100644
+index 0000000..62d4e0c
+--- /dev/null
++++ b/apps/zcode-cli/packages/core/src/tool/filesystem-scope.ts
+@@ -0,0 +1,76 @@
++import { realpath } from "node:fs/promises";
++import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
++
++export const LOCAL_FILESYSTEM_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep", "Bash"]);
++const ACCOUNT_PATH = /(?:^|[\\/])(?:\.env(?:\.[^\\/]+)?|\.npmrc|\.netrc|\.pypirc|\.ssh|\.aws|\.azure|\.zcode|\.codex|\.cloudflared|credentials?(?:\.[^\\/]+)?|security\.json|auth\.json|cookies?)(?:$|[\\/])/i;
++
++/** Lexical rejection happens before normalization can erase namespace markers. */
++export function isOrdinaryLocalPath(value: string): boolean {
++  if (!value || /[\x00-\x1f]/.test(value) || /^[\\/]{2}/.test(value)) return false;
++  if (/^[a-z]:[^\\/]/i.test(value) || /^[a-z]:$/i.test(value)) return false;
++  const withoutDrive = value.replace(/^[a-z]:/i, "");
++  if (withoutDrive.includes(":")) return false;
++  if (/(?:^|[\\/])(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|[\\/]|$)/i.test(withoutDrive)) return false;
++  if (/^\/(?:dev|proc|sys)(?:\/|$)/.test(value)) return false;
++  return !ACCOUNT_PATH.test(value);
++}
++
++async function canonicalTarget(target: string): Promise<string> {
++  let ancestor = target;
++  for (;;) {
++    try {
++      return resolve(await realpath(ancestor), relative(ancestor, target));
++    } catch (error) {
++      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
++      const parent = dirname(ancestor);
++      if (parent === ancestor) throw new Error("Filesystem path cannot be resolved");
++      ancestor = parent;
++    }
++  }
++}
++
++function contained(root: string, target: string): boolean {
++  const rel = relative(root, target);
++  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
++}
++
++export interface FilesystemScopeContext {
++  filesystemScope?: "workspace" | "machine";
++  workingDirectory: string;
++  workspaceRoot: string;
++}
++
++export async function assertFilesystemPath(raw: string, context: FilesystemScopeContext): Promise<void> {
++  if (!isAbsolute(context.workingDirectory) || !isAbsolute(context.workspaceRoot)) {
++    throw new Error("Filesystem scope requires absolute session directories");
++  }
++  const target = resolve(context.workingDirectory, raw);
++  if (!isOrdinaryLocalPath(raw) || !isOrdinaryLocalPath(target)) {
++    throw new Error("Filesystem policy rejects network, device, or account paths");
++  }
++  const actual = await canonicalTarget(target);
++  if (!isOrdinaryLocalPath(actual)) throw new Error("Filesystem policy rejects resolved path");
++  if (context.filesystemScope !== "machine") {
++    if (!contained(resolve(context.workspaceRoot), target) ||
++        !contained(await realpath(context.workspaceRoot), actual)) {
++      throw new Error("Filesystem path is outside the session workspace");
++    }
++  }
++}
++
++/** Validate the final tool target before asking and again before executing. */
++export async function assertToolFilesystemScope(
++  toolName: string, input: unknown, context: FilesystemScopeContext,
++): Promise<void> {
++  if (!LOCAL_FILESYSTEM_TOOLS.has(toolName)) return;
++  const value = input as Record<string, unknown>;
++  if (!value || typeof value !== "object") throw new Error("Invalid filesystem tool input");
++  const raw = ["Read", "Write", "Edit"].includes(toolName) ? value.file_path
++    : toolName === "Bash" ? context.workingDirectory : value.path ?? context.workingDirectory;
++  if (typeof raw !== "string") throw new Error("Missing filesystem tool path");
++  if (toolName === "Glob" && typeof value.pattern === "string" &&
++      (isAbsolute(value.pattern) || value.pattern.split(/[\\/]/).includes("..") || value.pattern.includes(":"))) {
++    throw new Error("Glob pattern must stay within its search root");
++  }
++  await assertFilesystemPath(raw, context);
++}
+diff --git a/apps/zcode-cli/packages/core/src/tool/handlers/bash-cwd-policy.ts b/apps/zcode-cli/packages/core/src/tool/handlers/bash-cwd-policy.ts
+index 62c5204..05b2737 100644
+--- a/apps/zcode-cli/packages/core/src/tool/handlers/bash-cwd-policy.ts
++++ b/apps/zcode-cli/packages/core/src/tool/handlers/bash-cwd-policy.ts
+@@ -1,4 +1,5 @@
+ import { realpathSync } from "node:fs";
++import { isOrdinaryLocalPath } from "../filesystem-scope.js";
+ import { platform as currentPlatform } from "node:process";
+ import type { ExecutionResult } from "@zcode/contracts";
+ import {
+@@ -16,6 +17,7 @@ interface BashCwdPolicyInput {
+   platform?: ToolPathPlatform;
+   workspaceRoot: string;
+   runtimeScope?: ToolRuntimeScope;
++  filesystemScope?: "workspace" | "machine";
+ }
+ 
+ interface BashCwdPolicyDecision {
+@@ -36,9 +38,17 @@ export function decideBashCwdPolicy(input: BashCwdPolicyInput): BashCwdPolicyDec
+   if (!input.resolvedCwd) return {};
+   if ((input.runtimeScope ?? "main") !== "main") return {};
+ 
++  // Reject network/device namespaces before realpath can touch them.
++  if (!isOrdinaryLocalPath(input.resolvedCwd)) {
++    return { nextWorkingDirectory: input.workspaceRoot, stderrSuffix: `Shell cwd was reset to ${input.workspaceRoot}` };
++  }
+   const boundary = normalizeCwdBoundaryInput(input);
+ 
+-  if (isResolvedCwdInsideWorkspace(boundary)) {
++  if (isResolvedCwdInsideWorkspace(boundary) ||
++      (input.filesystemScope === "machine" &&
++       getToolPathApi(input.platform ?? currentPlatform).isAbsolute(input.resolvedCwd) &&
++       isOrdinaryLocalPath(input.resolvedCwd) && isOrdinaryLocalPath(boundary.resolvedCwd) &&
++       isOrdinaryLocalPath(realpathCwdBoundary(input.resolvedCwd, (input.platform ?? currentPlatform) === "win32") ?? boundary.resolvedCwd))) {
+     return { nextWorkingDirectory: boundary.resolvedCwd };
+   }
+ 
+diff --git a/apps/zcode-cli/packages/core/src/tool/handlers/bash-read-file-state.ts b/apps/zcode-cli/packages/core/src/tool/handlers/bash-read-file-state.ts
+index a5c97fb..b3e6abf 100644
+--- a/apps/zcode-cli/packages/core/src/tool/handlers/bash-read-file-state.ts
++++ b/apps/zcode-cli/packages/core/src/tool/handlers/bash-read-file-state.ts
+@@ -109,15 +109,16 @@ async function backfillReadFileStateFromBash(input: BashReadFileStateEffectsInpu
+   const trace = createBashReadFileStateTrace(input.context);
+   await Promise.all(
+     sources.map(async (source) => {
+-      const resolvedPath = resolveWorkspacePath({
+-        inputPath: source.filePath,
+-        operation: "read",
+-        workingDirectory: input.context.workingDirectory,
+-        workspaceRoot: input.context.workspaceRoot,
+-      });
+-      if (findLatestReadFileState(readFileState, resolvedPath)) return;
+-
+       try {
++        const resolvedPath = resolveWorkspacePath({
++          inputPath: source.filePath,
++          operation: "read",
++          workingDirectory: input.context.workingDirectory,
++          workspaceRoot: input.context.workspaceRoot,
++          filesystemScope: input.context.filesystemScope,
++        });
++        if (findLatestReadFileState(readFileState, resolvedPath)) return;
++
+         const stat = await fileSystemPort.stat(
+           { path: resolvedPath, trace },
+           { signal: input.context.abortSignal },
+diff --git a/apps/zcode-cli/packages/core/src/tool/handlers/bash.ts b/apps/zcode-cli/packages/core/src/tool/handlers/bash.ts
+index 8315932..b9da314 100644
+--- a/apps/zcode-cli/packages/core/src/tool/handlers/bash.ts
++++ b/apps/zcode-cli/packages/core/src/tool/handlers/bash.ts
+@@ -209,6 +209,7 @@ async function executeBashHandler(
+     resolvedCwd: result.resolvedCwd,
+     workspaceRoot: context.workspaceRoot,
+     runtimeScope: context.runtimeScope,
++    filesystemScope: context.filesystemScope,
+   });
+   if (cwdDecision.nextWorkingDirectory) {
+     // 主线程 Bash 成功后会保留项目内 cwd；
+@@ -415,6 +416,7 @@ function createExecutionRequest(
+       operation: "execute",
+       workingDirectory: context.workingDirectory,
+       workspaceRoot: context.workspaceRoot,
++    filesystemScope: context.filesystemScope,
+     }),
+     ...(bashPrelude ? { bashPrelude } : {}),
+     captureCwdAfterSuccess: input.run_in_background ? undefined : true,
+diff --git a/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts b/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts
+index 6d3cf52..e5e8b38 100644
+--- a/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts
++++ b/apps/zcode-cli/packages/core/src/tool/handlers/edit.ts
+@@ -119,6 +119,7 @@ const editHandler: ToolHandler = async (input, context) => {
+     operation: "write",
+     workingDirectory: context.workingDirectory,
+     workspaceRoot: context.workspaceRoot,
++    filesystemScope: context.filesystemScope,
+   });
+ 
+   const stat = await statEditableFile(filePath, context);
+diff --git a/apps/zcode-cli/packages/core/src/tool/handlers/glob.ts b/apps/zcode-cli/packages/core/src/tool/handlers/glob.ts
+index c982357..299d3cd 100644
+--- a/apps/zcode-cli/packages/core/src/tool/handlers/glob.ts
++++ b/apps/zcode-cli/packages/core/src/tool/handlers/glob.ts
+@@ -46,11 +46,13 @@ const globHandler: ToolHandler = async (input, context) => {
+         operation: "read",
+         workingDirectory: context.workingDirectory,
+         workspaceRoot: context.workspaceRoot,
++        filesystemScope: context.filesystemScope,
+       })
+     : resolveToolWorkingDirectory(undefined, {
+         operation: "read",
+         workingDirectory: context.workingDirectory,
+         workspaceRoot: context.workspaceRoot,
++        filesystemScope: context.filesystemScope,
+       });
+ 
+   const result = await fileSystemPort.searchFiles(
+diff --git a/apps/zcode-cli/packages/core/src/tool/handlers/grep.ts b/apps/zcode-cli/packages/core/src/tool/handlers/grep.ts
+index c669b4d..c60d066 100644
+--- a/apps/zcode-cli/packages/core/src/tool/handlers/grep.ts
++++ b/apps/zcode-cli/packages/core/src/tool/handlers/grep.ts
+@@ -53,11 +53,13 @@ const grepHandler: ToolHandler = async (input, context) => {
+         operation: "read",
+         workingDirectory: context.workingDirectory,
+         workspaceRoot: context.workspaceRoot,
++        filesystemScope: context.filesystemScope,
+       })
+     : resolveToolWorkingDirectory(undefined, {
+         operation: "read",
+         workingDirectory: context.workingDirectory,
+         workspaceRoot: context.workspaceRoot,
++        filesystemScope: context.filesystemScope,
+       });
+ 
+   const contextLines = parsed.context ?? parsed["-C"];
+diff --git a/apps/zcode-cli/packages/core/src/tool/handlers/read.ts b/apps/zcode-cli/packages/core/src/tool/handlers/read.ts
+index 397c1d6..89907cc 100644
+--- a/apps/zcode-cli/packages/core/src/tool/handlers/read.ts
++++ b/apps/zcode-cli/packages/core/src/tool/handlers/read.ts
+@@ -161,6 +161,7 @@ const readHandler: ToolHandler = async (input, context) => {
+     operation: "read",
+     workingDirectory: context.workingDirectory,
+     workspaceRoot: context.workspaceRoot,
++    filesystemScope: context.filesystemScope,
+   });
+ 
+   try {
+diff --git a/apps/zcode-cli/packages/core/src/tool/handlers/write.ts b/apps/zcode-cli/packages/core/src/tool/handlers/write.ts
+index 78834c4..f112460 100644
+--- a/apps/zcode-cli/packages/core/src/tool/handlers/write.ts
++++ b/apps/zcode-cli/packages/core/src/tool/handlers/write.ts
+@@ -86,6 +86,7 @@ const writeHandler: ToolHandler = async (input, context) => {
+     operation: "write",
+     workingDirectory: context.workingDirectory,
+     workspaceRoot: context.workspaceRoot,
++    filesystemScope: context.filesystemScope,
+   });
+ 
+   let originalFile: string | null = null;
+diff --git a/apps/zcode-cli/packages/core/src/tool/path-policy.ts b/apps/zcode-cli/packages/core/src/tool/path-policy.ts
+index b1f8cfc..693dc43 100644
+--- a/apps/zcode-cli/packages/core/src/tool/path-policy.ts
++++ b/apps/zcode-cli/packages/core/src/tool/path-policy.ts
+@@ -2,11 +2,13 @@
+ // Tool Path Policy
+ // ============================================================
+ 
+-import { isAbsolute, normalize, resolve } from "node:path";
++import { isAbsolute, normalize, resolve, relative, sep } from "node:path";
++import { isOrdinaryLocalPath } from "./filesystem-scope.js";
+ import { CoreErrorType, createCoreError } from "@zcode/contracts";
+ 
+ interface ToolWorkspacePathOptions {
+   inputPath: string;
++  filesystemScope?: "workspace" | "machine";
+   workingDirectory: string;
+   workspaceRoot: string;
+   operation: "read" | "write" | "execute";
+@@ -33,9 +35,15 @@ export function resolveWorkspacePath(options: ToolWorkspacePathOptions): string
+     ? normalize(requestedPath)
+     : resolve(workingDirectory, requestedPath);
+ 
+-  // Current release intentionally does not hard-block paths outside workspaceRoot.
+-  // Cause: subagents may need to inspect user-requested sibling repos or external files
+-  // before the filesystem permission adapter grows explicit ask/deny rules for them.
++  // Scope is explicit; an absolute path alone is never an authorization.
++  const rel = relative(options.workspaceRoot, resolvedPath);
++  if (!isOrdinaryLocalPath(requestedPath) || !isOrdinaryLocalPath(resolvedPath) ||
++      (options.filesystemScope !== "machine" &&
++       (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)))) {
++    throw createCoreError(CoreErrorType.PermissionDenied, "Tool path is outside filesystem scope", {
++      recoverable: true,
++    });
++  }
+   return resolvedPath;
+ }
+ 
+@@ -43,18 +51,9 @@ export function resolveToolWorkingDirectory(
+   inputCwd: string | undefined,
+   options: Omit<ToolWorkspacePathOptions, "inputPath">,
+ ): string {
+-  if (!inputCwd) {
+-    const workingDirectory = normalizeAbsoluteDirectory(
+-      options.workingDirectory,
+-      "workingDirectory",
+-    );
+-    normalizeAbsoluteDirectory(options.workspaceRoot, "workspaceRoot");
+-    return workingDirectory;
+-  }
+-
+   return resolveWorkspacePath({
+     ...options,
+-    inputPath: inputCwd,
++    inputPath: inputCwd ?? options.workingDirectory,
+   });
+ }
+ 
+diff --git a/apps/zcode-cli/packages/core/src/tool/types.ts b/apps/zcode-cli/packages/core/src/tool/types.ts
+index 051a9c5..1fb642e 100644
+--- a/apps/zcode-cli/packages/core/src/tool/types.ts
++++ b/apps/zcode-cli/packages/core/src/tool/types.ts
+@@ -186,6 +186,7 @@ export interface ToolExecutionContext {
+   setWorkingDirectory?: (cwd: string) => Promise<void> | void;
+   workingDirectory: string;
+   workspaceRoot: string;
++  filesystemScope?: "workspace" | "machine";
+   workspaceIdentity?: string;
+   remoteSessionId?: string;
+   clientMode?: "desktop-continuous" | "web-remote-replayable";
+diff --git a/apps/zcode-cli/packages/core/test/filesystem-scope.test.ts b/apps/zcode-cli/packages/core/test/filesystem-scope.test.ts
+new file mode 100644
+index 0000000..103003a
+--- /dev/null
++++ b/apps/zcode-cli/packages/core/test/filesystem-scope.test.ts
+@@ -0,0 +1,125 @@
++import assert from "node:assert/strict";
++import { mkdtemp, mkdir, writeFile, symlink, rm } from "node:fs/promises";
++import { readFile } from "node:fs/promises";
++import { readToolEntry } from "../src/tool/handlers/read.js";
++import { bashToolEntry } from "../src/tool/handlers/bash.js";
++import { join } from "node:path";
++import { test, before, after } from "node:test";
++import { assertToolFilesystemScope, isOrdinaryLocalPath } from "../src/tool/filesystem-scope.js";
++import { resolveWorkspacePath, resolveToolWorkingDirectory } from "../src/tool/path-policy.js";
++import { decideBashCwdPolicy } from "../src/tool/handlers/bash-cwd-policy.js";
++import { globToolEntry } from "../src/tool/handlers/glob.js";
++import { grepToolEntry } from "../src/tool/handlers/grep.js";
++import { resolveToolPermission } from "../src/tool/executor/permission-flow.js";
++import { PermissionService } from "../src/permission/service.js";
++import { resolveRuntimeEmbeddedSearchEnabled, filterEmbeddedSearchRuntimeVisibleTools } from "../src/runtime/methods/embedded-search-branch.js";
++
++test("machine-local runtime retains dedicated Glob/Grep discovery", () => {
++  const runtime = { config: { filesystemScope: "machine" } } as any;
++  assert.equal(resolveRuntimeEmbeddedSearchEnabled(runtime), false);
++  const tools = [globToolEntry, grepToolEntry].map(entry => ({ name: entry.metadata.name })) as any;
++  assert.deepEqual(filterEmbeddedSearchRuntimeVisibleTools(runtime, tools), tools);
++});
++
++let root: string, workspace: string, outside: string;
++before(async () => {
++  root = await mkdtemp(join(process.cwd(), "zcode-path-policy-"));
++  workspace = join(root, "workspace"); outside = join(root, "external");
++  await mkdir(workspace); await mkdir(outside);
++  await writeFile(join(outside, "source.ts"), "needle");
++  await symlink(outside, join(workspace, "escape"), "junction");
++});
++after(async () => { await rm(root, { recursive: true, force: true }); });
++const context = (machine = true) => ({ workingDirectory: workspace, workspaceRoot: workspace,
++  ...(machine ? { filesystemScope: "machine" as const } : {}) });
++
++for (const tool of ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]) {
++  test(`${tool}: external targets require machine scope`, async () => {
++    const input = ["Read", "Write", "Edit"].includes(tool)
++      ? { file_path: join(outside, "source.ts") } : { path: outside, pattern: "*.ts", command: "node --version" };
++    const ctx = { ...context(), ...(tool === "Bash" ? { workingDirectory: outside } : {}) };
++    await assertToolFilesystemScope(tool, input, ctx);
++    await assert.rejects(assertToolFilesystemScope(tool, input, { ...ctx, filesystemScope: undefined }));
++    const resolveInput = { ...ctx, inputPath: outside, operation: "read" as const };
++    assert.equal(resolveWorkspacePath(resolveInput), outside);
++    assert.throws(() => resolveWorkspacePath({ ...resolveInput, filesystemScope: undefined }));
++  });
++}
++test("workspace paths work by default; symlink escapes fail including new write targets", async () => {
++  await assertToolFilesystemScope("Read", { file_path: join(workspace, "new.ts") }, context(false));
++  await assert.rejects(assertToolFilesystemScope("Write", { file_path: join(workspace, "escape/new/file.ts") }, context(false)));
++  await assertToolFilesystemScope("Write", { file_path: join(workspace, "escape/new/file.ts") }, context());
++});
++test("network, device, drive-relative and glob escape paths fail closed", async () => {
++  for (const path of ["//server/share", "\\\\server\\share", "\\\\?\\C:\\data", "C:relative", "NUL", "/dev/null", "file:stream"]) {
++    assert.equal(isOrdinaryLocalPath(path), false, path);
++    await assert.rejects(assertToolFilesystemScope("Read", { file_path: path }, context()));
++  }
++  await assert.rejects(assertToolFilesystemScope("Glob", { path: outside, pattern: "../**" }, context()));
++});
++test("Glob directory listing and Grep dispatch the external search root", async () => {
++  const seen: string[] = [];
++  const ctx = { ...context(), fileSystemPort: {
++    searchFiles: async ({ path }: { path: string }) => { seen.push(path); return { files: [join(path, "source.ts")], durationMs: 1, truncated: false }; },
++    searchText: async ({ path }: { path: string }) => { seen.push(path); return { files: [join(path, "source.ts")], matches: [], entries: [], durationMs: 1, truncated: false }; },
++  }};
++  await globToolEntry.handler({ path: outside, pattern: "*.ts" }, ctx as any);
++  await grepToolEntry.handler({ path: outside, pattern: "needle" }, ctx as any);
++  assert.deepEqual(seen, [outside, outside]);
++  await assert.rejects(globToolEntry.handler({ path: outside, pattern: "*" }, { ...ctx, filesystemScope: undefined } as any));
++});
++test("process cwd is retained only for machine scope", () => {
++  assert.equal(resolveToolWorkingDirectory(undefined, { ...context(), workingDirectory: outside, operation: "execute" }), outside);
++  assert.throws(() => resolveToolWorkingDirectory(undefined, { ...context(false), workingDirectory: outside, operation: "execute" }));
++  const input = { resolvedCwd: outside, workspaceRoot: workspace, status: "completed" as const, exitCode: 0 };
++  assert.equal(decideBashCwdPolicy({ ...input, filesystemScope: "machine" }).nextWorkingDirectory, outside);
++  assert.equal(decideBashCwdPolicy(input).nextWorkingDirectory, workspace);
++  assert.equal(decideBashCwdPolicy({ ...input, filesystemScope: "machine", resolvedCwd: "//server/share" }).nextWorkingDirectory, workspace);
++});
++test("machine scope requires the broker for each call even with yolo/preapproval; deny and plan remain closed", async () => {
++  let calls = 0, allow = true;
++  const deps = { ...context(), getWorkingDirectory: () => workspace, getWorkspaceRoot: () => workspace,
++    sessionId: "test", emitEvent: async () => {}, permissionService: new PermissionService(),
++    permissionBroker: { requestPermission: async () => { calls++; return { decision: allow ? "allow" : "deny" }; } },
++    hookRunner: { run: async () => { throw new Error("Machine approval must not run permission hooks"); } },
++  };
++  const input = { path: outside, pattern: "*.ts" };
++  const invoke = (mode = "yolo", entry = globToolEntry) => resolveToolPermission(deps as any,
++    { id: "call", name: entry.metadata.name, input } as any, { ...entry, prepareApproval: () => ({ gate: "proceed" }) } as any,
++    input, { permissionBehavior: "allow" } as any, mode as any, { traceId: "test" } as any);
++  assert.equal((await invoke()).allowed, true);
++  assert.equal((await invoke()).allowed, true);
++  assert.equal(calls, 2);
++  allow = false;
++  assert.equal((await invoke()).allowed, false);
++  assert.equal(calls, 3);
++  const write = { ...globToolEntry, metadata: { ...globToolEntry.metadata, name: "Write", readOnly: false } };
++  const denied = await resolveToolPermission(deps as any, { id: "write", name: "Write" } as any, write,
++    { file_path: join(outside, "new.ts") }, {} as any, "plan", { traceId: "test" } as any);
++  assert.equal(denied.allowed, false);
++  assert.equal(calls, 3);
++});
++
++test("Read dispatches an external file and returns its contents", async () => {
++  const file = join(outside, "source.ts");
++  const ctx = { ...context(), fileSystemPort: {
++    stat: async ({ path }: any) => { assert.equal(path, file); return { kind: "file", sizeBytes: 6, mtimeMs: 1 }; },
++    readTextFileRange: async ({ path }: any) => ({ content: await readFile(path, "utf8"), lineCount: 1, startLine: 1, totalLines: 1, sizeBytes: 6, bytesRead: 6, truncated: false }),
++  }};
++  const result = await readToolEntry.handler({ file_path: file }, ctx as any) as any;
++  assert.equal(result.content, "needle");
++  await assert.rejects(readToolEntry.handler({ file_path: file }, { ...ctx, filesystemScope: undefined } as any));
++});
++test("Bash dispatches the external cwd to the process port", async () => {
++  let calls = 0;
++  const ctx = { ...context(), workingDirectory: outside, abortSignal: new AbortController().signal,
++    executionPort: { run: async (request: any) => {
++      calls++; assert.equal(request.cwd, outside);
++      return { status: "completed", exitCode: 0, stdout: { text: "ok", bytes: 2, truncated: false }, stderr: { text: "", bytes: 0, truncated: false }, durationMs: 1, resolvedCwd: outside };
++    } },
++  };
++  await bashToolEntry.handler({ command: "node --version" }, ctx as any);
++  assert.equal(calls, 1);
++  await assert.rejects(bashToolEntry.handler({ command: "node --version" }, { ...ctx, filesystemScope: undefined } as any));
++  assert.equal(calls, 1);
++});
+diff --git a/apps/zcode-cli/spec/machine-local-filesystem.md b/apps/zcode-cli/spec/machine-local-filesystem.md
+new file mode 100644
+index 0000000..6ec5ff5
+--- /dev/null
++++ b/apps/zcode-cli/spec/machine-local-filesystem.md
+@@ -0,0 +1,30 @@
++# Session filesystem scope
++
++The trusted session/create and session/resume caller may explicitly request
++`filesystemScope: "machine"`; omission means `workspace`. This is runtime-only
++policy, never inferred from model text or project configuration. Workspace identity
++continues to identify the project. A warm resume cannot change the scope; a cold
++resume must explicitly reauthorize it. Remote workspaces cannot opt in.
++
++Flow: trusted protocol request -> runtime config -> executor preflight -> existing
++permission broker -> handler. Machine scope requires reverse approval for Read,
++Write, Edit, Glob, Grep and Bash, even where edit mode would normally auto-allow.
++Plan denials take precedence. The broker still requires an active dispatch grant.
++
++Preflight canonicalizes existing ancestors, rejects network/device namespaces,
++Windows drive-relative paths, alternate streams, reserved device names and sensitive
++account paths. Workspace scope denies lexical or symlink traversal outside the root.
++Machine scope admits ordinary external local paths, including new files. Glob patterns
++cannot escape their validated search root. Successful Bash cwd changes may persist
++outside the workspace only in machine scope. Shell commands remain trusted local
++process execution, not an OS sandbox.
++
++Acceptance: sibling read/list/search only with machine scope; workspace defaults,
++plan mutations, traversal, symlink, network/device failures; unchanged reverse broker;
++explicit create/resume plumbing, build and cross-repository live canary. No credentials
++or account contents belong in diagnostics. Existing entitlement work is untouched.
++
++Machine-scope runtimes expose dedicated Glob/Grep tools, including after shell
++branch refresh. Embedded search must not remove local discovery from this surface.
++The host's Individual session admission supplies the same active dispatch grant
++as queued tasks; readonly admission never grants mutation or general shell use.
+diff --git a/packages/shared/src/zcode-protocol/index.ts b/packages/shared/src/zcode-protocol/index.ts
+index 5b3de01..1fd9d28 100644
+--- a/packages/shared/src/zcode-protocol/index.ts
++++ b/packages/shared/src/zcode-protocol/index.ts
+@@ -76,6 +76,10 @@ export const ZCODE_PROTOCOL_VERSION = 1 as const;
+ export const ZCODE_PROTOCOL_V4_WIRE_VERSION = 3 as const;
+ export const zcodeRuntimeCapabilitiesSchema = z.object({
+   independentPlanState: z.boolean().optional(),
++  // 会话级语义权益选择（session/create、session/resume 的 entitlement 字段，
++  // 以及 session/read settings.entitlement 的 requested/observed/source 回读）。
++  entitlementSelection: z.boolean().optional(),
++  machineLocalFilesystem: z.boolean().optional(),
+ });
+ export const zcodeProtocolErrorCodes = {
+   sessionUnavailable: -32004,
+@@ -794,6 +798,17 @@ export const zcodeModelFormatPropertiesSchema = completeModelPropertiesDataSchem
+ });
+ export type ZCodeModelFormatProperties = z.infer<typeof zcodeModelFormatPropertiesSchema>;
+ 
++/** Active Model 固定的账号访问类别；当前商品和 Team scope 由账号服务在请求期解析。 */
++export const zcodeProviderAccountAccessSchema = z
++  .object({
++    type: z.literal("zhipu-account"),
++    accountType: z.enum(["zai", "bigmodel"]),
++    mode: z.enum(["start-plan", "individual-coding-plan", "team-coding-plan", "off-peak"]),
++    entitled: z.boolean(),
++  })
++  .strict();
++export type ZCodeProviderAccountAccess = z.infer<typeof zcodeProviderAccountAccessSchema>;
++
+ export const zcodeModelOptionSchema = z
+   .object({
+     ref: modelSelectionSchema,
+@@ -805,10 +820,31 @@ export const zcodeModelOptionSchema = z
+     reasoning: zcodeModelReasoningOptionsSchema.optional(),
+     properties: zcodeModelFormatPropertiesSchema,
+     disabledReason: z.string().optional(),
++    // 语义权益事实（只读）：该候选模型的 Provider 绑定的账号访问类别。
++    // 仅描述 Registry 中已准入 Provider 的静态 access 约束，不携带任何凭据材料；
++    // 缺省表示该 Provider 不是账号型（普通 API key），或来自不支持该字段的旧端。
++    accountAccess: zcodeProviderAccountAccessSchema.optional(),
+   })
+   .strict();
+ export type ZCodeModelOption = z.infer<typeof zcodeModelOptionSchema>;
+ 
++/**
++ * 会话级权益（billing entitlement）选择与权威回读。
++ *
++ * requested 是调用方通过 session/create、session/resume 显式声明的语义权益
++ * （zhipu 账号 planKind，不是 Provider ID 仿冒）；observed 是 runtime 从
++ * Provider Registry 对"当前会话绑定 Provider 的 access 约束"的权威读取。
++ * source 说明 observed 的证据来源；unavailable 表示本轮无法给出权益事实。
++ */
++export const zcodeSessionEntitlementSchema = z
++  .object({
++    requested: z.enum(["start-plan", "individual-coding-plan"]).optional(),
++    observed: zcodeProviderAccountAccessSchema.nullable(),
++    source: z.enum(["provider-registry", "unavailable"]),
++  })
++  .strict();
++export type ZCodeSessionEntitlement = z.infer<typeof zcodeSessionEntitlementSchema>;
++
+ export const zcodeAccountAccessSchema = z.discriminatedUnion("planKind", [
+   z
+     .object({
+@@ -837,17 +873,6 @@ export const zcodeAccountAccessSchema = z.discriminatedUnion("planKind", [
+ ]);
+ export type ZCodeAccountAccess = z.infer<typeof zcodeAccountAccessSchema>;
+ 
+-/** Active Model 固定的账号访问类别；当前商品和 Team scope 由账号服务在请求期解析。 */
+-export const zcodeProviderAccountAccessSchema = z
+-  .object({
+-    type: z.literal("zhipu-account"),
+-    accountType: z.enum(["zai", "bigmodel"]),
+-    mode: z.enum(["start-plan", "individual-coding-plan", "team-coding-plan", "off-peak"]),
+-    entitled: z.boolean(),
+-  })
+-  .strict();
+-export type ZCodeProviderAccountAccess = z.infer<typeof zcodeProviderAccountAccessSchema>;
+-
+ export type ZCodeSessionMode = z.infer<typeof zcodeSessionModeSchema>;
+ export type ZCodeSessionKind = z.infer<typeof zcodeSessionKindSchema>;
+ export type ZCodeSessionGoal = z.infer<typeof zcodeSessionGoalSchema>;
+@@ -919,6 +944,10 @@ export const zcodeSessionSettingsStateSchema = z
+       })
+       .strict()
+       .optional(),
++    // 权益回读（权威、无凭据）：requested 来自本会话的显式声明；observed 来自
++    // Provider Registry 对当前会话绑定 Provider 的 access 约束读取。旧端缺省
++    // 不携带该字段——消费方必须把"缺字段"当成"权益不可证"，不得自行推断。
++    entitlement: zcodeSessionEntitlementSchema.optional(),
+   })
+   .strict();
+ export type ZCodeSessionSettingsState = z.infer<typeof zcodeSessionSettingsStateSchema>;
+@@ -1576,6 +1605,12 @@ export const zcodeSessionCreateParamsSchema = z
+     // 动态工作流灰度：与 offPeakToolEnabled 同一
+     // 模式——host 裁决后下发，缺省不下发 = 不注册工作流工具簇（fail-closed）。
+     dynamicWorkflowEnabled: z.boolean().optional(),
++    // 会话级语义权益（billing entitlement）：显式声明本会话只允许使用哪种
++    // 账号访问类别（zhipu planKind）。runtime 在建会话与后续 setModel 时强制
++    // 约束；缺省保持历史行为（跟随 runtime 默认选择，不做权益收窄）。
++    // 不接受 Provider ID——权益语义与路由身份解耦。
++    entitlement: z.enum(["start-plan", "individual-coding-plan"]).optional(),
++    filesystemScope: z.enum(["workspace", "machine"]).optional(),
+   })
+   .strict();
+ export type ZCodeSessionCreateParams = z.infer<typeof zcodeSessionCreateParamsSchema>;
+@@ -1594,6 +1629,10 @@ export const zcodeSessionResumeParamsSchema = z
+     offPeakToolEnabled: z.boolean().optional(),
+     // 与 create 同语义；resume 不带会导致冷恢复丢工作流工具簇。
+     dynamicWorkflowEnabled: z.boolean().optional(),
++    // 会话级语义权益：resume 时对"该会话当前绑定的 Provider access"做权威核对，
++    // 观测结果与请求不一致立即失败（无静默降级）。
++    entitlement: z.enum(["start-plan", "individual-coding-plan"]).optional(),
++    filesystemScope: z.enum(["workspace", "machine"]).optional(),
+   })
+   .strict();
+ export type ZCodeSessionResumeParams = z.infer<typeof zcodeSessionResumeParamsSchema>;

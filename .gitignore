@@ -26,8 +26,3 @@ artifacts/
 *.tsbuildinfo
 *.bak
 /e2e*.json
-__pycache__/
-*.pyc
-.venv/
-third_party/quanta/build/
-third_party/quanta/dist/

@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   parseRegQueryOutput,
   loadConfig,
@@ -49,10 +49,32 @@ describe("ZCode CLI resolution and spawning", () => {
     assert.equal(resolved, expected);
   });
 
-  it("resolves current 0.16.9 on the real machine when installed", () => {
-    const cfg = loadConfig();
-    assert.ok(existsSync(cfg.zcodeCliPath), `Resolved CLI path should exist: ${cfg.zcodeCliPath}`);
-    assert.match(cfg.zcodeCliPath, /resources[\\/]glm[\\/]zcode\.cjs$/i);
+  it("loads an installed 0.16.9 layout and gives an explicit dev CLI precedence", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "z2c-config-installed-"));
+    const previousAppData = process.env.LOCALAPPDATA;
+    const previousCli = process.env.Z2C_ZCODE_CLI;
+    try {
+      const packaged = join(fixture, "Programs", "ZCode", "resources", "glm", "zcode.cjs");
+      mkdirSync(join(fixture, "Programs", "ZCode", "resources", "glm"), { recursive: true });
+      writeFileSync(packaged, "// installed-layout fixture\n");
+      process.env.LOCALAPPDATA = fixture;
+      delete process.env.Z2C_ZCODE_CLI;
+      const cfg = loadConfig();
+      assert.ok(existsSync(cfg.zcodeCliPath), "Resolved installed CLI must exist");
+      assert.equal(cfg.zcodeCliPath, packaged);
+      assert.match(cfg.zcodeCliPath, /resources[\\/]glm[\\/]zcode\.cjs$/i);
+      const devCli = join(fixture, "dev CLI.cjs");
+      writeFileSync(devCli, "// explicit override fixture\n");
+      process.env.Z2C_ZCODE_CLI = devCli;
+      assert.equal(loadConfig().zcodeCliPath, resolve(devCli));
+      assert.ok(existsSync(loadConfig().zcodeCliPath));
+    } finally {
+      if (previousAppData === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = previousAppData;
+      if (previousCli === undefined) delete process.env.Z2C_ZCODE_CLI;
+      else process.env.Z2C_ZCODE_CLI = previousCli;
+      rmSync(fixture, { recursive: true, force: true });
+    }
   });
 
   it("resolves legacy supported layouts when current layout is absent", () => {
@@ -90,12 +112,12 @@ describe("ZCode CLI resolution and spawning", () => {
   });
 
   it("resolves and handles paths containing spaces correctly", () => {
-    const mockAppData = "C:\\Users\\Sample User\\AppData\\Local";
+    const mockAppData = "C:\\Users\\Peter Pan\\AppData\\Local";
     const expected = join(mockAppData, "Programs", "ZCode", "resources", "glm", "zcode.cjs");
     const mockExists = (p: string) => p.toLowerCase() === expected.toLowerCase();
     const resolved = resolveZcodeCliPath({ LOCALAPPDATA: mockAppData }, mockExists);
     assert.equal(resolved, expected);
-    assert.ok(resolved.includes("Sample User"));
+    assert.ok(resolved.includes("Peter Pan"));
 
     // Spawning a JS/CJS CLI with spaces must use node and keep path as a single arg
     const spawnJs = resolveCliSpawn("C:\\Program Files\\ZCode App\\resources\\glm\\zcode.cjs", ["app-server", "--stdio"]);

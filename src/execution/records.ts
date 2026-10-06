@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { z } from "zod";
 import { ensureDir, getStateDir } from "../config/paths.js";
 
 /**
@@ -9,6 +10,7 @@ import { ensureDir, getStateDir } from "../config/paths.js";
  */
 export interface ExecutionRecord {
   taskId: string;
+  executor?: string;
   /** Present on new bridge records; optional for legacy harness records. */
   workspaceId?: string;
   /** Present on bridge-dispatched records; absent only on legacy records. */
@@ -80,6 +82,14 @@ export interface ExecutionRecord {
   };
 }
 
+export const executionRecordSchema = z.object({
+  taskId: z.string(), iteration: z.number().int().nonnegative(),
+  changedFiles: z.union([z.array(z.string()), z.number().int().nonnegative()]),
+  tests: z.string().nullable(), exitStatus: z.string(), timestamp: z.string(),
+  executor: z.string().min(1).max(80).optional(), notes: z.string().optional(),
+  outputId: z.number().int().positive().optional(), outputAvailable: z.boolean().optional(),
+}).passthrough(); // Preserve A2C ownership, network, audit and verification extensions.
+
 function recordsFile(workspaceId: string, stateDir?: string): string {
   const dir = ensureDir(path.join(getStateDir(stateDir), "executions"));
   return path.join(dir, `${workspaceId}.jsonl`);
@@ -93,7 +103,7 @@ export function appendExecutionRecord(workspaceId: string, record: ExecutionReco
   const requested = record.networkRequested ?? effective;
   const reported = record.networkReported ?? null;
   const persisted: ExecutionRecord = {
-    ...record,
+    ...executionRecordSchema.parse(record),
     network: effective,
     networkRequested: requested,
     networkEffective: effective,
@@ -119,14 +129,15 @@ export function readExecutionRecords(workspaceId: string, limit = 10, stateDir?:
   const lines = fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean);
   const records: ExecutionRecord[] = [];
   const boundedLimit = Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.floor(limit)));
-  for (const line of boundedLimit === 0 ? [] : lines.slice(-boundedLimit)) {
+  for (let index = lines.length - 1; index >= 0 && records.length < boundedLimit; index--) {
     try {
-      records.push(JSON.parse(line) as ExecutionRecord);
+      const parsed = executionRecordSchema.safeParse(JSON.parse(lines[index]));
+      if (parsed.success) records.push(parsed.data as ExecutionRecord);
     } catch {
       // skip corrupt lines
     }
   }
-  return records;
+  return records.reverse();
 }
 
 /**

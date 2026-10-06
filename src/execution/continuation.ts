@@ -82,6 +82,25 @@ function readRegular(file: string): unknown {
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error("Invalid protected continuation record");
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
+/**
+ * Bounded, credential-free reason for a failed strict continuation load: the
+ * failed check class (e.g. "Approval integrity mismatch", "Controller state
+ * invalid"), a zod field path, or a parse failure — with local paths masked
+ * and whitespace collapsed. Repair semantics: an expired/cancelled plan
+ * self-reconciles to RECONCILED_EXPIRED (S1); a NON-terminal plan that fails
+ * here stays fail-closed BROKEN_CONTINUATION by design — the operator installs
+ * a fresh approval (new manifest) rather than repairing protected state
+ * in place.
+ */
+function sanitizeLoadDetail(error: unknown): string {
+  const raw = error instanceof Error ? `${error.name === "ZodError" ? "schema: " : ""}${error.message}` : String(error);
+  return raw
+    .replace(/[A-Za-z]:\\[^\s"']*/g, "[LOCAL_PATH]")
+    .replace(/\/(?:home|Users)\/[^\s"']*/g, "[LOCAL_PATH]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 200);
+}
 function validateManifest(input: unknown): ApprovedManifest {
   const manifest = manifestSchema.parse(input);
   const seen = new Set<string>();
@@ -112,6 +131,7 @@ export class ContinuationController {
   private manifest: ApprovedManifest | null = null;
   private state: ControllerState | null = null;
   private loadError: string | null = null;
+  private loadErrorDetail: string | null = null;
   constructor(private readonly manager: CodexTaskManager, private readonly hooks: ContinuationHooks) {
     this.dir = continuationDirectory(manager.stateDir, manager.workspace.id);
     this.now = hooks.now ?? Date.now;
@@ -163,6 +183,10 @@ export class ContinuationController {
       // terminal state instead of latching BROKEN_CONTINUATION forever.
       if (!this.reconcileTerminalLoad(strictError)) {
         this.loadError = "Protected continuation approval/state invalid; explicit repair required";
+        // Keep the exact failed check visible: the generic message alone is
+        // un-actionable. The detail is a bounded, credential-free class string
+        // (validation messages, zod field paths) — never raw record contents.
+        this.loadErrorDetail = sanitizeLoadDetail(strictError);
       }
     }
   }
@@ -260,7 +284,7 @@ export class ContinuationController {
       challenge: this.state.challenge, generatedAt: this.state.generatedAt, loadedControllerSha256: this.loadedControllerSha256 }]);
   }
   status(ownerId?: string): unknown {
-    if (this.loadError) return { state: "BROKEN_CONTINUATION", error: this.loadError };
+    if (this.loadError) return { state: "BROKEN_CONTINUATION", error: this.loadError, errorDetail: this.loadErrorDetail };
     if (!this.manifest || !this.state || (ownerId && ownerId !== this.manifest.ownerId)) return { state: "DISABLED" };
     const s = this.state;
     const safeState = JSON.parse(JSON.stringify(s, (key, value) => {
@@ -415,7 +439,10 @@ export class ContinuationController {
       const submitted = await this.boundedReviewCall(() => this.manager.submitNative(input, () => {
         if (!this.canReview()) throw new Error("Review authorization paused or expired before dispatch");
       }));
-      assertNativeIdempotency(submitted, input);
+      // The upstream proof is bound to the projected NATIVE workspace payload
+      // (what Z2C hashed at admission) — verify against that projection.
+      const projection = await this.boundedReviewCall(() => this.manager.projectNativeWorkspace(input.workspace_id));
+      assertNativeIdempotency(submitted, { ...input, workspace_id: projection.nativeWorkspaceId });
       const identity = reviewIdentity(submitted, this.manifest!.workspaceId, attempt.reviewer);
       attempt.reviewer = identity; attempt.state = "ACTIVE"; delete attempt.error;
       this.save(); // Bind identity immediately, before events, polling or freshness work.

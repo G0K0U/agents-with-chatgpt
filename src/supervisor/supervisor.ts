@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { highestWorkerEffortRequired, workerEffortPolicyFile } from "../config/worker-effort-policy.js";
 import net from "node:net";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -9,6 +10,7 @@ import { readReleasePointer, type ParityState } from "../bridge/runtime-identity
 import { getSystemProcessInspector } from "../bridge/runtime.js";
 import { stableWorkspaceId } from "../workspace/identity.js";
 import { sharedEnv } from "../config/env.js";
+import { productDispatchPaused } from "../config/dispatch-policy.js";
 import {
   readSupervisorLock,
   inspectSupervisorProcess,
@@ -242,7 +244,7 @@ export interface SupervisorDeps {
 
 export interface SupervisorProbes {
   /** Local bridge health: workspace id + release identity, or null. */
-  bridgeHealth: () => Promise<{ workspaceId: string; releaseId: string | null; sourceParity: ParityState; buildParity: ParityState; version: string } | null>;
+  bridgeHealth: () => Promise<{ workspaceId: string; releaseId: string | null; sourceParity: ParityState; buildParity: ParityState; version: string; ready?: boolean; control_plane?: { READY_STATE?: string; LAST_ERROR_CODE?: string | null; LAST_FAILURE_LAYER?: string | null } } | null>;
   /** Public MCP endpoint reachable (expected unauthenticated 401). */
   publicMcp: () => Promise<boolean>;
   /** Z2C loopback listener liveness (HTTP probe). */
@@ -387,7 +389,7 @@ export class Supervisor {
     // Desktop relaunch. Legacy Desktop reconciliation is explicit opt-in.
     this.manageZcodeDesktop = (deps.env ?? process.env).A2C_MANAGE_ZCODE_DESKTOP === "1";
     this.startedAt = this.deps.now().toISOString();
-    for (const name of ["core", "tunnel", "runtime-identity", "queue-writer", "zcode-coordinator", "z2c-listener", "zcode-desktop", "providers"]) {
+    for (const name of ["core", "control-plane", "tunnel", "runtime-identity", "queue-writer", "zcode-coordinator", "z2c-listener", "zcode-desktop", "providers"]) {
       this.components.set(name, {
         component: name,
         state: "RECOVERING",
@@ -430,7 +432,7 @@ export class Supervisor {
             const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(4_000) });
             if (!res.ok) return null;
             const body = await res.json() as {
-              workspaceId?: string; status?: string; release?: { releaseId?: string | null; sourceParity?: ParityState; buildParity?: ParityState; version?: string };
+              workspaceId?: string; status?: string; ready?: boolean; control_plane?: { READY_STATE?: string; LAST_ERROR_CODE?: string | null; LAST_FAILURE_LAYER?: string | null }; release?: { releaseId?: string | null; sourceParity?: ParityState; buildParity?: ParityState; version?: string };
             };
             if (!body || body.status !== "ok" || !body.workspaceId) return null;
             return {
@@ -439,6 +441,7 @@ export class Supervisor {
               sourceParity: body.release?.sourceParity ?? "unknown",
               buildParity: body.release?.buildParity ?? "unknown",
               version: body.release?.version ?? "unknown",
+              ready: body.ready, control_plane: body.control_plane,
             };
           } catch {
             return null;
@@ -489,9 +492,9 @@ export class Supervisor {
         const lockFile = path.join(this.deps.stateDir, "locks", `${workspaceId}.json`);
         if (fs.existsSync(lockFile)) {
           try {
-            const lock = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { holder?: { provider?: string; taskId?: string } };
-            if (lock.holder?.provider) activeWriter = `${lock.holder.provider}:${lock.holder.taskId ?? ""}`;
-          } catch { /* unreadable lock: report no writer rather than guessing */ }
+            const lock = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { provider?: string; taskId?: string };
+            activeWriter = lock.provider && lock.taskId ? `${lock.provider}:${lock.taskId}` : "UNKNOWN";
+          } catch { activeWriter = "UNKNOWN"; }
         }
         return { paused, activeWriter };
       },
@@ -537,6 +540,11 @@ export class Supervisor {
       env: {
         ...process.env, ...this.deps.env,
         Z2C_PROVIDER: "official",
+        Z2C_WORKER_EFFORT_POLICY_FILE: highestWorkerEffortRequired(this.deps.stateDir) ? workerEffortPolicyFile(this.deps.stateDir) : undefined,
+        // This supervisor owns the injected provider pause. Recompute it from
+        // effective operator policy on every replacement; never retain an old
+        // managed pause after an authorized durable resume.
+        PRODUCT_TASK_DISPATCH_PAUSED: productDispatchPaused(this.deps.stateDir) ? "true" : "false",
         ZCODE_AGENT_SERVER_COMMAND: undefined,
         ZCODE_AGENT_SERVER_ARGS_JSON: undefined,
       },
@@ -871,6 +879,14 @@ export class Supervisor {
       ? { state: "READY" }
       : { state: "OFFLINE", detail: "no healthy local bridge", actionable: true },
       { action: "ensure-bridge", run: () => this.actionRestartBridge() });
+
+    // Liveness recovery and readiness are separate: provider/registry failures
+    // must not kill and respawn a healthy bridge.
+    this.observeComponent("control-plane", health?.ready === true
+      ? { state: "READY" }
+      : { state: "DEGRADED", actionable: false, detail: health?.control_plane
+        ? `${health.control_plane.READY_STATE ?? "UNKNOWN"}: ${health.control_plane.LAST_ERROR_CODE ?? "pending"} at ${health.control_plane.LAST_FAILURE_LAYER ?? "startup"}`
+        : "readiness contract unavailable" });
 
     // 2. tunnel: public MCP must answer the expected unauthenticated 401.
     if (health) {

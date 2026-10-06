@@ -22,6 +22,33 @@ import { createInterface } from "node:readline";
 const NL = "\n";
 const LOG = process.env.FAKE_APP_SERVER_LOG ?? "";
 
+// Deterministic timeout-lifecycle instrumentation (all opt-in via env; the
+// default behavior is unchanged):
+//   FAKE_TURN_HOLD=1                session/send never completes the turn on its own
+//   FAKE_TURN_COMPLETE_AFTER_MS=N   ...unless N ms elapse (late completion)
+//   FAKE_STOP_FAILS=1               session/stop answers with an error
+//   FAKE_STOP_DELAY_MS=N            session/stop answers only after N ms
+//   FAKE_PROBE_ON_STOP=1            after session/stop, send a valid allow-once
+//                                   Bash interaction/requestPermission and log
+//                                   the host's decision as {probeDecision}
+const HOLD_TURNS = process.env.FAKE_TURN_HOLD === "1";
+const LATE_COMPLETE_MS = Number(process.env.FAKE_TURN_COMPLETE_AFTER_MS ?? 0) || 0;
+// FAKE_MODEL_ERROR=<code>: the assistant message carries a model error record
+// (mirroring the live runtime's post-cancellation message shape) alongside the
+// pre-error text, so tests can prove partial checkpoint output preservation.
+const FAKE_MODEL_ERROR = process.env.FAKE_MODEL_ERROR?.trim() || "";
+// FAKE_ENTITLEMENT=1: advertise entitlementSelection and honor the semantic
+// entitlement on session/create + setModel (mirrors the live runtime's
+// per-setModel assertModelOptionMatchesEntitlement).
+// FAKE_ENTITLEMENT_ALLOWED="GLM-5.3,GLM-5.3-Flash": models the entitled
+// session may select (defaults to the whole catalog).
+const FAKE_ENTITLEMENT = process.env.FAKE_ENTITLEMENT === "1";
+const FAKE_ENTITLEMENT_ALLOWED = (process.env.FAKE_ENTITLEMENT_ALLOWED ?? "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+const STOP_FAILS = process.env.FAKE_STOP_FAILS === "1";
+const STOP_DELAY_MS = Number(process.env.FAKE_STOP_DELAY_MS ?? 0) || 0;
+const PROBE_ON_STOP = process.env.FAKE_PROBE_ON_STOP === "1";
+
 // Mirrors the LIVE standalone runtime shape (audited 2026-09-21):
 // single provider "zai-api", availability list follows the current model,
 // GLM-5.3-Flash requires options.reasoningLevel.
@@ -33,6 +60,29 @@ const CATALOG = {
 const DEFAULT_MODEL = CATALOG["GLM-5.3"]; // runtime default ≠ governed Flash → setModel must happen
 const DEFAULT_THOUGHT = "high";
 const THOUGHT_LEVELS = ["low", "high", "max"];
+
+// Optional per-model advertisement (mirrors settings.model.available[].reasoning
+// on runtimes that publish it): DIFFERENT level sets per model so tests prove
+// effort validation is target-model scoped, not global.
+const FULL_CATALOG = process.env.FAKE_APP_SERVER_FULL_CATALOG === "1";
+const REASONING = {
+  "GLM-5.3": { levels: ["medium", "high", "max"], defaultLevel: "high" },
+  "GLM-5.3-Flash": { levels: ["low", "high", "max"], defaultLevel: "max" },
+};
+// Optional future-model fixture: "GLM-5.4:low,medium" adds GLM-5.4 with its
+// own advertised levels (proves routing is table-driven, not a fixed list).
+const EXTRA = process.env.FAKE_APP_SERVER_EXTRA_MODEL ?? "";
+if (EXTRA) {
+  const [id, levels] = EXTRA.split(":");
+  if (id) {
+    CATALOG[id] = { providerId: PROVIDER_ID, modelId: id };
+    REASONING[id] = { levels: (levels ?? "low,high").split(","), defaultLevel: null };
+  }
+}
+function levelsFor(modelId, currentLevels) {
+  if (!FULL_CATALOG) return undefined;
+  return REASONING[modelId] ?? { levels: currentLevels, defaultLevel: null };
+}
 
 const hasKeyMaterial = Boolean(process.env.Z2C_MODEL_API_KEY || process.env.ZCODE_RUNTIME_API_KEY);
 
@@ -106,7 +156,49 @@ function pushV4Frame(subscriptionId, topic, payload) {
 
 function log(method) {
   if (!LOG) return;
-  try { appendFileSync(LOG, JSON.stringify({ method, hasKeyMaterial }) + NL); } catch { /* test-only */ }
+  try {
+    appendFileSync(
+      LOG,
+      JSON.stringify({
+        method,
+        hasKeyMaterial,
+        // Test-only evidence: whether the host opted the child into the
+        // standalone account runtime (env flag, not credential material).
+        standaloneAccountRuntime: process.env.ZCODE_PROTOCOL_STANDALONE_ACCOUNT_RUNTIME === "1",
+      }) + NL,
+    );
+  } catch { /* test-only */ }
+}
+
+// Post-stop permission probe: a valid allow-once Bash request for the session,
+// exactly as the live runtime would send mid-turn. If the host kept write
+// authority it would answer allow ("pnpm --version" is admitted by policy);
+// with a revoked execution grant it must answer deny.
+function sendPermissionProbe(state) {
+  const id = `probe-${randomUUID()}`;
+  const timeout = setTimeout(() => log("interaction/requestPermission.probeTimeout"), 10000);
+  const onLine = (line) => {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+    if (!msg || msg.id !== id) return;
+    rl.off("line", onLine);
+    clearTimeout(timeout);
+    try { appendFileSync(LOG, JSON.stringify({ probeDecision: msg?.result?.decision ?? null }) + NL); } catch { /* test-only */ }
+  };
+  rl.on("line", onLine);
+  send({
+    id,
+    method: "interaction/requestPermission",
+    params: {
+      sessionId: state.sessionId,
+      requestId: `probe-req-${randomUUID()}`,
+      toolCallId: `probe-tool-${randomUUID()}`,
+      toolName: "Bash",
+      input: { command: "pnpm --version" },
+      riskLevel: "low",
+      options: [{ optionId: "allow_once", kind: "allow_once", response: { decision: "allow" } }],
+    },
+  });
 }
 
 function snapshot(state, messageLimit) {
@@ -128,9 +220,25 @@ function snapshot(state, messageLimit) {
       : undefined,
     settings: state
       ? {
-          model: { current: state.model, available: [{ ref: state.model, label: state.model.modelId }] },
+          model: {
+            current: state.model,
+            available: FULL_CATALOG
+              ? Object.values(CATALOG).map((m) => ({ ref: { ...m }, label: m.modelId, reasoning: levelsFor(m.modelId, THOUGHT_LEVELS) }))
+              : [{ ref: state.model, label: state.model.modelId, ...(levelsFor(state.model.modelId, THOUGHT_LEVELS) ? { reasoning: levelsFor(state.model.modelId, THOUGHT_LEVELS) } : {}) }],
+          },
           thoughtLevel: { enabled: true, current: state.thoughtLevel, available: THOUGHT_LEVELS.map((value) => ({ value })) },
           mode: { current: state.mode },
+          ...(state.entitlement
+            ? {
+                // Registry-backed entitlement readback (mirrors the live mapper):
+                // requested == observed while the entitlement stays in force.
+                entitlement: {
+                  requested: state.entitlement,
+                  observed: { mode: state.entitlement },
+                  source: "provider-registry",
+                },
+              }
+            : {}),
         }
       : undefined,
     projection: { status: state?.closed ? "closed" : "idle", pendingPermissions: [], activeToolCalls: [] },
@@ -155,7 +263,7 @@ rl.on("line", (line) => {
 
   switch (msg.method) {
     case "runtime/capabilities":
-      return send({ id, result: { independentPlanState: true } });
+      return send({ id, result: FAKE_ENTITLEMENT ? { independentPlanState: true, entitlementSelection: true } : { independentPlanState: true } });
 
     case "workspace/updateProviderRegistry":
       return methodMissing(); // official standalone protocol has no such method
@@ -176,6 +284,9 @@ rl.on("line", (line) => {
         thoughtLevel: DEFAULT_THOUGHT,
         closed: false,
         messages: [],
+        ...(FAKE_ENTITLEMENT && typeof params.entitlement === "string"
+          ? { entitlement: params.entitlement }
+          : {}),
       };
       state.v4 = { logEpoch: `${randomUUID().slice(0, 18)}`, revision: 0, planEnabled: false };
       sessions.set(sessionId, state);
@@ -190,9 +301,23 @@ rl.on("line", (line) => {
       if (!model || model.providerId !== params.model?.providerId) {
         return send({ id, error: { code: -32603, message: "Provider Registry 中不存在 Model (fake)" } });
       }
+      if (state.entitlement && FAKE_ENTITLEMENT_ALLOWED.length > 0 && !FAKE_ENTITLEMENT_ALLOWED.includes(model.modelId)) {
+        return send({ id, error: { code: -32603, message: `Entitlement ${state.entitlement} does not declare model ${model.modelId} (fake)` } });
+      }
       // Mirrors the live runtime: Flash requires an explicit reasoning level.
       if (model.modelId === "GLM-5.3-Flash" && !params.model?.options?.reasoningLevel) {
         return send({ id, error: { code: -32603, message: `Reasoning level is required for ${model.providerId}/${model.modelId}` } });
+      }
+      // Mirrors the live runtime: setModel's options.reasoningLevel (when
+      // present) becomes the session's thought level, validated against the
+      // TARGET model's own advertised levels.
+      const requestedLevel = params.model?.options?.reasoningLevel;
+      if (requestedLevel) {
+        const allowed = FULL_CATALOG ? (REASONING[model.modelId]?.levels ?? THOUGHT_LEVELS) : THOUGHT_LEVELS;
+        if (!allowed.includes(requestedLevel)) {
+          return send({ id, error: { code: -32603, message: `Reasoning level ${requestedLevel} is not valid for ${model.modelId} (fake)` } });
+        }
+        state.thoughtLevel = requestedLevel;
       }
       state.model = { ...model };
       saveState();
@@ -202,8 +327,11 @@ rl.on("line", (line) => {
     case "session/setThoughtLevel": {
       const state = sessions.get(params.sessionId);
       if (!state) return notFound();
-      if (!THOUGHT_LEVELS.includes(params.thoughtLevel)) {
-        return send({ id, error: { code: -32602, message: "thought level not supported (fake)" } });
+      // Per-model truth: when the runtime advertises per-model reasoning, the
+      // level must be valid for the CURRENT model (mirrors live contract).
+      const allowed = FULL_CATALOG ? (REASONING[state.model.modelId]?.levels ?? THOUGHT_LEVELS) : THOUGHT_LEVELS;
+      if (!allowed.includes(params.thoughtLevel)) {
+        return send({ id, error: { code: -32602, message: `thought level not supported for ${state.model.modelId} (fake)` } });
       }
       state.thoughtLevel = params.thoughtLevel;
       saveState();
@@ -236,18 +364,39 @@ rl.on("line", (line) => {
       if (typeof params.content !== "string" || params.content.length === 0) return invalidParams();
       state.messages.push({ info: { role: "user" }, parts: [{ type: "text", text: params.content }] });
       state.messages.push({
-        info: { role: "assistant" },
-        parts: [{ type: "text", text: `FAKE OFFICIAL REPLY: ${params.content.slice(0, 40)}` }],
+        info: {
+          role: "assistant",
+          ...(FAKE_MODEL_ERROR
+            ? {
+                error: {
+                  code: FAKE_MODEL_ERROR,
+                  data: { code: FAKE_MODEL_ERROR, message: "Model request was cancelled" },
+                },
+              }
+            : {}),
+        },
+        parts: [{
+          type: "text",
+          text: FAKE_MODEL_ERROR
+            ? `PARTIAL CHECKPOINT BEFORE ERROR: ${params.content.slice(0, 20)}`
+            : `FAKE OFFICIAL REPLY: ${params.content.slice(0, 40)}`,
+        }],
       });
       saveState();
       send({ id, result: { sessionId: state.sessionId, accepted: true, stateRevision: state.messages.length } });
       // Official turn lifecycle notifications, emitted after the response.
+      // With FAKE_TURN_HOLD the completion never arrives on its own (a held
+      // turn), unless FAKE_TURN_COMPLETE_AFTER_MS forces a late completion.
+      const emitCompletion = () => {
+        send({ method: "session/event", params: { type: "turn.completed", eventId: randomUUID(), sessionId: state.sessionId, seq: 2, timestamp: Date.now(), payload: { response: "FAKE OFFICIAL REPLY", tokenCount: 1, toolCallCount: 0, duration: 5, resultType: "success", inputId: params.inputId } } });
+        send({ method: "state.updated", params: { type: "state.updated", scope: "session", sessionId: state.sessionId, revision: 2, reason: "prompt_completed", patch: { status: "idle" } } });
+      };
       const now = Date.now();
       setImmediate(() => {
         send({ method: "session/event", params: { type: "turn.started", eventId: randomUUID(), sessionId: state.sessionId, seq: 1, timestamp: now, payload: { turnNumber: 1, input: params.content } } });
-        send({ method: "session/event", params: { type: "turn.completed", eventId: randomUUID(), sessionId: state.sessionId, seq: 2, timestamp: now + 5, payload: { response: "FAKE OFFICIAL REPLY", tokenCount: 1, toolCallCount: 0, duration: 5, resultType: "success", inputId: params.inputId } } });
-        send({ method: "state.updated", params: { type: "state.updated", scope: "session", sessionId: state.sessionId, revision: 2, reason: "prompt_completed", patch: { status: "idle" } } });
+        if (!HOLD_TURNS) emitCompletion();
       });
+      if (HOLD_TURNS && LATE_COMPLETE_MS > 0) setTimeout(emitCompletion, LATE_COMPLETE_MS);
       return;
     }
 
@@ -263,7 +412,14 @@ rl.on("line", (line) => {
     case "session/stop": {
       const state = sessions.get(params.sessionId);
       if (!state) return notFound();
-      return send({ id, result: {} });
+      const respond = () => {
+        if (STOP_FAILS) return send({ id, error: { code: -32000, message: "stop failed (fake)" } });
+        send({ id, result: {} });
+        if (PROBE_ON_STOP) sendPermissionProbe(state);
+      };
+      if (STOP_DELAY_MS > 0) setTimeout(respond, STOP_DELAY_MS);
+      else respond();
+      return;
     }
 
     case "session/close": {

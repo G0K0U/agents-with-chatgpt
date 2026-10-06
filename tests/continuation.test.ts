@@ -92,6 +92,9 @@ describe("approved continuation workflow", () => {
           return { workspace_id: task.workspace_id, task_id, session_id: task.session_id, output_id, text };
         },
         cancelTask: async () => { throw new Error("Not expected"); }, resumeSession: async () => { throw new Error("Not expected"); },
+        resolveKeyedTask: async () => null,
+        taskLaneStatus: async () => ({ provider_healthy: true, provider_status: "healthy", active_task: null, queued_task_count: 0, paused: false }),
+        projectWorkspace: async (workspaceId: string) => ({ nativeWorkspaceId: workspaceId, canonicalPath: root }),
       } });
     controller = new ContinuationController(manager, { authorize: () => authorized, now: () => now,
       // Typed verifier fixture; real subprocess and fake-output negatives live in continuation-evidence.test.ts.
@@ -356,6 +359,38 @@ describe("approved continuation workflow", () => {
     if (field === "blocked-identity" || field === "stale-identity") { attempt.state = field === "blocked-identity" ? "BLOCKED" : "STALE"; delete attempt.reviewer; }
     fs.writeFileSync(file, JSON.stringify(saved)); boot(false); await controller.settled();
     expect(status().state).toBe("BROKEN_CONTINUATION"); expect(reviewCalls).toHaveLength(1);
+  });
+  it("surfaces the failed check as a bounded errorDetail when a non-terminal plan fails strict load", async () => {
+    reviewHold = true; boot(); await until(() => reviewCalls.length === 1); await manager.close();
+    const file = path.join(continuationDirectory(state, manifest.workspaceId), "state.json");
+    const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+    saved.nodes.U02.machineReview.attempts[0].state = "STABLE"; // not a valid attempt state
+    fs.writeFileSync(file, JSON.stringify(saved)); boot(false); await controller.settled();
+    expect(status().state).toBe("BROKEN_CONTINUATION");
+    expect(status().error).toBe("Protected continuation approval/state invalid; explicit repair required");
+    expect(String(status().errorDetail)).toContain("schema");
+    expect(String(status().errorDetail).length).toBeLessThanOrEqual(200);
+  });
+  it("terminal reconciliation (S1) reports the reconciled state without an errorDetail", async () => {
+    manifest.nodes[0].correctiveInputs = ["Approved corrective input"];
+    reviewOutput = receipt => JSON.stringify({ ...receipt, decision: "REWORK" });
+    boot(); await until(() => status().nodes.U02.state === "REWORK");
+    controller.setPaused(true); controller.wake("user-control"); await controller.settled(); await manager.close();
+    const dir = continuationDirectory(state, manifest.workspaceId);
+    // Cancel via the protected control surface, then corrupt the approval binding:
+    // an expired/cancelled plan can never dispatch again, so strict load failure
+    // must reconcile to a stable terminal state instead of latching BROKEN.
+    const stateFile = path.join(dir, "state.json");
+    const saved = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    saved.cancelled = true; saved.paused = false;
+    fs.writeFileSync(stateFile, JSON.stringify(saved));
+    const approvalFile = path.join(dir, "approval.json");
+    const approval = JSON.parse(fs.readFileSync(approvalFile, "utf8"));
+    approval.manifestHash = "0".repeat(64); // approval binding no longer matches
+    fs.writeFileSync(approvalFile, JSON.stringify(approval));
+    boot(false); await controller.settled();
+    expect(status().state).toBe("RECONCILED_EXPIRED");
+    expect(status().errorDetail).toBeUndefined();
   });
   it("uses a deterministic docs-inclusive review fingerprint independent of the web gate", () => {
     const before = reviewFingerprint(root, manifest.nodes[0]), gateBefore = verificationFingerprint(root);

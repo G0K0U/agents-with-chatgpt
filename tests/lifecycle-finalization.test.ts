@@ -173,6 +173,7 @@ describe("C2C live task finalization truth", () => {
         workspace_id: bridge.workspace.id,
         instruction: "complete the lifecycle finalization regression",
         write_scope: ["src"],
+        network: false,
         run_tests: false,
       },
     }));

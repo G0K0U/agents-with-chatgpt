@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { ZCODE_NATIVE_REQUIRED_IDENTITY, ZCODE_IDEMPOTENCY_PROTOCOL, nativeRequestFingerprint, type ZcodeNativeTaskView } from "./zcode-native.js";
+import { ZCODE_NATIVE_ADMISSIBLE_PROVIDER_IDS, ZCODE_IDEMPOTENCY_PROTOCOL, nativeRequestFingerprint, type ZcodeNativeTaskView } from "./zcode-native.js";
 import { ENGINEERING_AI_AUDIT_LEDGER_RELATIVE_PATH, ENGINEERING_AI_AUDIT_TIMELINE_LEDGER_RELATIVE_PATH } from "./audit-mirror.js";
 import { sanitizeExecutionOutput } from "./sanitize.js";
 import type { ApprovedNode } from "./continuation.js";
@@ -14,13 +14,18 @@ export const MAX_REVIEW_ATTEMPTS = 3;
 export const REVIEW_TIMEOUT_MS = 10 * 60_000;
 const fingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const executorId = z.string().regex(/^c2c_[a-f0-9]{8,32}$/);
+// 2026-09-28 catalog policy: the reviewer's identity is the binding Z2C
+// OBSERVED on the exact session — ANY model the runtime advertises on an
+// admissible non-retired route (Flash, GLM-5.3, future models). Single-model
+// literals (Flash-only, GLM-5.3-only) are gone; the route + authoritative
+// source remain the governed constraints and unobserved bindings fail closed.
 const identitySchema = z.object({
   workspace_id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
   task_id: z.string().regex(/^z2c_[A-Za-z0-9_-]{1,100}$/),
   session_id: z.string().regex(/^sess_[0-9a-f-]{36}$/i),
   model_binding: z.object({
-    provider_id: z.literal(ZCODE_NATIVE_REQUIRED_IDENTITY.provider_id),
-    model_id: z.literal(ZCODE_NATIVE_REQUIRED_IDENTITY.model_id),
+    provider_id: z.string().refine((p) => ZCODE_NATIVE_ADMISSIBLE_PROVIDER_IDS.has(p), "provider route is not admissible"),
+    model_id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
     source: z.string().min(1).max(200).optional(),
   }).strict(),
 }).strict();
