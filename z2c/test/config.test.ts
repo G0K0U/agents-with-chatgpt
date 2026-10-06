@@ -49,16 +49,31 @@ describe("ZCode CLI resolution and spawning", () => {
     assert.equal(resolved, expected);
   });
 
-  it("resolves current 0.16.9 on the real machine when installed", () => {
-    const cfg = loadConfig();
-    assert.ok(existsSync(cfg.zcodeCliPath), `Resolved CLI path should exist: ${cfg.zcodeCliPath}`);
-    // Z2C_ZCODE_CLI is the documented explicit override (highest precedence);
-    // on hosts that pin a dev-tree CLI the default-layout assertion does not
-    // apply. Without the override the packaged 0.16.9 layout must resolve.
-    if (process.env.Z2C_ZCODE_CLI?.trim()) {
-      assert.equal(cfg.zcodeCliPath, resolve(process.env.Z2C_ZCODE_CLI.trim()));
-    } else {
+  it("loads an installed 0.16.9 layout and gives an explicit dev CLI precedence", () => {
+    const fixture = mkdtempSync(join(tmpdir(), "z2c-config-installed-"));
+    const previousAppData = process.env.LOCALAPPDATA;
+    const previousCli = process.env.Z2C_ZCODE_CLI;
+    try {
+      const packaged = join(fixture, "Programs", "ZCode", "resources", "glm", "zcode.cjs");
+      mkdirSync(join(fixture, "Programs", "ZCode", "resources", "glm"), { recursive: true });
+      writeFileSync(packaged, "// installed-layout fixture\n");
+      process.env.LOCALAPPDATA = fixture;
+      delete process.env.Z2C_ZCODE_CLI;
+      const cfg = loadConfig();
+      assert.ok(existsSync(cfg.zcodeCliPath), "Resolved installed CLI must exist");
+      assert.equal(cfg.zcodeCliPath, packaged);
       assert.match(cfg.zcodeCliPath, /resources[\\/]glm[\\/]zcode\.cjs$/i);
+      const devCli = join(fixture, "dev CLI.cjs");
+      writeFileSync(devCli, "// explicit override fixture\n");
+      process.env.Z2C_ZCODE_CLI = devCli;
+      assert.equal(loadConfig().zcodeCliPath, resolve(devCli));
+      assert.ok(existsSync(loadConfig().zcodeCliPath));
+    } finally {
+      if (previousAppData === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = previousAppData;
+      if (previousCli === undefined) delete process.env.Z2C_ZCODE_CLI;
+      else process.env.Z2C_ZCODE_CLI = previousCli;
+      rmSync(fixture, { recursive: true, force: true });
     }
   });
 
