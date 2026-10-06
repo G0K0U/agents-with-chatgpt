@@ -15,9 +15,6 @@ Read [the release changes and limits](docs/release-v0.4.0-dot.md),
 [Dot goal workflow](docs/dot-goal-workflow.md), and
 [one-command recovery](docs/engineering-ai-workflow.md).
 
-> [!IMPORTANT]
-> **遇到问题？** 请先向 Codex 发送 **「更新 Codex with ChatGPT」** 并重试。更新到最新版本可以解决大多数已知问题。  
-> **Having trouble?** First ask Codex to **“Update Codex with ChatGPT”** and try again. Updating to the latest version resolves most known issues.
 
 ## What it is · 这是什么
 
