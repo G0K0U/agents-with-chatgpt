@@ -19,6 +19,8 @@ describe("detached restart handoff (offline)", () => {
     deps = {
       observe: vi.fn(async () => started ? replacement : old), processStart: vi.fn(() => "helper-start"),
       launch: vi.fn(async () => {}), stop: vi.fn(async () => true),
+      // Synthetic runtime PIDs have no relationship to the host process tree.
+      isTaskDescendant: vi.fn(() => false),
       ensure: vi.fn(async () => { started = true; return { spawned: true, runtime: { ...replacement, service: "c2c", version: "test",
         workspaceRoot: root, workspaceId: stableWorkspaceId(root), stateDir: state, adminToken: "SECRET-ADMIN", publicUrl: null } }; }),
       tunnel: vi.fn(async () => true),
@@ -172,6 +174,7 @@ describe("detached restart handoff (offline)", () => {
           } return old;
         },
         processIdentity: pid => pid === old.pid ? 'same' : 'gone', processStart: () => 'fixture',
+        isTaskDescendant: () => false,
         launch: async id => fs.appendFileSync(${JSON.stringify(starts)}, id + '\\n')
       }); } catch (error) { fs.writeFileSync(ready[Number(process.argv[2])] + '.error', String(error.message)); process.exitCode = 2; }`);
     const children = [0, 1].map(index => spawn(process.execPath, ["--import", "tsx", fixture, String(index)], { windowsHide: true, stdio: "ignore" }));
@@ -449,6 +452,7 @@ describe("detached restart handoff (offline)", () => {
     fs.writeFileSync(parentFile, `import { spawn } from 'node:child_process'; import { requestRestart } from ${JSON.stringify(moduleUrl)};
       await requestRestart(${JSON.stringify(root)}, { stateDir: ${JSON.stringify(state)}, tunnel: false }, {
         observe: async () => (${JSON.stringify(old)}), processStart: () => 'fixture-parent-start',
+        isTaskDescendant: () => false,
         launch: async id => { const child = spawn(process.execPath, [${JSON.stringify(childFile)}, id], { detached: true, windowsHide: true, stdio: 'ignore' }); child.unref();
           await new Promise((r,j) => { child.once('spawn',r); child.once('error',j); }); process.kill(process.pid, 'SIGTERM'); }
       });`);
@@ -517,6 +521,7 @@ describe("restart helper readiness semantics (eventual success is not START_FAIL
       observe: vi.fn(async () => old), processStart: vi.fn(() => "helper-start"),
       launch: vi.fn(async () => {}), stop: vi.fn(async () => true),
       ensure: vi.fn(async () => { throw new Error("Bridge did not become healthy within 20s. See log"); }),
+      isTaskDescendant: vi.fn(() => false),
       tunnel: vi.fn(async () => true),
     };
   });

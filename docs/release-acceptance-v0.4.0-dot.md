@@ -60,3 +60,10 @@ Hosted runner case counts differ when ripgrep is absent: the Node fallback
 engine runs there, while local search acceptance covers both ripgrep and Node.
 The first Node 24 job recorded 1505 A2C passes with no skips. Numerical counts
 are environment-specific; release CI and local gates are reported separately.
+
+Hosted run 37467324808 passed Node 22 but exposed an offline restart fixture
+that queried the runner's real process inventory on Node 24. Synthetic runtime
+PIDs now use the existing dependency seam, including detached test children.
+All 63 restart-handoff cases and typecheck passed locally. The production
+ancestry guard is unchanged; env/ancestry rejection and unavailable/throwing
+inventory assertions remain in the suite. The failed hosted run is preserved.
