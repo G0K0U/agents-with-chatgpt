@@ -47,7 +47,7 @@ resolution, validated instance/release/build identity and authenticated shared
 agent-plane tools, then shut down its exact temporary child. It did not
 activate a production LKG, reconfigure a tunnel or create a model worker.
 
-The first hosted CI run passed the final 1513 A2C tests on both Node 22 and
+The first hosted CI run passed the complete A2C suite on both Node 22 and
 24, then exposed two Z2C tests that assumed a locally installed ZCode runtime.
 The installed-layout test now creates real fixture files and verifies explicit
 override precedence. Doctor diagnostics use a private fixture state and a
@@ -55,3 +55,8 @@ version-only CLI; an additional assertion proves a missing CLI still fails
 even when the legacy configuration warning is present. All 47 affected tests
 passed locally with no skips. Original failed CI remains visible in run
 37465871989; the release notes record the subsequent CI result.
+
+Hosted runner case counts differ when ripgrep is absent: the Node fallback
+engine runs there, while local search acceptance covers both ripgrep and Node.
+The first Node 24 job recorded 1505 A2C passes with no skips. Numerical counts
+are environment-specific; release CI and local gates are reported separately.
