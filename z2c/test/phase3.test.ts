@@ -785,22 +785,35 @@ describe("daemon pid/orphan handling", () => {
 describe("doctor (migration diagnostics)", () => {
   it("flags a stale Phase-1 Z2C_PROVIDER leftover without failing the run", async () => {
     const { runDoctor } = await import("../src/cli/doctor.js");
-    const previous = process.env.Z2C_PROVIDER;
-    const previousPort = process.env.Z2C_PORT;
+    const fixture = tempDir();
+    const cli = join(fixture, "version-only.cjs");
+    writeFileSync(cli, 'process.stdout.write("0.16.9\\n");\n');
+    const names = ["Z2C_PROVIDER", "Z2C_PORT", "Z2C_ZCODE_CLI", "Z2C_STATE_DIR", "Z2C_EXPECTED_VERSION"];
+    const previous = new Map(names.map((name) => [name, process.env[name]]));
     process.env.Z2C_PROVIDER = "desktop";
-    process.env.Z2C_PORT = "59999"; // unassigned port -> health checks fail fast, reported as info
+    process.env.Z2C_PORT = "0"; // no external or operator service can own this port
+    process.env.Z2C_ZCODE_CLI = cli;
+    process.env.Z2C_STATE_DIR = join(fixture, "isolated-state");
+    process.env.Z2C_EXPECTED_VERSION = "0.16.";
     const logs: string[] = [];
     const originalLog = console.log;
     console.log = (...c: unknown[]) => logs.push(c.join(" "));
     try {
       const code = await runDoctor();
       assert.equal(code, 0, "stale config is a warning, not an error");
+      assert.match(logs.join("\n"), /\[ok\] zcode-agent-path/);
+      // A genuine missing runtime must still fail, even with the same warning.
+      logs.length = 0;
+      rmSync(cli);
+      assert.equal(await runDoctor(), 1, "missing CLI must remain an error");
+      assert.match(logs.join("\n"), /\[FAIL\] zcode-agent-path/);
     } finally {
       console.log = originalLog;
-      if (previous !== undefined) process.env.Z2C_PROVIDER = previous;
-      else delete process.env.Z2C_PROVIDER;
-      if (previousPort !== undefined) process.env.Z2C_PORT = previousPort;
-      else delete process.env.Z2C_PORT;
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      rmSync(fixture, { recursive: true, force: true });
     }
     const joined = logs.join("\n");
     assert.match(joined, /stale-env-z2c-provider/);

@@ -46,3 +46,12 @@ forms on both mapper and rejected-call paths, rejected ambiguous model
 resolution, validated instance/release/build identity and authenticated shared
 agent-plane tools, then shut down its exact temporary child. It did not
 activate a production LKG, reconfigure a tunnel or create a model worker.
+
+The first hosted CI run passed the final 1513 A2C tests on both Node 22 and
+24, then exposed two Z2C tests that assumed a locally installed ZCode runtime.
+The installed-layout test now creates real fixture files and verifies explicit
+override precedence. Doctor diagnostics use a private fixture state and a
+version-only CLI; an additional assertion proves a missing CLI still fails
+even when the legacy configuration warning is present. All 47 affected tests
+passed locally with no skips. Original failed CI remains visible in run
+37465871989; the release notes record the subsequent CI result.
